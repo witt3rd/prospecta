@@ -104,6 +104,22 @@ Concretely: substrate-up, migrate, bank-create, embedder-config, llm-config, fir
 
 **Prevents:** the substrate's real power being inaccessible because the on-ramp is six manual steps; "I'll try it tomorrow" becoming "I never tried it"; the plugin shipping convenience the library lacks (which would violate P9).
 
+## P17 — Capable defaults ship as an extras module, not as core dependencies
+
+The core library has zero provider imports (P3 enforces the injection contract). Capable defaults live in `prospecta.defaults`, installed via `pip install prospecta[defaults]`, which pulls in LiteLLM and exposes `make_default_embedder()` and `make_default_llm()`. These factories read env vars (`OPENAI_API_KEY`, `PROSPECTA_EMBED_MODEL`, `PROSPECTA_LLM_MODEL`) and return callables that conform to the injection contract. Callers that supply their own `embed=` / `llm=` always win (P4).
+
+The pattern is **"capable defaults, bring your own API key, caller can always override the abstraction."** It serves three audiences with one architecture:
+
+| Audience | Embed | LLM |
+|---|---|---|
+| Notebook / script user | `prospecta.defaults` | `prospecta.defaults` |
+| Hermes plugin | `prospecta.defaults` | `ctx.llm.complete` (host-provided, free) |
+| Animus / Cookie / advanced caller | own embedder | own LLM router |
+
+The Hermes plugin case is load-bearing in this design: `ctx.llm` covers the LLM half of the spine without any provider deps in the plugin or library, but it does not cover embeddings — so `prospecta.defaults` exists *specifically* to fill that gap cleanly without forcing core to import LiteLLM.
+
+**Prevents:** core dependency creep ("just one little import"); alternately, no-defaults rigidity that forces every caller — including the Hermes plugin — to hand-roll provider clients; and the plugin growing its own embedding routing in violation of P9.
+
 ---
 
 *Authored 2026-05-18 by Forge ⚒️ as PRINCIPLES.md for the prospecta ralplan. Distilled from the assessment doc (`~/forge/wiki/2026-05-18_memory-library-and-plugin-assessment.md`) and animus's CODING.md operating philosophy.*
