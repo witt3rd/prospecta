@@ -68,6 +68,9 @@ class Memory:
         self._default_bank_id = bank_id
         self._tracer = tracer
         self._pool = ConnectionPool(database_url=database_url)
+        # T14: sweeper thread state (lazy; created in start_sweeper).
+        self._sweeper_thread = None  # type: ignore[assignment]
+        self._sweeper_config = None  # type: ignore[assignment]
 
     @property
     def database_url(self) -> str:
@@ -176,6 +179,14 @@ class Memory:
         """
         from prospecta import _index
         return _index.index_directory(self, path, **kwargs)
+
+    def index_single_file(self, path, **kwargs):
+        """Index ONE file. P7 single write path (used by retain AND sweeper).
+
+        See prospecta._index.index_single_file for full signature.
+        """
+        from prospecta import _index
+        return _index.index_single_file(self, path, **kwargs)
 
     def search(self, text: str, **kwargs):
         """Search across the default bank.
@@ -398,3 +409,59 @@ class Memory:
             queries=formulated,
             queries_to_results=queries_to_results,
         )
+
+    # ------------------------------------------------------------------
+    # T14 — background sweeper (P14 filesystem drift safety net)
+    # ------------------------------------------------------------------
+
+    def start_sweeper(
+        self,
+        *,
+        corpus_paths,
+        sweep_interval_seconds: float = 86400.0,
+        file_extensions: tuple = (".md", ".markdown"),
+        ignore_patterns: list | None = None,
+    ) -> None:
+        """Start the background sweeper. Raises RuntimeError if already running.
+
+        Sweeper is the implicit-file-change write path (P14 safety net). Per
+        the substrate-opacity rule, sweeper is the legitimate home for
+        filesystem awareness inside the library.
+        """
+        from pathlib import Path
+        from prospecta._sweeper import SweeperConfig, SweeperThread
+
+        if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
+            raise RuntimeError("sweeper is already running; call stop_sweeper first")
+
+        config = SweeperConfig(
+            corpus_paths=[Path(p) for p in corpus_paths],
+            sweep_interval_seconds=float(sweep_interval_seconds),
+            file_extensions=tuple(file_extensions),
+            ignore_patterns=list(ignore_patterns) if ignore_patterns else None,
+        )
+        self._sweeper_config = config
+        thread = SweeperThread(self, config)
+        self._sweeper_thread = thread
+        thread.start()
+
+    def stop_sweeper(self, *, timeout: float = 5.0) -> bool:
+        """Stop the background sweeper. Returns True iff thread exited cleanly.
+
+        Idempotent: if no sweeper is running, returns True.
+        """
+        thread = self._sweeper_thread
+        if thread is None:
+            return True
+        ok = thread.stop(timeout=timeout)
+        if ok:
+            self._sweeper_thread = None
+        return ok
+
+    def shutdown(self) -> None:
+        """Stop sweeper (if running) + close pool. Idempotent."""
+        try:
+            if self._sweeper_thread is not None:
+                self.stop_sweeper(timeout=5.0)
+        finally:
+            self.close()

@@ -168,3 +168,18 @@ def populated_corpus(memory_with_bank_and_mock_llm):
     for source, body, idx in seeds:
         mem.retain(body, index_text=idx, source=source)
     return mem
+
+
+@pytest.fixture
+def tmp_corpus(tmp_path):
+    """A small markdown corpus with frontmatter `index_text` so indexing
+    does NOT require an LLM. T14 sweeper fixture."""
+    d = tmp_path / "corpus"
+    d.mkdir()
+    (d / "doc1.md").write_text(
+        "---\nindex_text: 'first doc question'\n---\nBody one."
+    )
+    (d / "doc2.md").write_text(
+        "---\nindex_text: 'second doc question'\n---\nBody two."
+    )
+    return d

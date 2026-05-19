@@ -128,209 +128,185 @@ def _hash_bytes(data: bytes) -> str:
 # index_directory
 # ---------------------------------------------------------------------------
 
-def index_directory(
+@dataclass(frozen=True)
+class SingleFileIndexResult:
+    """Outcome of indexing a single file. P7 single write path.
+
+    status:
+      - "new":       a brand-new document was inserted.
+      - "replaced":  a prior document for the same source was replaced
+                     (or its source bookkeeping updated for same-hash).
+      - "unchanged": the same file (same hash) was already indexed; no-op.
+      - "skipped":   no parser matched, parser produced no docs, etc.
+      - "error":     a recoverable error fired (e.g. parser exception).
+    """
+
+    status: str  # one of: new | replaced | unchanged | skipped | error
+    document_ids: tuple[str, ...] = ()
+    items_added: int = 0
+    error: str | None = None
+
+
+def index_single_file(
     memory: "Memory",
     path: str | Path,
     *,
     source_prefix: str | None = None,
+    root: Path | None = None,
     parsers: list[ParserPlugin] | None = None,
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
-) -> IndexStats:
-    """Walk a directory, parse each file, chunk + embed + write."""
+) -> SingleFileIndexResult:
+    """Index ONE file. Same write semantics as index_directory's per-file body.
+
+    P7: this is the single write path for filesystem-derived indexing. Both
+    index_directory (loop) and the sweeper (drift detection) call this.
+
+    `root` is used only to compute a relative source string when
+    `source_prefix` is supplied. When `root` is None, `source_prefix` falls
+    back to file basename.
+    """
     if memory._embed is None:
         raise RuntimeError(
-            "Memory.index_directory requires an `embed` callable; "
+            "Memory.index_single_file requires an `embed` callable; "
             "construct Memory(embed=...)"
         )
-    root = Path(path)
+    file_path = Path(path)
     parsers = list(parsers or [])
-    parsers.append(_MarkdownParser())  # bundled fallback
+    parsers.append(_MarkdownParser())
 
-    bank_id = memory._default_bank_id
+    parser = _select_parser(file_path, parsers)
+    if parser is None:
+        return SingleFileIndexResult(status="skipped")
 
-    docs_added = 0
-    docs_replaced = 0
-    items_added = 0
-    files_scanned = 0
-    files_skipped = 0
-    files_unchanged = 0
-    errors = 0
+    try:
+        file_bytes = file_path.read_bytes()
+    except OSError as e:
+        return SingleFileIndexResult(status="error", error=repr(e))
+    content_hash = _hash_bytes(file_bytes)
 
-    for file_path in _crawl(root):
-        files_scanned += 1
-        parser = _select_parser(file_path, parsers)
-        if parser is None:
-            files_skipped += 1
-            continue
+    # Substrate-opacity: source is caller-supplied opaque string.
+    if source_prefix:
         try:
-            file_bytes = file_path.read_bytes()
-        except OSError:
-            errors += 1
-            continue
-        content_hash = _hash_bytes(file_bytes)
-
-        # Substrate-opacity: source is caller-supplied opaque string.
-        if source_prefix:
-            try:
-                rel = file_path.relative_to(root) if root.is_dir() else file_path.name
-            except ValueError:
-                rel = file_path
-            source = f"{source_prefix}/{rel}"
-        else:
-            source = str(file_path)
-
-        try:
-            parsed_iter = list(parser.parse(file_path))
-        except Exception as e:
-            logger.warning("Parser failed for %s: %s", file_path, e)
-            errors += 1
-            continue
-
-        if not parsed_iter:
-            files_skipped += 1
-            continue
-
-        # Single-doc path (multi-doc per file handled by hashing original_text per doc)
-        for parsed in parsed_iter:
-            # Per-doc hash if multi-doc parser splits a single file
-            if len(parsed_iter) > 1:
-                doc_hash = hashlib.sha256(
-                    (content_hash + parsed.original_text).encode("utf-8")
-                ).hexdigest()
+            if root is not None and root.is_dir():
+                rel = file_path.relative_to(root)
             else:
-                doc_hash = content_hash
+                rel = file_path.name
+        except ValueError:
+            rel = file_path
+        source = f"{source_prefix}/{rel}"
+    else:
+        source = str(file_path)
 
-            with memory._pool.connection() as conn:
-                # Check if document with same (bank_id, content_hash) exists.
-                doc_id, _replaced, prior_source = upsert_document(
-                    conn,
-                    bank_id=bank_id,
-                    source=source,
-                    content_hash=doc_hash,
-                    original_text=parsed.original_text,
-                    metadata=parsed.metadata or {},
-                    tags=list(parsed.tags or []),
-                )
-                # If hash already existed → check whether content_hash was for
-                # *the file's bytes*: if file_bytes identical → unchanged; else
-                # this is the rare case the body matches but file changed (we
-                # treat as unchanged for indexing purposes).
-                existed = prior_source is not None or (
-                    _replaced is False
-                    and _doc_already_had_items(conn, doc_id)
-                )
+    try:
+        parsed_iter = list(parser.parse(file_path))
+    except Exception as e:
+        logger.warning("Parser failed for %s: %s", file_path, e)
+        return SingleFileIndexResult(status="error", error=repr(e))
 
-                if existed:
-                    # Source-divergence handling: if caller's source differs
-                    # from stored, update the source bookkeeping (treat as
-                    # replace) but still skip re-embed since content_hash
-                    # matched.
-                    if prior_source != source:
-                        update_document_source(
-                            conn,
-                            document_id=doc_id,
-                            source=source,
-                            original_text=parsed.original_text,
-                            metadata=parsed.metadata or {},
-                            tags=list(parsed.tags or []),
-                        )
-                        docs_replaced += 1
-                    else:
-                        files_unchanged += 1
-                    conn.commit()
-                    continue
+    if not parsed_iter:
+        return SingleFileIndexResult(status="skipped")
 
-                # Replace-on-same-source semantics for *different* hash:
-                # When the same source (file path) previously had a different
-                # content_hash document, we delete the older one before
-                # inserting the new one. Detect via documents.source match.
-                replaced_count = _delete_prior_docs_at_source_diff_hash(
-                    conn, bank_id=bank_id, source=source, keep_doc_id=doc_id,
-                )
-                if replaced_count > 0:
-                    docs_replaced += 1
-                else:
-                    docs_added += 1
+    return _write_parsed_docs(
+        memory,
+        file_path=file_path,
+        parsed_iter=parsed_iter,
+        content_hash=content_hash,
+        source=source,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
 
-                # T10: frontmatter `index_text:` override (P4 — caller wins).
-                # When the parser surfaces caller-supplied index_text, bypass
-                # chunking entirely: each string becomes one memory_items row
-                # whose content IS the override. The body is preserved in
-                # documents.original_text (P5). LLM is never called (P1).
-                override = parsed.index_text
-                if override is not None:
-                    if isinstance(override, str):
-                        override_texts = [override]
-                    elif isinstance(override, list):
-                        override_texts = [str(x) for x in override]
-                    else:
-                        override_texts = [str(override)]
-                    vectors = memory._embed(override_texts)
-                    if len(vectors) != len(override_texts):
-                        raise RuntimeError(
-                            f"embed() returned {len(vectors)} vectors "
-                            f"for {len(override_texts)} inputs"
-                        )
-                    items = []
-                    for text, vec in zip(override_texts, vectors):
-                        items.append({
-                            "content": text,
-                            "original_chunk": text,
-                            "embedding": list(vec),
-                            "metadata": {
-                                **(parsed.metadata or {}),
-                                "index_text_caller_supplied": True,
-                            },
-                            "tags": list(parsed.tags or []),
-                            "update_mode": "append",
-                            "llm_generated": False,
-                        })
-                    upsert_memory_items(
+
+def _write_parsed_docs(
+    memory: "Memory",
+    *,
+    file_path: Path,
+    parsed_iter: list[ParsedDocument],
+    content_hash: str,
+    source: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> SingleFileIndexResult:
+    """Inner write-path. Returns aggregated SingleFileIndexResult per file."""
+    bank_id = memory._default_bank_id
+    statuses: list[str] = []
+    document_ids: list[str] = []
+    total_items_added = 0
+
+    for parsed in parsed_iter:
+        if len(parsed_iter) > 1:
+            doc_hash = hashlib.sha256(
+                (content_hash + parsed.original_text).encode("utf-8")
+            ).hexdigest()
+        else:
+            doc_hash = content_hash
+
+        with memory._pool.connection() as conn:
+            doc_id, _replaced, prior_source = upsert_document(
+                conn,
+                bank_id=bank_id,
+                source=source,
+                content_hash=doc_hash,
+                original_text=parsed.original_text,
+                metadata=parsed.metadata or {},
+                tags=list(parsed.tags or []),
+            )
+            existed = prior_source is not None or (
+                _replaced is False
+                and _doc_already_had_items(conn, doc_id)
+            )
+
+            if existed:
+                if prior_source != source:
+                    update_document_source(
                         conn,
-                        bank_id=bank_id,
                         document_id=doc_id,
-                        items=items,
+                        source=source,
+                        original_text=parsed.original_text,
+                        metadata=parsed.metadata or {},
+                        tags=list(parsed.tags or []),
                     )
-                    items_added += len(items)
-                    conn.commit()
-                    continue
-
-                # Chunk + embed (no override path)
-                if parsed.original_text.strip():
-                    chunks = list(
-                        chunk_text(
-                            parsed.original_text,
-                            file_path,
-                            chunk_size=chunk_size,
-                            overlap=chunk_overlap,
-                        )
-                    )
+                    statuses.append("replaced")
                 else:
-                    chunks = []
+                    statuses.append("unchanged")
+                document_ids.append(str(doc_id))
+                conn.commit()
+                continue
 
-                if not chunks:
-                    conn.commit()
-                    continue
+            replaced_count = _delete_prior_docs_at_source_diff_hash(
+                conn, bank_id=bank_id, source=source, keep_doc_id=doc_id,
+            )
+            if replaced_count > 0:
+                statuses.append("replaced")
+            else:
+                statuses.append("new")
+            document_ids.append(str(doc_id))
 
-                texts = [c.content for c in chunks]
-                vectors = memory._embed(texts)
-                if len(vectors) != len(texts):
+            # T10: frontmatter `index_text:` override (P4 — caller wins).
+            override = parsed.index_text
+            if override is not None:
+                if isinstance(override, str):
+                    override_texts = [override]
+                elif isinstance(override, list):
+                    override_texts = [str(x) for x in override]
+                else:
+                    override_texts = [str(override)]
+                vectors = memory._embed(override_texts)
+                if len(vectors) != len(override_texts):
                     raise RuntimeError(
-                        f"embed() returned {len(vectors)} vectors for {len(texts)} inputs"
+                        f"embed() returned {len(vectors)} vectors "
+                        f"for {len(override_texts)} inputs"
                     )
-
                 items = []
-                for c, vec in zip(chunks, vectors):
-                    # T9 slice: content == chunk (no LLM spine yet).
-                    # original_chunk preserves the chunk text (P5 audit).
+                for text, vec in zip(override_texts, vectors):
                     items.append({
-                        "content": c.content,
-                        "original_chunk": c.content,
+                        "content": text,
+                        "original_chunk": text,
                         "embedding": list(vec),
                         "metadata": {
                             **(parsed.metadata or {}),
-                            **c.to_metadata(),
+                            "index_text_caller_supplied": True,
                         },
                         "tags": list(parsed.tags or []),
                         "update_mode": "append",
@@ -342,8 +318,121 @@ def index_directory(
                     document_id=doc_id,
                     items=items,
                 )
-                items_added += len(items)
+                total_items_added += len(items)
                 conn.commit()
+                continue
+
+            # Chunk + embed (no override path)
+            if parsed.original_text.strip():
+                chunks = list(
+                    chunk_text(
+                        parsed.original_text,
+                        file_path,
+                        chunk_size=chunk_size,
+                        overlap=chunk_overlap,
+                    )
+                )
+            else:
+                chunks = []
+
+            if not chunks:
+                conn.commit()
+                continue
+
+            texts = [c.content for c in chunks]
+            vectors = memory._embed(texts)
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"embed() returned {len(vectors)} vectors for {len(texts)} inputs"
+                )
+
+            items = []
+            for c, vec in zip(chunks, vectors):
+                items.append({
+                    "content": c.content,
+                    "original_chunk": c.content,
+                    "embedding": list(vec),
+                    "metadata": {
+                        **(parsed.metadata or {}),
+                        **c.to_metadata(),
+                    },
+                    "tags": list(parsed.tags or []),
+                    "update_mode": "append",
+                    "llm_generated": False,
+                })
+            upsert_memory_items(
+                conn,
+                bank_id=bank_id,
+                document_id=doc_id,
+                items=items,
+            )
+            total_items_added += len(items)
+            conn.commit()
+
+    # Aggregate per-doc statuses into one file-level status.
+    # Priority: new > replaced > unchanged > skipped.
+    if "new" in statuses:
+        agg = "new"
+    elif "replaced" in statuses:
+        agg = "replaced"
+    elif "unchanged" in statuses:
+        agg = "unchanged"
+    else:
+        agg = "skipped"
+    return SingleFileIndexResult(
+        status=agg,
+        document_ids=tuple(document_ids),
+        items_added=total_items_added,
+    )
+
+
+def index_directory(
+    memory: "Memory",
+    path: str | Path,
+    *,
+    source_prefix: str | None = None,
+    parsers: list[ParserPlugin] | None = None,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+) -> IndexStats:
+    """Walk a directory; delegate per-file write to index_single_file (P7)."""
+    if memory._embed is None:
+        raise RuntimeError(
+            "Memory.index_directory requires an `embed` callable; "
+            "construct Memory(embed=...)"
+        )
+    root = Path(path)
+
+    docs_added = 0
+    docs_replaced = 0
+    items_added = 0
+    files_scanned = 0
+    files_skipped = 0
+    files_unchanged = 0
+    errors = 0
+
+    for file_path in _crawl(root):
+        files_scanned += 1
+        result = index_single_file(
+            memory,
+            file_path,
+            source_prefix=source_prefix,
+            root=root,
+            parsers=parsers,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        if result.status == "new":
+            docs_added += 1
+        elif result.status == "replaced":
+            docs_replaced += 1
+        elif result.status == "unchanged":
+            files_unchanged += 1
+        elif result.status == "error":
+            errors += 1
+        else:
+            files_skipped += 1
+        items_added += result.items_added
 
     return IndexStats(
         documents_added=docs_added,

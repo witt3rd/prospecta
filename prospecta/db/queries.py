@@ -354,6 +354,144 @@ def append_formulate_event(
         )
 
 
+def append_sweep_pass(
+    conn,
+    *,
+    bank_id: str,
+    corpus_path: str,
+    started_at,
+    ended_at,
+    files_seen: int,
+    files_indexed: int,
+    files_pruned: int = 0,
+    errors_count: int = 0,
+    duration_ms: int,
+    error: str | None = None,
+    pass_metadata: dict | None = None,
+) -> int:
+    """Append a row to sweep_passes (A4 append-only history).
+
+    Returns the inserted row's BIGSERIAL id.
+    """
+    import json as _json
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sweep_passes
+                (bank_id, corpus_path, started_at, ended_at,
+                 files_seen, files_indexed, files_pruned, errors_count,
+                 duration_ms, error, pass_metadata)
+            VALUES
+                (%(bank_id)s, %(corpus_path)s, %(started_at)s, %(ended_at)s,
+                 %(files_seen)s, %(files_indexed)s, %(files_pruned)s, %(errors_count)s,
+                 %(duration_ms)s, %(error)s, %(pass_metadata)s::jsonb)
+            RETURNING id
+            """,
+            {
+                "bank_id": bank_id,
+                "corpus_path": corpus_path,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "files_seen": int(files_seen),
+                "files_indexed": int(files_indexed),
+                "files_pruned": int(files_pruned),
+                "errors_count": int(errors_count),
+                "duration_ms": int(duration_ms),
+                "error": error,
+                "pass_metadata": _json.dumps(pass_metadata or {}),
+            },
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+def upsert_sweeper_state(
+    conn,
+    *,
+    bank_id: str,
+    corpus_path: str,
+    last_pass_started_at,
+    last_pass_ended_at,
+    last_pass_files_seen: int,
+    last_pass_files_indexed: int,
+    last_pass_files_pruned: int,
+    last_pass_errors: int,
+    last_pass_duration_ms: int,
+    last_error: str | None = None,
+) -> None:
+    """Upsert sweeper_state (current-state cache, schema.md §9)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sweeper_state
+                (bank_id, corpus_path,
+                 last_pass_started_at, last_pass_ended_at,
+                 last_pass_files_seen, last_pass_files_indexed,
+                 last_pass_files_pruned, last_pass_errors,
+                 last_pass_duration_ms, last_error)
+            VALUES
+                (%(bank_id)s, %(corpus_path)s,
+                 %(started)s, %(ended)s,
+                 %(seen)s, %(indexed)s, %(pruned)s, %(errors)s,
+                 %(duration_ms)s, %(error)s)
+            ON CONFLICT (bank_id, corpus_path) DO UPDATE
+            SET last_pass_started_at = EXCLUDED.last_pass_started_at,
+                last_pass_ended_at   = EXCLUDED.last_pass_ended_at,
+                last_pass_files_seen = EXCLUDED.last_pass_files_seen,
+                last_pass_files_indexed = EXCLUDED.last_pass_files_indexed,
+                last_pass_files_pruned  = EXCLUDED.last_pass_files_pruned,
+                last_pass_errors     = EXCLUDED.last_pass_errors,
+                last_pass_duration_ms = EXCLUDED.last_pass_duration_ms,
+                last_error           = EXCLUDED.last_error
+            """,
+            {
+                "bank_id": bank_id,
+                "corpus_path": corpus_path,
+                "started": last_pass_started_at,
+                "ended": last_pass_ended_at,
+                "seen": int(last_pass_files_seen),
+                "indexed": int(last_pass_files_indexed),
+                "pruned": int(last_pass_files_pruned),
+                "errors": int(last_pass_errors),
+                "duration_ms": int(last_pass_duration_ms),
+                "error": last_error,
+            },
+        )
+
+
+def read_sweeper_state(conn, *, bank_id: str, corpus_path: str) -> dict | None:
+    """Return current sweeper_state row for (bank_id, corpus_path) as a dict,
+    or None if no row exists."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT bank_id, corpus_path,
+                   last_pass_started_at, last_pass_ended_at,
+                   last_pass_files_seen, last_pass_files_indexed,
+                   last_pass_files_pruned, last_pass_errors,
+                   last_pass_duration_ms, last_error
+            FROM sweeper_state
+            WHERE bank_id = %(bank_id)s AND corpus_path = %(corpus_path)s
+            """,
+            {"bank_id": bank_id, "corpus_path": corpus_path},
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "bank_id": row[0],
+            "corpus_path": row[1],
+            "last_pass_started_at": row[2],
+            "last_pass_ended_at": row[3],
+            "last_pass_files_seen": row[4],
+            "last_pass_files_indexed": row[5],
+            "last_pass_files_pruned": row[6],
+            "last_pass_errors": row[7],
+            "last_pass_duration_ms": row[8],
+            "last_error": row[9],
+        }
+
+
 def delete_documents_by_source(
     conn, *, bank_id: str, sources: list[str]
 ) -> int:
