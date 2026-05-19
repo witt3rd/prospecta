@@ -253,7 +253,50 @@ def index_directory(
                 else:
                     docs_added += 1
 
-                # Chunk + embed
+                # T10: frontmatter `index_text:` override (P4 — caller wins).
+                # When the parser surfaces caller-supplied index_text, bypass
+                # chunking entirely: each string becomes one memory_items row
+                # whose content IS the override. The body is preserved in
+                # documents.original_text (P5). LLM is never called (P1).
+                override = parsed.index_text
+                if override is not None:
+                    if isinstance(override, str):
+                        override_texts = [override]
+                    elif isinstance(override, list):
+                        override_texts = [str(x) for x in override]
+                    else:
+                        override_texts = [str(override)]
+                    vectors = memory._embed(override_texts)
+                    if len(vectors) != len(override_texts):
+                        raise RuntimeError(
+                            f"embed() returned {len(vectors)} vectors "
+                            f"for {len(override_texts)} inputs"
+                        )
+                    items = []
+                    for text, vec in zip(override_texts, vectors):
+                        items.append({
+                            "content": text,
+                            "original_chunk": text,
+                            "embedding": list(vec),
+                            "metadata": {
+                                **(parsed.metadata or {}),
+                                "index_text_caller_supplied": True,
+                            },
+                            "tags": list(parsed.tags or []),
+                            "update_mode": "append",
+                            "llm_generated": False,
+                        })
+                    upsert_memory_items(
+                        conn,
+                        bank_id=bank_id,
+                        document_id=doc_id,
+                        items=items,
+                    )
+                    items_added += len(items)
+                    conn.commit()
+                    continue
+
+                # Chunk + embed (no override path)
                 if parsed.original_text.strip():
                     chunks = list(
                         chunk_text(
