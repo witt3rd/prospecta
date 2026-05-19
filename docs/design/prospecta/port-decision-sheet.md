@@ -202,19 +202,18 @@ What it becomes is roughly `Memory.bank_stats(bank_id)` from T4 (already shipped
 
 ### Site 8 — Prune method
 
-**Disposition: PRESERVE-AS-CONCEPT + REWRITE.**
+**Disposition: GENERALIZE + REWRITE.**
 
-The behavior is generic: walk memory_items, check if their `source` path still exists, delete rows whose source is gone. The mechanic ports to:
+`documents.source` is a caller-supplied opaque string. The library MUST NOT introspect or heuristic-classify it. No "is it a path? is it a URL?" inference inside `prune_stale` or anywhere else in the library.
 
-```python
-def prune_stale(self) -> dict:
-    """Remove memory_items rows whose source file no longer exists."""
-    # Find all distinct source paths for this bank
-    # For each, check os.path.exists
-    # Delete memory_items + documents where source is gone
-```
+`Memory.prune_stale()` in v0.1 is therefore *not* "delete rows whose source no longer exists on disk" — that would require the library to interpret what `source` means. Instead:
 
-`dry_run` parameter ports verbatim. The 5000-id pagination for chroma's SQLite-variable-limit dodge (L213) is DELETED — Postgres has no such limit; standard SQL works.
+- **`Memory.prune_stale()`** — removes rows the *caller* has flagged as stale. The semantics of "stale" live in the caller, not the library. v0.1 minimum: removes rows where a caller has set a `stale: true` metadata key, or `Memory.remove_documents(sources: list[str])` is called explicitly with a caller-supplied list.
+- **The sweeper (T14)** — which IS filesystem-aware by design (it walks configured corpus paths) — carries the path semantics. After its walk it computes which `documents.source` values are absent on disk and calls `Memory.remove_documents([...])` with that list. The sweeper has filesystem knowledge; the library doesn't.
+
+`dry_run` parameter survives in both `prune_stale` and `remove_documents`. The 5000-id pagination chroma needed (L213) is DELETED — Postgres has no such limit; standard SQL works.
+
+**Substrate-opacity is the discipline.** Hindsight uses `documents.source` polymorphically; prospecta does the same. The library never names what kinds of sources exist — only the caller and the sweeper know that.
 
 ---
 
@@ -310,7 +309,7 @@ T13 (read-side spine) can be implemented against:
 
 3. **`Memory.clear()` / `Memory.rebuild()` — v0.1 or v0.2?** Plan-v2 §3.4 has both in the v0.1 API. T9 ships them.
 
-4. **Stale source-path tracking** for `prune_stale` — does the schema have a path column? Looking at schema.md §2... yes: `documents.source` (originally the file path, URL, or conv ID per the addendum). prune_stale walks distinct `documents.source` values, checks `os.path.exists`, deletes rows where it's gone (only if the source is a path — URLs and conv IDs skip the existence check).
+4. **Stale source tracking for `prune_stale`** — `documents.source` is a caller-supplied opaque string. The library MUST NOT introspect or classify it (don't check "does it look like a path?"). Filesystem-aware stale detection lives in the sweeper (T14), which walks corpus paths and calls `Memory.remove_documents([sources_gone])`. v0.1 `Memory.prune_stale()` removes only caller-flagged stale rows; it does not interpret `source`.
 
 ---
 
