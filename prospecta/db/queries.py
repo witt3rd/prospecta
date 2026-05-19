@@ -655,3 +655,49 @@ def lexical_search(
         )
         cols = [c.name for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# T15 — Global stats (CLI `prospecta stats`)
+# ---------------------------------------------------------------------------
+
+def stats(conn, *, bank_id: str | None = None) -> dict:
+    """Return aggregate counters across substrate.
+
+    If bank_id is provided, scopes counts to that bank where applicable.
+    Returns a dict with: banks, documents, memory_items, retain_events,
+    recall_events, formulate_events, sweep_passes.
+    """
+    out: dict = {}
+    with conn.cursor() as cur:
+        if bank_id is None:
+            cur.execute("SELECT COUNT(*) FROM banks")
+            out["banks"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM documents")
+            out["documents"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM memory_items")
+            out["memory_items"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM retain_events")
+            out["retain_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM recall_events")
+            out["recall_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM formulate_events")
+            out["formulate_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM sweep_passes")
+            out["sweep_passes"] = cur.fetchone()[0]
+        else:
+            cur.execute("SELECT COUNT(*) FROM banks WHERE bank_id = %s", (bank_id,))
+            out["banks"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM documents WHERE bank_id = %s", (bank_id,))
+            out["documents"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM memory_items WHERE bank_id = %s", (bank_id,))
+            out["memory_items"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM retain_events WHERE bank_id = %s", (bank_id,))
+            out["retain_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM recall_events WHERE bank_id = %s", (bank_id,))
+            out["recall_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM formulate_events WHERE bank_id = %s", (bank_id,))
+            out["formulate_events"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM sweep_passes WHERE bank_id = %s", (bank_id,))
+            out["sweep_passes"] = cur.fetchone()[0]
+    return out

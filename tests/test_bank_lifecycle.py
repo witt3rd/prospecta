@@ -166,9 +166,10 @@ def test_memory_requires_database_url():
 
 def test_cli_create_bank(fresh_db):
     """Smoke-test the CLI subcommand against a fresh DB."""
+    # T15: --database-url is now a global flag, must precede subcommand.
     result = subprocess.run(
-        ["prospecta", "create-bank", "--database-url", fresh_db,
-         "--id", "clitest", "--embedding-dim", "384"],
+        ["prospecta", "--database-url", fresh_db,
+         "create-bank", "--id", "clitest", "--embedding-dim", "384"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -178,22 +179,24 @@ def test_cli_create_bank(fresh_db):
 
 
 def test_cli_stats(fresh_db):
-    """Smoke-test prospecta stats."""
+    """Smoke-test prospecta stats (T15: global counters, pretty output)."""
     subprocess.run(
-        ["prospecta", "create-bank", "--database-url", fresh_db,
-         "--id", "statbank", "--embedding-dim", "384"],
+        ["prospecta", "--database-url", fresh_db,
+         "create-bank", "--id", "statbank", "--embedding-dim", "384"],
         check=True,
         capture_output=True,
         text=True,
         timeout=30,
     )
     result = subprocess.run(
-        ["prospecta", "stats", "--database-url", fresh_db, "--bank", "statbank"],
+        ["prospecta", "--database-url", fresh_db, "--bank", "statbank",
+         "stats", "--bank-only"],
         capture_output=True,
         text=True,
         timeout=30,
     )
-    assert result.returncode == 0
-    output = json.loads(result.stdout)
-    assert output["bank_id"] == "statbank"
-    assert output["documents"] == 0
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    # Pretty output lists counters
+    assert "documents" in result.stdout
+    assert "memory_items" in result.stdout
+    assert "statbank" in result.stdout
