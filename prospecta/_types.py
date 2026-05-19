@@ -81,6 +81,46 @@ class RAGResult:
     queries_to_results: dict[str, list[RecalledMemory]]
 
 
+class DocumentSourceConflictError(Exception):
+    """Raised when retain() finds same content_hash already stored under a different source.
+
+    Per schema.md §6 (re-retain replace-on-source-match): identical content
+    (same content_hash) under a *different* caller-supplied source is treated
+    as an error rather than silently re-binding the document. The library
+    treats `source` as opaque (substrate-opacity); the caller is the only
+    party that knows what conflict-routing should happen.
+    """
+
+    def __init__(
+        self,
+        *,
+        content_hash: str,
+        existing_source: str | None,
+        attempted_source: str | None,
+    ) -> None:
+        self.content_hash = content_hash
+        self.existing_source = existing_source
+        self.attempted_source = attempted_source
+        super().__init__(
+            f"Document with content_hash={content_hash[:12]}... already retained under "
+            f"source={existing_source!r}; refusing to store under source={attempted_source!r}"
+        )
+
+
+class IndexTextGenerationError(Exception):
+    """Raised when LLM returns no usable index_text strings.
+
+    Carries the raw LLM response so the caller (or T14 sweeper) can decide
+    whether to log + skip, retry with a different prompt, or surface.
+    """
+
+    def __init__(self, *, raw_response: str) -> None:
+        self.raw_response = raw_response
+        super().__init__(
+            f"LLM produced no usable index_text strings; raw response: {raw_response[:200]!r}"
+        )
+
+
 Tracer = Callable[[str, dict[str, Any]], None]
 """Observability primitive. Default no-op.
 

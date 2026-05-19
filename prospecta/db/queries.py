@@ -221,6 +221,48 @@ def upsert_memory_items(
     return len(items)
 
 
+def append_retain_event(
+    conn,
+    *,
+    bank_id: str,
+    document_id: str | None,
+    items_count: int,
+    index_text_caller_supplied: bool,
+    duration_ms: int,
+    raw_llm_response: str | None = None,
+    error: str | None = None,
+) -> None:
+    """INSERT a row into retain_events.
+
+    Schema invariants (schema.md §1):
+      - bank_id, items_count, index_text_caller_supplied, duration_ms are NOT NULL.
+      - document_id is NULL-able (deletion sets it NULL via ON DELETE SET NULL).
+      - created_at defaults to now().
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO retain_events
+                (bank_id, document_id, items_count,
+                 index_text_caller_supplied, duration_ms,
+                 raw_llm_response, error)
+            VALUES
+                (%(bank_id)s, %(doc)s, %(items_count)s,
+                 %(caller_supplied)s, %(duration_ms)s,
+                 %(raw)s, %(error)s)
+            """,
+            {
+                "bank_id": bank_id,
+                "doc": document_id,
+                "items_count": int(items_count),
+                "caller_supplied": bool(index_text_caller_supplied),
+                "duration_ms": int(duration_ms),
+                "raw": raw_llm_response,
+                "error": error,
+            },
+        )
+
+
 def delete_documents_by_source(
     conn, *, bank_id: str, sources: list[str]
 ) -> int:

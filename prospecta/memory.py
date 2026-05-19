@@ -192,15 +192,14 @@ class Memory:
         from prospecta import _index
         return _index.remove_documents(self, sources)
 
-    def retain(self, content: str, **kwargs):
-        """STUB — T11 ships the bilateral-spine write path.
+    def retain(self, content: str, **kwargs) -> str:
+        """Write-side bilateral spine. Returns document_id (str UUID).
 
-        For T9 we expose only the file-walked path via index_directory.
-        Single-doc inline retain (with caller-supplied index_text override
-        and replace-on-source-match) lands in T11.
+        See prospecta._retain.retain for full signature and semantics:
+          - replace-on-source-match (schema.md §6)
+          - caller-supplied index_text bypasses LLM (P4)
+          - prompt_override bypasses default prompt (P4)
+          - DocumentSourceConflictError on hash collision with different source
         """
-        raise NotImplementedError(
-            "Memory.retain() is not implemented in T9. "
-            "Use index_directory() for the T9 vertical slice; "
-            "retain() lands in T11 (bilateral-spine write path)."
-        )
+        from prospecta import _retain
+        return _retain.retain(self, content, **kwargs)
