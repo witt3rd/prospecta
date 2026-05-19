@@ -31,5 +31,8 @@ embed-openai = [
     "openai>=1.0",
 ]
 
+[project.scripts]
+prospecta = "prospecta.cli.__main__:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["prospecta"]
