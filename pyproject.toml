@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prospecta"
+version = "0.1.0.dev0"
+description = "Bilateral LLM-mediated memory library with hybrid retrieval over Postgres+pgvector"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Donald Thompson", email = "donald@witt3rd.com" },
+]
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.4",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "testcontainers[postgres]>=4",
+]
+embed-st = [
+    "sentence-transformers>=2.5",
+]
+embed-openai = [
+    "openai>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["prospecta"]
