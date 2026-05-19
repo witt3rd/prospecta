@@ -183,3 +183,51 @@ def tmp_corpus(tmp_path):
         "---\nindex_text: 'second doc question'\n---\nBody two."
     )
     return d
+
+
+@pytest.fixture
+def recording_tracer():
+    from prospecta._tracer import RecordingTracer
+    return RecordingTracer()
+
+
+@pytest.fixture
+def memory_with_recording_tracer(fresh_db, mock_llm, recording_tracer):
+    """Memory wired with RecordingTracer (events captured in-memory,
+    NOT persisted to event tables — PostgresSink is bypassed)."""
+    from prospecta.memory import Memory
+    from tests._stub_embedder import EMBED_DIM, stub_embed
+
+    mem = Memory(
+        database_url=fresh_db,
+        bank_id="test",
+        llm=mock_llm,
+        embed=stub_embed,
+        tracer=recording_tracer,
+    )
+    mem.create_bank("test", embedding_dim=EMBED_DIM)
+    # expose mock_llm on the memory for convenience in tests
+    mem._mock_llm = mock_llm  # type: ignore[attr-defined]
+    yield mem
+    mem.close()
+
+
+@pytest.fixture
+def populated_corpus_with_recording_tracer(memory_with_recording_tracer):
+    """memory_with_recording_tracer + small set of retained docs.
+
+    Uses index_text override so the mock_llm is not consumed during seeding.
+    Tests can inspect the tracer's events after recall_synth fires.
+    """
+    mem = memory_with_recording_tracer
+    seeds = [
+        ("kelly-bio", "Kelly was born on March 4th, 1990 in San Diego.",
+         ["When is Kelly's birthday?", "Where was Kelly born?"]),
+        ("beach-note", "La Jolla has cliffs and tidepools.",
+         ["What is at La Jolla beach?"]),
+    ]
+    for source, body, idx in seeds:
+        mem.retain(body, index_text=idx, source=source)
+    # Clear seeded events so tests assert on the queries-under-test only.
+    mem._tracer.clear()
+    return mem

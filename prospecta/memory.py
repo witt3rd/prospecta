@@ -66,8 +66,15 @@ class Memory:
         self._llm = llm
         self._embed = embed
         self._default_bank_id = bank_id
-        self._tracer = tracer
         self._pool = ConnectionPool(database_url=database_url)
+        # T16: tracer fan-out. Default = PostgresSink (canonical persistence
+        # path for events). Caller may supply NoOpTracer, RecordingTracer,
+        # CompositeTracer, or any Tracer-shaped callable to override.
+        if tracer is not None:
+            self._tracer = tracer
+        else:
+            from prospecta.observability import PostgresSink
+            self._tracer = PostgresSink(pool=self._pool, bank_id=bank_id)
         # T14: sweeper thread state (lazy; created in start_sweeper).
         self._sweeper_thread = None  # type: ignore[assignment]
         self._sweeper_config = None  # type: ignore[assignment]
@@ -272,7 +279,6 @@ class Memory:
         import time as _time
 
         from prospecta._formulate import formulate_queries as _impl
-        from prospecta.db.queries import append_formulate_event
 
         if self._llm is None:
             raise RuntimeError(
@@ -289,31 +295,32 @@ class Memory:
         )
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 
-        with self._pool.connection() as conn:
-            append_formulate_event(
-                conn,
-                bank_id=self._default_bank_id,
-                message=message,
-                n_queries=len(queries),
-                parse_fallback=outcome.parse_fallback,
-                raw_response=outcome.raw_response,
-                error_kind=outcome.error_kind,
-                duration_ms=duration_ms,
-                json_mode_used=True,
-            )
-            conn.commit()
+        # T16: tracer dispatch (was direct append_formulate_event;
+        # default PostgresSink performs the row write).
+        try:
+            self._tracer("llm_call", {
+                "bank_id": self._default_bank_id,
+                "purpose": "formulate_queries",
+                "json_mode": True,
+                "duration_ms": duration_ms,
+                "messages_count": 1,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on llm_call; ignoring")
 
-        if self._tracer is not None:
-            try:
-                self._tracer("formulate", {
-                    "bank_id": self._default_bank_id,
-                    "n_queries": len(queries),
-                    "parse_fallback": outcome.parse_fallback,
-                    "error_kind": outcome.error_kind,
-                    "duration_ms": duration_ms,
-                })
-            except Exception:  # pragma: no cover
-                logger.exception("tracer raised; ignoring")
+        try:
+            self._tracer("formulate_queries", {
+                "bank_id": self._default_bank_id,
+                "message": message,
+                "n_queries": len(queries),
+                "parse_fallback": outcome.parse_fallback,
+                "raw_response": outcome.raw_response,
+                "error_kind": outcome.error_kind,
+                "duration_ms": duration_ms,
+                "json_mode_used": True,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on formulate_queries; ignoring")
 
         return queries
 
@@ -336,7 +343,6 @@ class Memory:
         import time as _time
 
         from prospecta import _rag
-        from prospecta.db.queries import append_recall_event
 
         if self._llm is None:
             raise RuntimeError(
@@ -369,39 +375,41 @@ class Memory:
             flat_results.extend(results)
 
         # 3. Synthesize — full content (P5), no truncation.
+        synth_t0 = _time.monotonic()
         synthesis = _rag.synthesize(
             message,
             flat_results,
             self._llm,
             prompt_override=synth_prompt_override,
         )
+        synth_duration_ms = int((_time.monotonic() - synth_t0) * 1000)
 
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 
-        # 4. Append recall_events row.
-        with self._pool.connection() as conn:
-            append_recall_event(
-                conn,
-                bank_id=bank_id,
-                queries=[q.text for q in formulated],
-                mode=mode,
-                n_results=len(flat_results),
-                duration_ms=duration_ms,
-            )
-            conn.commit()
+        # 4. T16: tracer dispatch (was direct append_recall_event +
+        # tracer; PostgresSink owns the row write).
+        try:
+            self._tracer("llm_call", {
+                "bank_id": bank_id,
+                "purpose": "synthesize",
+                "json_mode": False,
+                "duration_ms": synth_duration_ms,
+                "messages_count": 1,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on llm_call; ignoring")
 
-        # 5. tracer event (P3 observability)
-        if self._tracer is not None:
-            try:
-                self._tracer("recall", {
-                    "bank_id": bank_id,
-                    "n_queries": len(formulated),
-                    "n_results": len(flat_results),
-                    "mode": mode,
-                    "duration_ms": duration_ms,
-                })
-            except Exception:  # pragma: no cover
-                logger.exception("tracer raised; ignoring")
+        try:
+            self._tracer("recall", {
+                "bank_id": bank_id,
+                "queries": [q.text for q in formulated],
+                "mode": mode,
+                "n_results": len(flat_results),
+                "duration_ms": duration_ms,
+                "trace": None,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on recall; ignoring")
 
         return RAGResult(
             synthesis=synthesis,
@@ -459,9 +467,15 @@ class Memory:
         return ok
 
     def shutdown(self) -> None:
-        """Stop sweeper (if running) + close pool. Idempotent."""
+        """Stop sweeper (if running) + close tracer + pool. Idempotent."""
         try:
             if self._sweeper_thread is not None:
                 self.stop_sweeper(timeout=5.0)
         finally:
+            close_fn = getattr(self._tracer, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:  # pragma: no cover
+                    logger.exception("tracer.close() raised; ignoring")
             self.close()

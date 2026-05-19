@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING
 from prospecta._index_text import generate_index_text
 from prospecta._types import DocumentSourceConflictError
 from prospecta.db.queries import (
-    append_retain_event,
     delete_memory_items_for_document,
     upsert_memory_items,
 )
@@ -131,6 +130,18 @@ def retain(
             prompt_override=index_text_prompt_override,
             context=prompt_context,
         )
+        # T16: tracer event for the LLM call (default PostgresSink writes
+        # to llm_calls; tests using RecordingTracer observe in-memory).
+        try:
+            memory._tracer("llm_call", {
+                "bank_id": bank_id,
+                "purpose": "index_text",
+                "json_mode": False,
+                "duration_ms": int((time.monotonic() - t_start) * 1000),
+                "messages_count": 1,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on llm_call (index_text); ignoring")
         # Best-effort raw response capture for retain_events audit. The
         # generate_index_text helper doesn't expose the raw response on
         # success; we leave raw_llm_response=None for now (only populated
@@ -217,32 +228,23 @@ def retain(
         )
 
         duration_ms = int((time.monotonic() - t_start) * 1000)
-
-        append_retain_event(
-            conn,
-            bank_id=bank_id,
-            document_id=document_id,
-            items_count=len(items),
-            index_text_caller_supplied=caller_supplied,
-            duration_ms=duration_ms,
-            raw_llm_response=raw_llm_response,
-            error=None,
-        )
         conn.commit()
 
-    # tracer (P3 observability primitive)
-    if memory._tracer is not None:
-        try:
-            memory._tracer("retain", {
-                "bank_id": bank_id,
-                "document_id": document_id,
-                "items_count": len(items),
-                "index_text_caller_supplied": caller_supplied,
-                "duration_ms": duration_ms,
-                "source": resolved_source,
-            })
-        except Exception:  # pragma: no cover — tracer must not break retain
-            logger.exception("tracer raised; ignoring")
+    # T16: tracer dispatch (was direct append_retain_event; default
+    # PostgresSink performs the row write).
+    try:
+        memory._tracer("retain", {
+            "bank_id": bank_id,
+            "document_id": document_id,
+            "items_count": len(items),
+            "index_text_caller_supplied": caller_supplied,
+            "duration_ms": duration_ms,
+            "raw_llm_response": raw_llm_response,
+            "error": None,
+            "source": resolved_source,
+        })
+    except Exception:  # pragma: no cover — tracer must not break retain
+        logger.exception("tracer raised; ignoring")
 
     return document_id
 

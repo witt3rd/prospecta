@@ -459,6 +459,41 @@ def upsert_sweeper_state(
         )
 
 
+def append_llm_call(
+    conn,
+    *,
+    bank_id: str | None,
+    prompt_name: str,
+    messages_count: int,
+    json_mode: bool,
+    duration_ms: int,
+    error: str | None = None,
+) -> None:
+    """Append a row to llm_calls (schema.md §1).
+
+    bank_id is nullable (provider/setup-time calls may not have one).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO llm_calls
+                (bank_id, prompt_name, messages_count, json_mode,
+                 duration_ms, error)
+            VALUES
+                (%(bank_id)s, %(prompt_name)s, %(messages_count)s,
+                 %(json_mode)s, %(duration_ms)s, %(error)s)
+            """,
+            {
+                "bank_id": bank_id,
+                "prompt_name": prompt_name,
+                "messages_count": int(messages_count),
+                "json_mode": bool(json_mode),
+                "duration_ms": int(duration_ms),
+                "error": error,
+            },
+        )
+
+
 def read_sweeper_state(conn, *, bank_id: str, corpus_path: str) -> dict | None:
     """Return current sweeper_state row for (bank_id, corpus_path) as a dict,
     or None if no row exists."""

@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prospecta._ignore import should_ignore
-from prospecta.db.queries import append_sweep_pass, upsert_sweeper_state
 
 if TYPE_CHECKING:
     from prospecta.memory import Memory
@@ -132,6 +131,7 @@ def run_one_pass(
             if stop_event is not None and stop_event.is_set():
                 break
             files_scanned += 1
+            file_t0 = time.monotonic()
             try:
                 # P7: single write path. Sweeper does NOT reach into _index
                 # internals; it calls the same Memory.index_single_file that
@@ -148,6 +148,18 @@ def run_one_pass(
                 logger.warning(
                     "sweeper: index_single_file failed for %s: %s", fp, e
                 )
+                # T16: fire tracer event for the per-file failure too.
+                try:
+                    memory._tracer("index_single_file", {
+                        "bank_id": bank_id,
+                        "source": str(fp),
+                        "status": "error",
+                        "duration_ms": int((time.monotonic() - file_t0) * 1000),
+                        "content_hash": None,
+                        "error": repr(e),
+                    })
+                except Exception:  # pragma: no cover
+                    logger.exception("tracer raised on index_single_file; ignoring")
                 continue
 
             if result.status == "error":
@@ -161,53 +173,42 @@ def run_one_pass(
             else:  # unchanged | skipped
                 files_skipped += 1
 
+            # T16: tracer event for the per-file outcome (PostgresSink no-ops
+            # for v0.1 since no index_events table; RecordingTracer captures).
+            try:
+                memory._tracer("index_single_file", {
+                    "bank_id": bank_id,
+                    "source": str(fp),
+                    "status": result.status,
+                    "duration_ms": int((time.monotonic() - file_t0) * 1000),
+                    "content_hash": getattr(result, "content_hash", None),
+                    "error": getattr(result, "error", None),
+                })
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised on index_single_file; ignoring")
+
         finished_at = datetime.now(timezone.utc)
         duration_ms = int((time.monotonic() - t0) * 1000)
 
-        # Persist sweep_passes + sweeper_state via the same library
-        # transaction (schema.md §8 co-write contract).
-        pass_error_summary = (
-            f"{len(error_paths)} file(s) failed; first: {error_paths[0]}"
-            if error_paths
-            else None
-        )
+        # T16: tracer dispatch (was direct append_sweep_pass +
+        # upsert_sweeper_state co-write; default PostgresSink performs both
+        # writes atomically per schema.md §8 co-write contract).
         try:
-            with memory._pool.connection() as conn:
-                append_sweep_pass(
-                    conn,
-                    bank_id=bank_id,
-                    corpus_path=str(corpus),
-                    started_at=started_at,
-                    ended_at=finished_at,
-                    files_seen=files_scanned,
-                    files_indexed=files_indexed,
-                    files_pruned=0,
-                    errors_count=errors,
-                    duration_ms=duration_ms,
-                    error=pass_error_summary,
-                    pass_metadata={
-                        "error_paths": [
-                            {"path": p, "error": err}
-                            for (p, err) in error_paths
-                        ]
-                    } if error_paths else None,
-                )
-                upsert_sweeper_state(
-                    conn,
-                    bank_id=bank_id,
-                    corpus_path=str(corpus),
-                    last_pass_started_at=started_at,
-                    last_pass_ended_at=finished_at,
-                    last_pass_files_seen=files_scanned,
-                    last_pass_files_indexed=files_indexed,
-                    last_pass_files_pruned=0,
-                    last_pass_errors=errors,
-                    last_pass_duration_ms=duration_ms,
-                    last_error=pass_error_summary,
-                )
-                conn.commit()
+            memory._tracer("sweep_pass", {
+                "bank_id": bank_id,
+                "corpus_path": str(corpus),
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_ms": duration_ms,
+                "files_scanned": files_scanned,
+                "files_indexed": files_indexed,
+                "files_skipped": files_skipped,
+                "files_pruned": 0,
+                "errors": errors,
+                "error_paths": error_paths,
+            })
         except Exception:  # pragma: no cover — observability shouldn't poison
-            logger.exception("sweeper: failed to persist sweep_passes/sweeper_state")
+            logger.exception("sweeper: tracer raised on sweep_pass; ignoring")
 
         results.append(SweepResult(
             corpus_path=corpus,
