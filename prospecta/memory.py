@@ -162,3 +162,45 @@ class Memory:
     def close(self) -> None:
         """Close the connection pool."""
         self._pool.close()
+
+    # ------------------------------------------------------------------
+    # T9 — index/search/remove (delegate to _index)
+    # ------------------------------------------------------------------
+
+    def index_directory(self, path, **kwargs):
+        """Walk a directory, parse + chunk + embed + index each file.
+
+        See prospecta._index.index_directory for full signature.
+        """
+        from prospecta import _index
+        return _index.index_directory(self, path, **kwargs)
+
+    def search(self, text: str, **kwargs):
+        """Search across the default bank.
+
+        Modes: 'hybrid' (default), 'semantic', 'lexical'. RecalledMemory.scores
+        is always populated with three numeric keys (A6 COALESCE invariant).
+        """
+        from prospecta import _index
+        return _index.search(self, text, **kwargs)
+
+    def remove_documents(self, sources: list[str]) -> int:
+        """Explicit removal by caller-supplied source list (P5 substrate-opacity).
+
+        Caller decides which sources are stale. The library does not introspect.
+        """
+        from prospecta import _index
+        return _index.remove_documents(self, sources)
+
+    def retain(self, content: str, **kwargs):
+        """STUB — T11 ships the bilateral-spine write path.
+
+        For T9 we expose only the file-walked path via index_directory.
+        Single-doc inline retain (with caller-supplied index_text override
+        and replace-on-source-match) lands in T11.
+        """
+        raise NotImplementedError(
+            "Memory.retain() is not implemented in T9. "
+            "Use index_directory() for the T9 vertical slice; "
+            "retain() lands in T11 (bilateral-spine write path)."
+        )

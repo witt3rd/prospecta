@@ -57,6 +57,19 @@ class RecalledMemory:
 
 
 @dataclass(frozen=True)
+class IndexStats:
+    """Result of Memory.index_directory(). Sibling to RAGResult shape."""
+
+    documents_added: int = 0
+    documents_replaced: int = 0
+    memory_items_added: int = 0
+    files_scanned: int = 0
+    files_skipped: int = 0
+    files_unchanged: int = 0
+    errors: int = 0
+
+
+@dataclass(frozen=True)
 class RAGResult:
     """Result of recall_synth. queries_to_results enables per-query trace
     (A9 fold from prospecta-impl ralplan Round 2).
