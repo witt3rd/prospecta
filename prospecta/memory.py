@@ -251,14 +251,60 @@ class Memory:
         context: str | None = None,
         prompt_override: str | None = None,
     ) -> "list[Query]":
-        """STUB (T12): return single-query echo of the message.
+        """Read-side spine: LLM-mediated multi-query expansion (JSON-mode).
 
-        T13 replaces this with a real LLM-driven query-formulation call
-        (json_mode=True). Until then, the chain degenerates to one query
-        equal to the input message. Callers must not depend on the count
-        being exactly one — recall_synth is written to handle any number.
+        Returns list[Query]. On parse failure, falls back to
+        [Query(text=message)] and records a formulate_events row with
+        parse_fallback=True (schema.md §13). The library NEVER raises
+        on malformed LLM JSON.
         """
-        return [Query(text=message)]
+        import time as _time
+
+        from prospecta._formulate import formulate_queries as _impl
+        from prospecta.db.queries import append_formulate_event
+
+        if self._llm is None:
+            raise RuntimeError(
+                "Memory.formulate_queries requires an `llm` callable; "
+                "construct Memory(llm=...)"
+            )
+
+        t_start = _time.monotonic()
+        queries, outcome = _impl(
+            message,
+            llm=self._llm,
+            context=context,
+            prompt_override=prompt_override,
+        )
+        duration_ms = int((_time.monotonic() - t_start) * 1000)
+
+        with self._pool.connection() as conn:
+            append_formulate_event(
+                conn,
+                bank_id=self._default_bank_id,
+                message=message,
+                n_queries=len(queries),
+                parse_fallback=outcome.parse_fallback,
+                raw_response=outcome.raw_response,
+                error_kind=outcome.error_kind,
+                duration_ms=duration_ms,
+                json_mode_used=True,
+            )
+            conn.commit()
+
+        if self._tracer is not None:
+            try:
+                self._tracer("formulate", {
+                    "bank_id": self._default_bank_id,
+                    "n_queries": len(queries),
+                    "parse_fallback": outcome.parse_fallback,
+                    "error_kind": outcome.error_kind,
+                    "duration_ms": duration_ms,
+                })
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised; ignoring")
+
+        return queries
 
     def recall_synth(
         self,

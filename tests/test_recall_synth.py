@@ -31,15 +31,23 @@ def _recall_events(database_url: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def test_recall_synth_calls_synthesize(populated_corpus, mock_llm):
-    mock_llm.canned = "Kelly's birthday is March 4th."
+    # T13: formulate_queries now uses real LLM (JSON-mode). Discriminate
+    # the two LLM calls (formulate=json_mode, synthesize=plain) so we can
+    # set distinct responses for each.
+    def respond(messages, *, json_mode):
+        if json_mode:
+            return '{"queries": [{"text": "kelly"}]}'
+        return "Kelly's birthday is March 4th."
+
+    mock_llm.set_response(respond)
     result = populated_corpus.recall_synth("what about kelly?")
     assert isinstance(result, RAGResult)
-    assert result.synthesis  # non-empty
     assert result.synthesis == "Kelly's birthday is March 4th."
-    assert len(result.queries) == 1  # stub returns single query
+    assert len(result.queries) == 1
     assert result.queries_to_results  # dict per query
-    # Exactly one synthesize call
-    assert len(mock_llm.calls) == 1
+    # Two calls now: formulate (json_mode=True), synthesize (json_mode=False).
+    assert len(mock_llm.calls) == 2
+    assert mock_llm.calls[0]["json_mode"] is True
     assert mock_llm.calls[-1]["json_mode"] is False
 
 
@@ -130,14 +138,16 @@ def test_recall_synth_full_content_preserved(populated_corpus):
 
 
 # ---------------------------------------------------------------------------
-# 8. formulate_queries stub returns single-query echo
+# 8. formulate_queries falls back cleanly when default mock returns non-JSON
+#    (T13: stub is gone; behavior under malformed LLM output is parse-fallback)
 # ---------------------------------------------------------------------------
 
-def test_formulate_queries_stub(memory_with_bank_and_mock_llm):
+def test_formulate_queries_default_mock_falls_back(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
+    # Default mock_llm returns question-shaped strings (not JSON), so the
+    # real formulate_queries should fall back to [Query(text=message)].
+    # Comprehensive parse-fallback coverage lives in test_formulate_queries.py.
     out = mem.formulate_queries("anything")
     assert len(out) == 1
     assert isinstance(out[0], Query)
     assert out[0].text == "anything"
-    # Stub does NOT call the LLM (T13 owns that)
-    # mock_llm.calls would have grown if formulate touched LLM

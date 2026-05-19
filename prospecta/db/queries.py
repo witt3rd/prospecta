@@ -301,6 +301,59 @@ def append_recall_event(
         )
 
 
+def append_formulate_event(
+    conn,
+    *,
+    bank_id: str,
+    message: str,
+    n_queries: int,
+    parse_fallback: bool,
+    raw_response: str | None,
+    error_kind: str | None,
+    duration_ms: int,
+    json_mode_used: bool = True,
+    metadata: dict | None = None,
+) -> None:
+    """INSERT a row into formulate_events.
+
+    Schema invariants (schema.md §1; migration 0001_initial.sql):
+      - bank_id, message, n_queries_out, json_mode_used, parse_fallback,
+        raw_response, duration_ms are NOT NULL.
+      - created_at defaults to now().
+
+    parse_fallback is canonical observability per schema.md §13. Raw LLM
+    output is preserved verbatim. error_kind is passed in for symmetry
+    with the in-memory FormulateOutcome but is NOT currently persisted —
+    the table shape does not yet have an error_kind column; if needed,
+    T14 sweeper can extend the schema.
+    """
+    # error_kind is not yet persisted (no column); accept for forward
+    # compatibility and to keep the Memory wrapper symmetric.
+    _ = error_kind
+    _ = metadata
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO formulate_events
+                (bank_id, message, n_queries_out, json_mode_used,
+                 parse_fallback, raw_response, duration_ms)
+            VALUES
+                (%(bank_id)s, %(message)s, %(n_queries)s, %(json_mode_used)s,
+                 %(parse_fallback)s, %(raw_response)s, %(duration_ms)s)
+            """,
+            {
+                "bank_id": bank_id,
+                "message": message,
+                "n_queries": int(n_queries),
+                "json_mode_used": bool(json_mode_used),
+                "parse_fallback": bool(parse_fallback),
+                # schema column is NOT NULL; coerce None → empty string.
+                "raw_response": raw_response if raw_response is not None else "",
+                "duration_ms": int(duration_ms),
+            },
+        )
+
+
 def delete_documents_by_source(
     conn, *, bank_id: str, sources: list[str]
 ) -> int:
