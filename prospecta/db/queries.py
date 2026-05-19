@@ -263,6 +263,44 @@ def append_retain_event(
         )
 
 
+def append_recall_event(
+    conn,
+    *,
+    bank_id: str,
+    queries: list[str],
+    mode: str,
+    n_results: int,
+    duration_ms: int,
+    trace: dict | None = None,
+) -> None:
+    """INSERT a row into recall_events.
+
+    Schema invariants (schema.md §1):
+      - bank_id, queries (JSONB), mode, n_results, duration_ms are NOT NULL.
+      - query_timestamp, trace are nullable.
+      - created_at defaults to now().
+    """
+    import json as _json
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO recall_events
+                (bank_id, queries, mode, n_results, duration_ms, trace)
+            VALUES
+                (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
+                 %(n_results)s, %(duration_ms)s, %(trace)s::jsonb)
+            """,
+            {
+                "bank_id": bank_id,
+                "queries": _json.dumps(list(queries)),
+                "mode": mode,
+                "n_results": int(n_results),
+                "duration_ms": int(duration_ms),
+                "trace": _json.dumps(trace) if trace is not None else None,
+            },
+        )
+
+
 def delete_documents_by_source(
     conn, *, bank_id: str, sources: list[str]
 ) -> int:

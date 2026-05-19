@@ -137,3 +137,34 @@ def memory_with_bank_and_mock_llm(fresh_db, mock_llm):
     mem.create_bank("test", embedding_dim=EMBED_DIM)
     yield mem
     mem.close()
+
+
+@pytest.fixture
+def populated_corpus(memory_with_bank_and_mock_llm):
+    """Memory with a small set of retained docs.
+
+    Uses retain() with index_text override so the mock_llm is NOT consumed
+    during seeding (P4 caller-wins). Tests can still inspect mock_llm.calls
+    cleanly after recall_synth fires.
+    """
+    mem = memory_with_bank_and_mock_llm
+    seeds = [
+        (
+            "kelly-bio",
+            "Kelly was born on March 4th, 1990 in San Diego. She loves the beach.",
+            ["When is Kelly's birthday?", "Where was Kelly born?"],
+        ),
+        (
+            "beach-note",
+            "The beach at La Jolla has cliffs and tidepools. Kelly visits often.",
+            ["What is at La Jolla beach?"],
+        ),
+        (
+            "forge-note",
+            "The forge bench stays warm between sessions. Sparks light the dark.",
+            ["What does the forge bench feel like?"],
+        ),
+    ]
+    for source, body, idx in seeds:
+        mem.retain(body, index_text=idx, source=source)
+    return mem
