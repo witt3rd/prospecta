@@ -1,0 +1,1 @@
+The annual catering vendor review covers fifteen approved suppliers for events along the coastline. Each vendor must hold current food-service permits and submit insurance certificates. The logistics planning committee meets quarterly to review event-hosting capacity at the ocean venues under contract.

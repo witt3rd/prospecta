@@ -1,0 +1,1 @@
+In the garden, tulips bloomed first this year. Roses followed a few weeks later, their petals heavy with morning dew. The compost pile near the back fence has been turning well through the warm months. Watering happens every other day in the afternoon shade.

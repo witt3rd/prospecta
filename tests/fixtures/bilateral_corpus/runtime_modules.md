@@ -1,0 +1,1 @@
+The software module loaded a new function definition into memory and bound it to the runtime symbol table. Each subsequent call to the function invoked the compiled bytecode through the dispatch table. Module-level imports resolved at startup; lazy imports deferred until first use.

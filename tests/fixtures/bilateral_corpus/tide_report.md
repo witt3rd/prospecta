@@ -1,0 +1,1 @@
+Tide tables for the pacific coastline this season run higher than last year. Parking near the ocean venue is constrained on weekends. The sand erosion along the shore has prompted a coastal commission review; permits for new construction near the beach have been temporarily suspended.

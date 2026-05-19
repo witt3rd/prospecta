@@ -1,0 +1,1 @@
+The compiler's parser walks the abstract syntax tree node by node, emitting bytecode for each function definition encountered. Module imports are resolved at the binary linker stage, where unresolved symbols become hard errors. Syntax errors surface during the lexer pass.
