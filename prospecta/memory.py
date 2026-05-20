@@ -28,6 +28,36 @@ from prospecta.db.queries import (
 logger = logging.getLogger(__name__)
 
 
+def _serialize_recall_results(results: "list[RecalledMemory]") -> list[dict]:
+    """Serialize a flat list of RecalledMemory for the recall_events.results
+    JSONB column (migration 0003).
+
+    One dict per result, in flat-list order (rank is 1-indexed within the
+    flat list — recall_synth flattens queries_to_results preserving query
+    order so the rank reflects surface position across all queries):
+
+      - source: documents.source (file path / URL / conv ID)
+      - document_id: UUID string
+      - rank: 1-indexed position in flat list
+      - scores: {semantic, lexical, lexical_body, rrf} all numeric (A6)
+      - content_preview: first 200 chars of RecalledMemory.content
+        (NOT a P5 violation — full content stays in memory_items;
+        this is the inspection-only audit trail per 0003 column comment)
+    """
+    PREVIEW_LEN = 200
+    out: list[dict] = []
+    for i, r in enumerate(results, start=1):
+        content = r.content if isinstance(r.content, str) else str(r.content)
+        out.append({
+            "source": r.source,
+            "document_id": str(r.document_id),
+            "rank": i,
+            "scores": dict(r.scores) if r.scores is not None else {},
+            "content_preview": content[:PREVIEW_LEN],
+        })
+    return out
+
+
 class BankConfigConflict(Exception):
     """Raised when create_bank is called with a different embedding_dim
     than an existing bank with the same bank_id."""
@@ -242,7 +272,12 @@ class Memory:
         Each query runs its own search(); results concatenated preserving
         query order and intra-query rank. Duplicate memory_item_ids across
         queries are KEPT (caller may use this signal).
+
+        Migration 0003: fires a 'recall' tracer event with the durable
+        results array (no synthesis — that's recall_synth's territory).
         """
+        import time as _time
+
         coerced: list[Query] = []
         for q in queries:
             if isinstance(q, str):
@@ -250,6 +285,7 @@ class Memory:
             else:
                 coerced.append(q)
 
+        t_start = _time.monotonic()
         flat: list[RecalledMemory] = []
         for q in coerced:
             results = self.search(
@@ -260,6 +296,22 @@ class Memory:
                 rrf_k=rrf_k,
             )
             flat.extend(results)
+        duration_ms = int((_time.monotonic() - t_start) * 1000)
+
+        try:
+            self._tracer("recall", {
+                "bank_id": self._default_bank_id,
+                "queries": [q.text for q in coerced],
+                "mode": mode,
+                "n_results": len(flat),
+                "duration_ms": duration_ms,
+                "trace": None,
+                "results": _serialize_recall_results(flat),
+                "synthesis": None,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on recall; ignoring")
+
         return flat
 
     def formulate_queries(
@@ -296,7 +348,9 @@ class Memory:
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 
         # T16: tracer dispatch (was direct append_formulate_event;
-        # default PostgresSink performs the row write).
+        # default PostgresSink performs the row write). Migration 0003:
+        # llm_call payload carries verbatim prompt + response for durable
+        # trace (opt-in via PostgresSink(persist_llm_text=...)).
         try:
             self._tracer("llm_call", {
                 "bank_id": self._default_bank_id,
@@ -304,6 +358,8 @@ class Memory:
                 "json_mode": True,
                 "duration_ms": duration_ms,
                 "messages_count": 1,
+                "prompt_text": outcome.prompt,
+                "response_text": outcome.raw_response,
             })
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on llm_call; ignoring")
@@ -376,7 +432,7 @@ class Memory:
 
         # 3. Synthesize — full content (P5), no truncation.
         synth_t0 = _time.monotonic()
-        synthesis = _rag.synthesize(
+        synthesis, synth_prompt = _rag.synthesize(
             message,
             flat_results,
             self._llm,
@@ -386,8 +442,10 @@ class Memory:
 
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 
-        # 4. T16: tracer dispatch (was direct append_recall_event +
-        # tracer; PostgresSink owns the row write).
+        # 4. T16 + migration 0003: tracer dispatch carries the full durable
+        # trace — llm_call gets verbatim prompt + response; recall gets the
+        # results array (200-char content_preview per element; full content
+        # stays in memory_items) + synthesis text.
         try:
             self._tracer("llm_call", {
                 "bank_id": bank_id,
@@ -395,6 +453,8 @@ class Memory:
                 "json_mode": False,
                 "duration_ms": synth_duration_ms,
                 "messages_count": 1,
+                "prompt_text": synth_prompt,
+                "response_text": synthesis,
             })
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on llm_call; ignoring")
@@ -407,6 +467,8 @@ class Memory:
                 "n_results": len(flat_results),
                 "duration_ms": duration_ms,
                 "trace": None,
+                "results": _serialize_recall_results(flat_results),
+                "synthesis": synthesis,
             })
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on recall; ignoring")

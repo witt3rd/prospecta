@@ -44,6 +44,10 @@ class FormulateOutcome:
     parse_fallback: bool
     raw_response: str
     error_kind: ErrorKind | None
+    prompt: str = ""
+    """The rendered prompt text sent to the LLM (verbatim). Captured here
+    so the Memory wrapper can thread it through to the llm_calls tracer
+    payload (migration 0003)."""
 
 
 def formulate_queries(
@@ -85,11 +89,13 @@ def formulate_queries(
             error_kind,
         )
         return [Query(text=message)], FormulateOutcome(
-            parse_fallback=True, raw_response=raw, error_kind=error_kind
+            parse_fallback=True, raw_response=raw, error_kind=error_kind,
+            prompt=rendered,
         )
 
     return queries, FormulateOutcome(
-        parse_fallback=False, raw_response=raw, error_kind=None
+        parse_fallback=False, raw_response=raw, error_kind=None,
+        prompt=rendered,
     )
 
 

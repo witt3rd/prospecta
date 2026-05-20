@@ -98,6 +98,8 @@ def retain(
     # ------------------------------------------------------------------
     caller_supplied: bool
     raw_llm_response: str | None = None
+    rendered_prompt: str | None = None
+    index_text_generated: list[str] | None = None
     if index_text is not None:
         caller_supplied = True
         if isinstance(index_text, str):
@@ -124,14 +126,16 @@ def retain(
             "source": resolved_source,
             **extra_metadata,
         }
-        index_text_list = generate_index_text(
+        index_text_list, rendered_prompt, raw_llm_response = generate_index_text(
             content,
             memory._llm,
             prompt_override=index_text_prompt_override,
             context=prompt_context,
         )
-        # T16: tracer event for the LLM call (default PostgresSink writes
-        # to llm_calls; tests using RecordingTracer observe in-memory).
+        index_text_generated = list(index_text_list)
+        # T16 + 0003: tracer event for the LLM call carries verbatim
+        # prompt + response so PostgresSink can durably persist them
+        # (opt-in via PostgresSink(persist_llm_text=...)).
         try:
             memory._tracer("llm_call", {
                 "bank_id": bank_id,
@@ -139,14 +143,11 @@ def retain(
                 "json_mode": False,
                 "duration_ms": int((time.monotonic() - t_start) * 1000),
                 "messages_count": 1,
+                "prompt_text": rendered_prompt,
+                "response_text": raw_llm_response,
             })
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on llm_call (index_text); ignoring")
-        # Best-effort raw response capture for retain_events audit. The
-        # generate_index_text helper doesn't expose the raw response on
-        # success; we leave raw_llm_response=None for now (only populated
-        # on failure paths via IndexTextGenerationError, surfaced by
-        # T14 sweeper).
 
     # ------------------------------------------------------------------
     # Re-retain check (schema.md §6).
@@ -242,6 +243,7 @@ def retain(
             "raw_llm_response": raw_llm_response,
             "error": None,
             "source": resolved_source,
+            "index_text_generated": index_text_generated,
         })
     except Exception:  # pragma: no cover — tracer must not break retain
         logger.exception("tracer raised; ignoring")

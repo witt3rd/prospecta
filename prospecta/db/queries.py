@@ -231,12 +231,15 @@ def append_retain_event(
     duration_ms: int,
     raw_llm_response: str | None = None,
     error: str | None = None,
+    index_text_generated: list[str] | None = None,
 ) -> None:
     """INSERT a row into retain_events.
 
-    Schema invariants (schema.md §1):
+    Schema invariants (schema.md §1, migration 0003):
       - bank_id, items_count, index_text_caller_supplied, duration_ms are NOT NULL.
       - document_id is NULL-able (deletion sets it NULL via ON DELETE SET NULL).
+      - index_text_generated is the verbatim LLM-authored list (NULL when caller
+        supplied index_text or pre-0003).
       - created_at defaults to now().
     """
     with conn.cursor() as cur:
@@ -245,11 +248,11 @@ def append_retain_event(
             INSERT INTO retain_events
                 (bank_id, document_id, items_count,
                  index_text_caller_supplied, duration_ms,
-                 raw_llm_response, error)
+                 raw_llm_response, error, index_text_generated)
             VALUES
                 (%(bank_id)s, %(doc)s, %(items_count)s,
                  %(caller_supplied)s, %(duration_ms)s,
-                 %(raw)s, %(error)s)
+                 %(raw)s, %(error)s, %(idx_gen)s)
             """,
             {
                 "bank_id": bank_id,
@@ -259,6 +262,9 @@ def append_retain_event(
                 "duration_ms": int(duration_ms),
                 "raw": raw_llm_response,
                 "error": error,
+                "idx_gen": list(index_text_generated)
+                if index_text_generated is not None
+                else None,
             },
         )
 
@@ -272,12 +278,18 @@ def append_recall_event(
     n_results: int,
     duration_ms: int,
     trace: dict | None = None,
+    results: list[dict] | None = None,
+    synthesis: str | None = None,
 ) -> None:
     """INSERT a row into recall_events.
 
-    Schema invariants (schema.md §1):
+    Schema invariants (schema.md §1, migration 0003):
       - bank_id, queries (JSONB), mode, n_results, duration_ms are NOT NULL.
       - query_timestamp, trace are nullable.
+      - results (JSONB): {source, document_id, rank, scores, content_preview}[]
+        — inspection record (200-char preview per element). Full content stays
+        in memory_items. NULL on pre-0003 rows.
+      - synthesis (TEXT): RAG synthesis output; NULL for plain recall().
       - created_at defaults to now().
     """
     import json as _json
@@ -285,10 +297,12 @@ def append_recall_event(
         cur.execute(
             """
             INSERT INTO recall_events
-                (bank_id, queries, mode, n_results, duration_ms, trace)
+                (bank_id, queries, mode, n_results, duration_ms, trace,
+                 results, synthesis)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
-                 %(n_results)s, %(duration_ms)s, %(trace)s::jsonb)
+                 %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
+                 %(results)s::jsonb, %(synthesis)s)
             """,
             {
                 "bank_id": bank_id,
@@ -297,6 +311,8 @@ def append_recall_event(
                 "n_results": int(n_results),
                 "duration_ms": int(duration_ms),
                 "trace": _json.dumps(trace) if trace is not None else None,
+                "results": _json.dumps(results) if results is not None else None,
+                "synthesis": synthesis,
             },
         )
 
@@ -316,30 +332,24 @@ def append_formulate_event(
 ) -> None:
     """INSERT a row into formulate_events.
 
-    Schema invariants (schema.md §1; migration 0001_initial.sql):
+    Schema invariants (schema.md §1; migrations 0001 + 0003):
       - bank_id, message, n_queries_out, json_mode_used, parse_fallback,
         raw_response, duration_ms are NOT NULL.
+      - error_kind is nullable; ``'malformed_json' | 'schema_mismatch' | NULL``.
+        Persisted via 0003 (was dropped on the floor pre-0003).
       - created_at defaults to now().
-
-    parse_fallback is canonical observability per schema.md §13. Raw LLM
-    output is preserved verbatim. error_kind is passed in for symmetry
-    with the in-memory FormulateOutcome but is NOT currently persisted —
-    the table shape does not yet have an error_kind column; if needed,
-    T14 sweeper can extend the schema.
     """
-    # error_kind is not yet persisted (no column); accept for forward
-    # compatibility and to keep the Memory wrapper symmetric.
-    _ = error_kind
     _ = metadata
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO formulate_events
                 (bank_id, message, n_queries_out, json_mode_used,
-                 parse_fallback, raw_response, duration_ms)
+                 parse_fallback, raw_response, duration_ms, error_kind)
             VALUES
                 (%(bank_id)s, %(message)s, %(n_queries)s, %(json_mode_used)s,
-                 %(parse_fallback)s, %(raw_response)s, %(duration_ms)s)
+                 %(parse_fallback)s, %(raw_response)s, %(duration_ms)s,
+                 %(error_kind)s)
             """,
             {
                 "bank_id": bank_id,
@@ -350,6 +360,7 @@ def append_formulate_event(
                 # schema column is NOT NULL; coerce None → empty string.
                 "raw_response": raw_response if raw_response is not None else "",
                 "duration_ms": int(duration_ms),
+                "error_kind": error_kind,
             },
         )
 
@@ -468,20 +479,26 @@ def append_llm_call(
     json_mode: bool,
     duration_ms: int,
     error: str | None = None,
+    prompt_text: str | None = None,
+    response_text: str | None = None,
 ) -> None:
-    """Append a row to llm_calls (schema.md §1).
+    """Append a row to llm_calls (schema.md §1; migration 0003).
 
     bank_id is nullable (provider/setup-time calls may not have one).
+    prompt_text and response_text are nullable; PostgresSink's
+    persist_llm_text flag may force them to NULL even when the tracer
+    payload carries them.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO llm_calls
                 (bank_id, prompt_name, messages_count, json_mode,
-                 duration_ms, error)
+                 duration_ms, error, prompt_text, response_text)
             VALUES
                 (%(bank_id)s, %(prompt_name)s, %(messages_count)s,
-                 %(json_mode)s, %(duration_ms)s, %(error)s)
+                 %(json_mode)s, %(duration_ms)s, %(error)s,
+                 %(prompt_text)s, %(response_text)s)
             """,
             {
                 "bank_id": bank_id,
@@ -490,6 +507,8 @@ def append_llm_call(
                 "json_mode": bool(json_mode),
                 "duration_ms": int(duration_ms),
                 "error": error,
+                "prompt_text": prompt_text,
+                "response_text": response_text,
             },
         )
 

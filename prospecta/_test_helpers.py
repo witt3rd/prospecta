@@ -60,7 +60,8 @@ def build_memory_with_spine_config(
 
         def _identity_index_text(content, llm, *, prompt_override=None, context=None):
             # Classical RAG: index_text == content (single chunk).
-            return [content]
+            # Match generate_index_text's tuple shape (parsed, prompt, raw).
+            return [content], "", ""
 
         mem._test_orig_generate_index_text = _retain_mod.generate_index_text  # type: ignore[attr-defined]
         _retain_mod.generate_index_text = _identity_index_text  # type: ignore[assignment]

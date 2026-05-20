@@ -56,12 +56,26 @@ class PostgresSink:
         *,
         pool=None,
         bank_id: str | None = None,
+        persist_llm_text: bool = True,
     ) -> None:
+        """Construct a PostgresSink.
+
+        Args:
+          database_url: Postgres connection URL (used when no pool given).
+          pool: optional ConnectionPool (Memory passes its pool here).
+          bank_id: optional bank_id default (informational).
+          persist_llm_text: if True (default for v0.1.x β), llm_calls.prompt_text
+            and response_text columns receive the verbatim prompt + response
+            captured at the call site. If False, both columns are written NULL
+            even when the tracer payload carries them — useful to flip off
+            once debug visibility is no longer needed.
+        """
         if pool is None and database_url is None:
             raise ValueError("PostgresSink requires either a pool or database_url")
         self._pool = pool
         self._database_url = database_url
         self._bank_id = bank_id
+        self._persist_llm_text = bool(persist_llm_text)
 
     # ------------------------------------------------------------------
     # connection acquisition
@@ -104,6 +118,7 @@ class PostgresSink:
                 duration_ms=int(p["duration_ms"]),
                 raw_llm_response=p.get("raw_llm_response"),
                 error=p.get("error"),
+                index_text_generated=p.get("index_text_generated"),
             )
             conn.commit()
 
@@ -117,6 +132,8 @@ class PostgresSink:
                 n_results=int(p["n_results"]),
                 duration_ms=int(p["duration_ms"]),
                 trace=p.get("trace"),
+                results=p.get("results"),
+                synthesis=p.get("synthesis"),
             )
             conn.commit()
 
@@ -182,6 +199,12 @@ class PostgresSink:
         return None
 
     def _handle_llm_call(self, p: dict[str, Any]) -> None:
+        if self._persist_llm_text:
+            prompt_text = p.get("prompt_text")
+            response_text = p.get("response_text")
+        else:
+            prompt_text = None
+            response_text = None
         with self._connection() as conn:
             append_llm_call(
                 conn,
@@ -191,6 +214,8 @@ class PostgresSink:
                 json_mode=bool(p.get("json_mode", False)),
                 duration_ms=int(p["duration_ms"]),
                 error=p.get("error"),
+                prompt_text=prompt_text,
+                response_text=response_text,
             )
             conn.commit()
 

@@ -39,8 +39,12 @@ def synthesize(
     *,
     prompt_override: str | None = None,
     context: dict | None = None,
-) -> str:
+) -> tuple[str, str]:
     """Compose RAG synthesis from retrieved chunks via the LLM.
+
+    Returns ``(synthesis, rendered_prompt)``. The prompt is returned so the
+    Memory wrapper can thread it through to the llm_calls tracer payload
+    (migration 0003).
 
     Uses prospecta/prompts/rag-synthesize.md by default. Caller can override
     via prompt_override (rendered inline as Jinja2 with the same vars).
@@ -69,4 +73,5 @@ def synthesize(
     else:
         rendered = render_prompt("rag-synthesize", variables)
 
-    return llm(messages=[{"role": "user", "content": rendered}])
+    synthesis = llm(messages=[{"role": "user", "content": rendered}])
+    return synthesis, rendered

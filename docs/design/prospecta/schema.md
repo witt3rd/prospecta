@@ -208,9 +208,16 @@ CREATE TABLE retain_events (
     duration_ms              INTEGER NOT NULL,
     raw_llm_response         TEXT,
     error                    TEXT,
+    index_text_generated     TEXT[],            -- migration 0003
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX retain_events_bank_time_idx ON retain_events(bank_id, created_at DESC);
+
+-- migration 0003 — `index_text_generated TEXT[]`: verbatim list of LLM-generated
+-- index_text strings (one row per retain() call). NULL when the caller supplied
+-- index_text (no LLM call, P4 caller-wins) or when the row pre-dates 0003. This
+-- closes the inspection gap: prior to 0003 you could see *that* retain ran but
+-- not *what questions the LLM produced*.
 
 CREATE TABLE recall_events (
     id                BIGSERIAL PRIMARY KEY,
@@ -221,9 +228,21 @@ CREATE TABLE recall_events (
     duration_ms       INTEGER NOT NULL,
     query_timestamp   TIMESTAMPTZ,
     trace             JSONB,
+    results           JSONB,                    -- migration 0003
+    synthesis         TEXT,                     -- migration 0003
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX recall_events_bank_time_idx ON recall_events(bank_id, created_at DESC);
+
+-- migration 0003 — `results JSONB`: array of
+-- `{source, document_id, rank, scores, content_preview}` for the chunks that
+-- surfaced at this recall. `content_preview` is the first 200 chars of
+-- memory_items.content — inspection-only (NOT a P5 violation; full content
+-- lives in memory_items). Populated for both `recall()` and `recall_synth()`.
+-- migration 0003 — `synthesis TEXT`: verbatim RAG synthesis output. NULL for
+-- plain `recall()` (no synthesis); populated for `recall_synth()`. Closes the
+-- inspection gap: prior to 0003 you could see *that* synthesis ran but not
+-- *what it said*.
 
 CREATE TABLE formulate_events (
     id                BIGSERIAL PRIMARY KEY,
@@ -234,9 +253,15 @@ CREATE TABLE formulate_events (
     parse_fallback    BOOLEAN NOT NULL,
     raw_response      TEXT NOT NULL,
     duration_ms       INTEGER NOT NULL,
+    error_kind        TEXT,                     -- migration 0003
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX formulate_events_bank_time_idx ON formulate_events(bank_id, created_at DESC);
+
+-- migration 0003 — `error_kind TEXT`: parse-failure discriminator
+-- (`'malformed_json' | 'schema_mismatch' | NULL`). NULL on success. Persisted
+-- from `FormulateOutcome.error_kind`. Distinguishes parse-failure classes at
+-- query-time without re-parsing `raw_response`.
 
 CREATE TABLE llm_calls (
     id              BIGSERIAL PRIMARY KEY,
@@ -246,10 +271,19 @@ CREATE TABLE llm_calls (
     json_mode       BOOLEAN NOT NULL,
     duration_ms     INTEGER NOT NULL,
     error           TEXT,
+    prompt_text     TEXT,                       -- migration 0003 (opt-in)
+    response_text   TEXT,                       -- migration 0003 (opt-in)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX llm_calls_bank_time_idx   ON llm_calls(bank_id, created_at DESC);
 CREATE INDEX llm_calls_prompt_time_idx ON llm_calls(prompt_name, created_at DESC);
+
+-- migration 0003 — `prompt_text TEXT` + `response_text TEXT`: verbatim rendered
+-- prompt and LLM response. Captured at the call site (`_retain`, `formulate`,
+-- `synthesize`) and threaded through the tracer payload. Persistence is opt-in
+-- via `PostgresSink(persist_llm_text=...)` — default True for v0.1.x β (debug
+-- visibility), can flip off when no longer needed without breaking the payload
+-- contract. NULL when the flag is off or on pre-0003 rows.
 
 -- A4: append-only sweep history
 CREATE TABLE sweep_passes (

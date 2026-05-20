@@ -28,12 +28,13 @@ def generate_index_text(
     *,
     prompt_override: str | None = None,
     context: dict | None = None,
-) -> list[str]:
+) -> tuple[list[str], str, str]:
     """Generate question-shaped index_text strings via LLM.
 
-    Returns list[str] — each string is a question or assertion that, when
-    asked, should retrieve this content. P1: bilateral synthesis spine
-    write-side.
+    Returns ``(parsed_questions, rendered_prompt, raw_response)`` — bilateral
+    synthesis spine write-side. The prompt + raw_response are returned so the
+    caller (``_retain.retain``) can thread them through to the tracer for
+    durable trace capture in ``llm_calls`` + ``retain_events``.
 
     Args:
       content: The body to index (P5: full content, no truncation).
@@ -79,7 +80,7 @@ def generate_index_text(
 
     if not lines:
         raise IndexTextGenerationError(raw_response=raw)
-    return lines
+    return lines, rendered, raw
 
 
 def _strip_list_prefix(s: str) -> str:
