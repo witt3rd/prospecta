@@ -1469,13 +1469,17 @@ defaults = [
 ]
 dev = [
     { name = "litellm" },
+    { name = "openai" },
     { name = "pytest" },
     { name = "testcontainers" },
 ]
 embed-openai = [
     { name = "openai" },
 ]
-embed-st = [
+embed-openai-compatible = [
+    { name = "openai" },
+]
+embed-sentence-transformers = [
     { name = "sentence-transformers" },
 ]
 
@@ -1484,15 +1488,17 @@ requires-dist = [
     { name = "jinja2", specifier = ">=3.1" },
     { name = "litellm", marker = "extra == 'defaults'", specifier = ">=1.0" },
     { name = "litellm", marker = "extra == 'dev'", specifier = ">=1.0" },
+    { name = "openai", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'embed-openai'", specifier = ">=1.0" },
+    { name = "openai", marker = "extra == 'embed-openai-compatible'", specifier = ">=1.0" },
     { name = "pgvector", specifier = ">=0.4" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "sentence-transformers", marker = "extra == 'embed-st'", specifier = ">=2.5" },
+    { name = "sentence-transformers", marker = "extra == 'embed-sentence-transformers'", specifier = ">=2.5" },
     { name = "testcontainers", extras = ["postgres"], marker = "extra == 'dev'", specifier = ">=4" },
 ]
-provides-extras = ["dev", "defaults", "embed-st", "embed-openai"]
+provides-extras = ["dev", "defaults", "embed-sentence-transformers", "embed-openai", "embed-openai-compatible"]
 
 [[package]]
 name = "psycopg"

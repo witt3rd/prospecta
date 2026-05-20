@@ -24,14 +24,18 @@ dev = [
     "pytest>=7",
     "testcontainers[postgres]>=4",
     "litellm>=1.0",
+    "openai>=1.0",
 ]
 defaults = [
     "litellm>=1.0",
 ]
-embed-st = [
+embed-sentence-transformers = [
     "sentence-transformers>=2.5",
 ]
 embed-openai = [
+    "openai>=1.0",
+]
+embed-openai-compatible = [
     "openai>=1.0",
 ]
 
