@@ -114,6 +114,20 @@ prospecta config                         # show loaded config (passwords redacte
 
 ---
 
+## Observability
+
+Every load-bearing event of the bilateral spine is recorded in Postgres event tables — a durable audit trail, not ephemeral stderr. Six tables capture the full flow:
+
+- **`retain_events`** — what was retained, with the verbatim LLM-generated `index_text` (the anticipated questions) when not caller-supplied.
+- **`recall_events`** — what was queried, the formulated sub-questions, the surfaced results (with per-channel scores), and the synthesized answer.
+- **`formulate_events`** — the user's verbatim message, the LLM's JSON expansion, and parse-fallback diagnostics (`error_kind` discriminates `malformed_json` from `schema_mismatch`).
+- **`llm_calls`** — every LLM call's verbatim prompt and response (opt-out via `PostgresSink(persist_llm_text=False)`).
+- **`sweep_passes`** + **`sweeper_state`** — background filesystem sweeper timing and outcomes.
+
+Inspect a session end-to-end with a few SQL queries from `pgcli` or any Postgres client. See [`docs/observability.md`](docs/observability.md) for the inspection guide, the cheat-sheet of queries, custom-tracer patterns, and the opt-outs.
+
+---
+
 ## Where prospecta sits in the agent-memory landscape
 
 There is no one-size-fits-all for agentic memory. Different systems make different bets about what's worth remembering and how to find it later. A quick survey of the 2025-2026 landscape, organized by primary retrieval mechanism. Where [Hermes Agent](https://hermes-agent.nousresearch.com) ships a bundled provider in a category, it's named inline.
