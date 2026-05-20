@@ -11,6 +11,10 @@ authors = ["Forge ⚒️ <forge@witt3rd.com>"]
 name = "prospecta-tui"
 path = "src/main.rs"
 
+[lib]
+name = "prospecta_tui"
+path = "src/lib.rs"
+
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
