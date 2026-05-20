@@ -29,6 +29,11 @@ struct Cli {
     /// Smoke-test the connection: print bank count and exit. No TUI launched.
     #[arg(long)]
     smoke: bool,
+
+    /// Print the most recent events across all five event tables and exit.
+    /// Useful for sanity-checking the substrate without launching the TUI.
+    #[arg(long)]
+    dump_events: bool,
 }
 
 #[tokio::main]
@@ -56,6 +61,37 @@ async fn main() -> Result<()> {
             redacted,
             row.n.unwrap_or(0)
         );
+        return Ok(());
+    }
+
+    if cli.dump_events {
+        let events = prospecta_tui::db::events::recent(&pool, None, 50, 50)
+            .await
+            .wrap_err("loading events")?;
+        println!(
+            "prospecta-tui dump_events: {} events from {}",
+            events.len(),
+            redacted
+        );
+        for e in events {
+            let bank = e.bank_id.as_deref().unwrap_or("—");
+            let dur = match e.duration_ms {
+                Some(n) if n >= 1000 => format!("{:.1}s", n as f64 / 1000.0),
+                Some(n) => format!("{}ms", n),
+                None => "—".to_string(),
+            };
+            let marker = if e.has_error { "!" } else { " " };
+            println!(
+                "{}  {:<9} bank={:<12} id={:<5} dur={:<7} {} {}",
+                e.created_at.format("%Y-%m-%d %H:%M:%S"),
+                e.kind.tag(),
+                bank,
+                e.id,
+                dur,
+                marker,
+                e.summary,
+            );
+        }
         return Ok(());
     }
 
