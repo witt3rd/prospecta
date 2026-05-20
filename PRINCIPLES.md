@@ -90,18 +90,6 @@ The sweeper handles drift (files added/modified/deleted outside the library). It
 
 **Prevents:** waiting-on-sweeper latency in the agent's recall; sweeper-down meaning new retains aren't searchable.
 
-### P14.1 — Hybrid retrieval is the spine's safety net along two axes (T19 rectification)
-
-The hybrid retrieval is the spine's safety net along **two distinct axes**. v0.1 ships both axes honestly via three-channel RRF fusion (semantic + lexical_content + lexical_body).
-
-1. **Phrasing-drift rescue (within the indexed string).** When the embedder fails on minor phrasing drift (plurals/singulars, derivational forms) the embedded `index_text` no longer matches the query's vector shape. Postgres stemming via `to_tsvector('english', content)` (the `content_tsv` channel) catches the overlap on the SAME indexed string. This is the original two-channel safety net.
-
-2. **Body-fallback rescue (across channels).** When the LLM-generated `index_text` drifts semantically AND lexically from the query (the worst case: questions phrased so differently they share no terms with the query), the previous two channels both go dark — the embedder misses on shape, and `content_tsv` has no overlap. The body channel (`body_tsv` over `original_chunk`) still surfaces the document via BM25 on the source text. This is the body-fallback axis, added by T19 and shipped in v0.1.
-
-The spine is the value proposition (P1); the hybrid retrieval ensures the value still lands when the spine half-fails. *Zhèngmíng:* before T19, P14 implicitly promised both axes; the body channel made the promise honest.
-
-**Prevents:** silent retrieval failure when LLM-generated `index_text` is wrong-shape; the spine being all-or-nothing rather than gracefully degrading; the safety net being marketed but not actually present.
-
 ## P15 — Spine is documented in the README
 
 Prospecta's README leads with bilateral synthesis. It says *this is what makes us different from LlamaIndex / Khoj / mem0*. Not buried in §4 of an architecture doc. The pattern is the value proposition; the implementation is in service of it.
@@ -131,6 +119,18 @@ The pattern is **"capable defaults, bring your own API key, caller can always ov
 The Hermes plugin case is load-bearing in this design: `ctx.llm` covers the LLM half of the spine without any provider deps in the plugin or library, but it does not cover embeddings — so `prospecta.defaults` exists *specifically* to fill that gap cleanly without forcing core to import LiteLLM.
 
 **Prevents:** core dependency creep ("just one little import"); alternately, no-defaults rigidity that forces every caller — including the Hermes plugin — to hand-roll provider clients; and the plugin growing its own embedding routing in violation of P9.
+
+## P18 — Hybrid retrieval is the spine's safety net along two axes
+
+The hybrid retrieval is the spine's safety net along **two distinct axes**. v0.1 ships both axes honestly via three-channel RRF fusion (semantic + lexical_content + lexical_body).
+
+1. **Phrasing-drift rescue (within the indexed string).** When the embedder misses on minor phrasing drift (plurals/singulars, derivational forms), the embedded `index_text` no longer matches the query's vector shape. Postgres stemming via `to_tsvector('english', content)` (the `content_tsv` channel) catches the overlap on the same indexed string.
+
+2. **Body-fallback rescue (across channels).** When the LLM-generated `index_text` drifts semantically AND lexically from the query (the worst case: questions phrased so differently they share no terms with the query), the previous two channels both go dark — the embedder misses on shape, and `content_tsv` has no lexical overlap. The body channel (`body_tsv` over `original_chunk`) still surfaces the document via BM25 on the source text.
+
+The spine (P1) is the value proposition; the hybrid retrieval ensures the value still lands when the spine half-fails. Distinct from P14 (sweeper as drift safety net for filesystem changes): P14 protects against substrate drift between writes; P18 protects against retrieval drift between question-shape and query-shape at recall time. Different mechanisms, different failure modes, both load-bearing.
+
+**Prevents:** silent retrieval failure when LLM-generated `index_text` is wrong-shape; the spine being all-or-nothing rather than gracefully degrading; the safety net being marketed but not actually present in the substrate.
 
 ---
 
