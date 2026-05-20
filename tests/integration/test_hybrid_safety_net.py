@@ -309,15 +309,157 @@ def test_hybrid_at_least_matches_best_single_mode(drift_memory):
 
 
 def test_a6_scores_always_populated(drift_memory):
-    """A6 invariant: every mode produces RecalledMemory with all three
-    score keys numeric (semantic, lexical, rrf). Never null."""
+    """A6 invariant: every mode produces RecalledMemory with all four
+    score keys numeric (semantic, lexical, lexical_body, rrf). Never null."""
     for mode in ("semantic", "lexical", "hybrid"):
         results = drift_memory.search(QUERY, mode=mode, limit=5)
         assert results, f"mode={mode} returned no results"
         for r in results:
-            assert set(r.scores.keys()) >= {"semantic", "lexical", "rrf"}
-            for k in ("semantic", "lexical", "rrf"):
+            assert set(r.scores.keys()) >= {
+                "semantic", "lexical", "lexical_body", "rrf",
+            }
+            for k in ("semantic", "lexical", "lexical_body", "rrf"):
                 v = r.scores[k]
                 assert isinstance(v, (int, float)), (
                     f"mode={mode} score[{k}]={v!r} is not numeric (A6 violation)"
                 )
+
+
+# ---------------------------------------------------------------------------
+# T19 — Body-channel rescue (true two-axis P14 safety net)
+# ---------------------------------------------------------------------------
+
+# Constructs a deliberate drift case where the LLM-generated index_text is
+# semantically and lexically off-topic ("tea in China"), but the body
+# (original_chunk) is a strong match for the query. Only the body channel
+# can rescue this doc — content_tsv has zero overlap with the query terms.
+BODY_RESCUE_SOURCE = "kelly_birthday_bodychan.md"
+BODY_RESCUE_INDEX_TEXT = "The price of tea in China remains stable this quarter"
+BODY_RESCUE_BODY = (
+    "Kelly was born on March 4th, 1990. Her birthday party was epic — "
+    "friends in the kitchen, music loud, the cake unforgettable."
+)
+BODY_RESCUE_QUERY = "When was Kelly born and her birthday party?"
+
+
+@pytest.fixture
+def body_rescue_memory(pg_container, bilateral_embed):
+    """Memory with one body-rescue target + the same distractors as
+    drift_memory. The target's index_text is OFF-TOPIC (tea/china) so
+    content_tsv has zero query overlap; the body is ON-TOPIC (kelly/born/
+    march/birthday) so body_tsv carries the rescue.
+    """
+    from prospecta.memory import Memory
+
+    new_url, base_url, db_name = _fresh_url(pg_container)
+    bank = f"bodychan_{int(time.time() * 1_000_000)}"
+    mem = Memory(
+        database_url=new_url,
+        bank_id=bank,
+        llm=None,
+        embed=bilateral_embed,
+    )
+    mem.create_bank(bank, embedding_dim=bilateral_embed.dim)
+
+    # Target: drifted index_text, on-topic body.
+    mem.retain(
+        BODY_RESCUE_BODY,
+        index_text=BODY_RESCUE_INDEX_TEXT,
+        source=BODY_RESCUE_SOURCE,
+    )
+    # Distractors: question-shape index_text with no query overlap.
+    for src, idx, body in DISTRACTOR_DOCS:
+        mem.retain(body, index_text=idx, source=src)
+
+    try:
+        yield mem
+    finally:
+        mem.close()
+        _drop_db(base_url, db_name)
+
+
+def test_body_channel_rescues_drifted_index_text(body_rescue_memory):
+    """The P14 promise made honest: when LLM-generated index_text drifts
+    semantically AND lexically from the query, body_tsv (over
+    original_chunk) rescues the document via three-channel RRF fusion.
+
+    Setup:
+      - Target: index_text="The price of tea in China..." (off-topic)
+                body="Kelly was born March 4th 1990. Birthday party..."
+      - Query: "When was Kelly born and her birthday party?"
+
+    Expected:
+      - mode='lexical' (content_tsv only): target absent or zero-score.
+      - mode='hybrid' (three-channel RRF): target surfaces with
+        lexical_body > 0 carrying the rescue.
+    """
+    # Confirm the index_text has no query-term overlap by checking
+    # mode='lexical' (content-channel only) does NOT surface the target.
+    lex_results = body_rescue_memory.search(
+        BODY_RESCUE_QUERY, mode="lexical", limit=10,
+    )
+    lex_rank = _rank_of(lex_results, BODY_RESCUE_SOURCE)
+    # Target must not appear in content-only lexical results — the
+    # index_text has zero overlap with query terms. This locks the
+    # rescue requirement: only the body channel can save it.
+    assert lex_rank is None, (
+        f"content-channel lexical should NOT surface the body-rescue target; "
+        f"got rank {lex_rank}. The drifted index_text apparently shares "
+        f"tokens with the query, breaking the test scenario."
+    )
+
+    # The body-rescue: mode='hybrid' surfaces the target via body_tsv.
+    hyb_results = body_rescue_memory.search(
+        BODY_RESCUE_QUERY, mode="hybrid", limit=10,
+    )
+    hyb_rank = _rank_of(hyb_results, BODY_RESCUE_SOURCE)
+    print(f"\n[body-rescue hybrid] target rank = {hyb_rank}")
+    for i, r in enumerate(hyb_results, start=1):
+        print(
+            f"  {i}. {_source_of(r)}  "
+            f"sem={r.scores['semantic']:.4f}  "
+            f"lex={r.scores['lexical']:.4f}  "
+            f"lex_body={r.scores['lexical_body']:.4f}  "
+            f"rrf={r.scores['rrf']:.4f}"
+        )
+    assert hyb_rank is not None, (
+        "hybrid must surface the body-rescue target via body_tsv channel"
+    )
+    assert hyb_rank <= 2, (
+        f"hybrid should rescue body-channel target to top-2; got rank {hyb_rank}"
+    )
+
+    # Locate the rescued target and verify body channel is the dominant
+    # lexical signal (content channel is zero by construction).
+    target = next(
+        r for r in hyb_results if _source_of(r) == BODY_RESCUE_SOURCE
+    )
+    assert target.scores["lexical"] == 0.0, (
+        f"content-channel score must be 0 for the off-topic index_text; "
+        f"got {target.scores['lexical']}"
+    )
+    assert target.scores["lexical_body"] > 0.0, (
+        f"body-channel score must be positive to carry the rescue; "
+        f"got {target.scores['lexical_body']}"
+    )
+
+
+def test_mode_lexical_unchanged_by_body_channel(body_rescue_memory):
+    """Option A locked: mode='lexical' scopes to content_tsv only.
+
+    The body channel is intentionally NOT joined into mode='lexical'
+    in v0.1 — body rescue fires only via mode='hybrid' RRF fusion. This
+    test locks that behavior contract; future v0.2 may change semantics
+    with explicit deprecation.
+    """
+    # The body-rescue target has off-topic index_text (no query overlap).
+    # If mode='lexical' were to silently include body_tsv, the target
+    # would surface. It must not.
+    results = body_rescue_memory.search(
+        BODY_RESCUE_QUERY, mode="lexical", limit=10,
+    )
+    rank = _rank_of(results, BODY_RESCUE_SOURCE)
+    assert rank is None, (
+        f"mode='lexical' must remain content-only (option A); body-rescue "
+        f"target surfaced at rank {rank}, indicating body channel leaked in."
+    )

@@ -50,7 +50,21 @@ class RecalledMemory:
     original_chunk: str     # source text (P5)
     source: str             # documents.source (file path / URL / conv ID)
     score: float            # RRF score (or single-mode score)
-    scores: dict[str, float]  # {"semantic": x, "lexical": y, "rrf": z}
+    scores: dict[str, float]
+    """Four-key scores dict, always-populated, all numeric (A6 invariant):
+      - "semantic": cosine similarity from HNSW channel (1 - distance).
+        0.0 when result didn't surface via semantic channel.
+      - "lexical": ts_rank over content_tsv (LLM-generated index_text /
+        questions channel). Preserved name for backward compat per v0.1
+        option γ; semantically equivalent to `lexical_content`.
+      - "lexical_body": ts_rank over body_tsv (original_chunk / source
+        body channel). The P14 body-fallback safety net — rescues docs
+        whose LLM-generated index_text drifted from query language.
+        0.0 unless surfaced via mode='hybrid' three-channel fusion.
+      - "rrf": fused Reciprocal Rank Fusion score (semantic +
+        lexical_content + lexical_body in hybrid mode; identical to
+        single-channel score in semantic/lexical modes).
+    """
     metadata: dict[str, Any]
     bank_id: str
     document_id: str

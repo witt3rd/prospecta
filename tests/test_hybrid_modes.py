@@ -21,10 +21,11 @@ def test_hybrid_default_rrf_k_60(memory_with_bank, tmp_path):
     memory_with_bank.index_directory(tmp_path)
     results = memory_with_bank.search("forge metal", limit=5)
     assert len(results) > 0
-    # rrf score should be sum of two reciprocals ≤ 2/61 with k=60 + rank=1
+    # rrf score should be sum of three reciprocals ≤ 3/61 with k=60 + rank=1
+    # (three-channel fusion: semantic + lexical_content + lexical_body).
     for r in results:
         assert r.scores["rrf"] >= 0.0
-        assert r.scores["rrf"] <= 2.0 / 61.0 + 1e-9
+        assert r.scores["rrf"] <= 3.0 / 61.0 + 1e-9
 
 
 def test_hybrid_rrf_k_override(memory_with_bank, tmp_path):

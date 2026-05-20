@@ -56,14 +56,20 @@ def test_search_modes_return_distinct_shapes(memory_with_bank, tmp_path):
 
 
 def test_scores_never_null(memory_with_bank, tmp_path):
-    """A6: scores dict is always populated with all three numeric keys."""
+    """A6: scores dict is always populated with all four numeric keys.
+
+    Three-channel RRF (T19): semantic, lexical (=content), lexical_body, rrf.
+    All four keys always present and numeric across all three modes.
+    """
     _write_corpus(tmp_path)
     memory_with_bank.index_directory(tmp_path)
 
     for mode in ("hybrid", "semantic", "lexical"):
         results = memory_with_bank.search("birthday", limit=5, mode=mode)
         for r in results:
-            assert set(r.scores.keys()) >= {"semantic", "lexical", "rrf"}
+            assert set(r.scores.keys()) >= {
+                "semantic", "lexical", "lexical_body", "rrf",
+            }
             for k, v in r.scores.items():
                 assert v is not None
                 assert isinstance(v, (int, float))

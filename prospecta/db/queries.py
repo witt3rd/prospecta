@@ -546,8 +546,16 @@ def delete_documents_by_source(
 # T9 — Retrieval SQL (hybrid / semantic / lexical)
 # ---------------------------------------------------------------------------
 
-# A6: COALESCE on scores → never NULL in returned rows. Plain SQL using
-# parameterized bank_id, query_embedding, query_text, limit, rrf_k.
+# A6: COALESCE on scores → never NULL in returned rows. Three-channel RRF
+# fusion: semantic (cosine over embedding) + lexical_content (ts_rank over
+# content_tsv = index_text / questions) + lexical_body (ts_rank over
+# body_tsv = original_chunk / source body). Three CTEs FULL OUTER JOIN'd;
+# RRF score = sum of three COALESCE'd reciprocals. All score components
+# always-numeric per A6 invariant.
+#
+# The lexical_body channel implements the P14 body-fallback safety net:
+# when LLM-generated index_text drifts hard from query language, body
+# content still rescues the doc via BM25 fusion.
 HYBRID_SQL = """
 WITH
   semantic AS (
@@ -562,39 +570,57 @@ WITH
     ORDER BY m.embedding <=> %(qe)s::vector
     LIMIT %(per_side)s
   ),
-  lexical AS (
+  lexical_content AS (
     SELECT m.id AS id, m.document_id, m.content, m.original_chunk, d.source,
            m.metadata, m.tags,
-           ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_score,
+           ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_content_score,
            ROW_NUMBER() OVER (
                ORDER BY ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) DESC
-           ) AS lex_rank
+           ) AS lex_content_rank
     FROM memory_items m
     JOIN documents d ON d.id = m.document_id
     WHERE m.bank_id = %(bank_id)s
       AND m.content_tsv @@ websearch_to_tsquery('english', %(qt)s)
       AND (%(meta)s::jsonb IS NULL OR m.metadata @> %(meta)s::jsonb)
-    ORDER BY lex_score DESC
+    ORDER BY lex_content_score DESC
+    LIMIT %(per_side)s
+  ),
+  lexical_body AS (
+    SELECT m.id AS id, m.document_id, m.content, m.original_chunk, d.source,
+           m.metadata, m.tags,
+           ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_body_score,
+           ROW_NUMBER() OVER (
+               ORDER BY ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) DESC
+           ) AS lex_body_rank
+    FROM memory_items m
+    JOIN documents d ON d.id = m.document_id
+    WHERE m.bank_id = %(bank_id)s
+      AND m.body_tsv @@ websearch_to_tsquery('english', %(qt)s)
+      AND (%(meta)s::jsonb IS NULL OR m.metadata @> %(meta)s::jsonb)
+    ORDER BY lex_body_score DESC
     LIMIT %(per_side)s
   ),
   fused AS (
     SELECT
-      COALESCE(s.id, l.id) AS id,
-      COALESCE(s.document_id, l.document_id) AS document_id,
-      COALESCE(s.content, l.content) AS content,
-      COALESCE(s.original_chunk, l.original_chunk) AS original_chunk,
-      COALESCE(s.source, l.source) AS source,
-      COALESCE(s.metadata, l.metadata) AS metadata,
-      COALESCE(s.tags, l.tags) AS tags,
+      COALESCE(s.id, lc.id, lb.id) AS id,
+      COALESCE(s.document_id, lc.document_id, lb.document_id) AS document_id,
+      COALESCE(s.content, lc.content, lb.content) AS content,
+      COALESCE(s.original_chunk, lc.original_chunk, lb.original_chunk) AS original_chunk,
+      COALESCE(s.source, lc.source, lb.source) AS source,
+      COALESCE(s.metadata, lc.metadata, lb.metadata) AS metadata,
+      COALESCE(s.tags, lc.tags, lb.tags) AS tags,
       COALESCE(s.sem_score, 0.0) AS sem_score,
-      COALESCE(l.lex_score, 0.0) AS lex_score,
+      COALESCE(lc.lex_content_score, 0.0) AS lex_content_score,
+      COALESCE(lb.lex_body_score, 0.0) AS lex_body_score,
       (COALESCE(1.0 / (%(rrf_k)s + s.sem_rank), 0.0)
-       + COALESCE(1.0 / (%(rrf_k)s + l.lex_rank), 0.0)) AS rrf_score
+       + COALESCE(1.0 / (%(rrf_k)s + lc.lex_content_rank), 0.0)
+       + COALESCE(1.0 / (%(rrf_k)s + lb.lex_body_rank), 0.0)) AS rrf_score
     FROM semantic s
-    FULL OUTER JOIN lexical l ON s.id = l.id
+    FULL OUTER JOIN lexical_content lc ON s.id = lc.id
+    FULL OUTER JOIN lexical_body lb ON COALESCE(s.id, lc.id) = lb.id
   )
 SELECT id, document_id, content, original_chunk, source, metadata, tags,
-       sem_score, lex_score, rrf_score
+       sem_score, lex_content_score, lex_body_score, rrf_score
 FROM fused
 ORDER BY rrf_score DESC
 LIMIT %(limit)s
@@ -678,9 +704,55 @@ def lexical_search(
     conn, *, bank_id: str, query_text: str,
     limit: int = 10, metadata_filter: dict | None = None,
 ) -> list[dict]:
+    """Lexical search over content_tsv (the index_text / questions channel).
+
+    Note: mode='lexical' is preserved as content-only per v0.1 option A.
+    The body channel (body_tsv) only fires through mode='hybrid' (RRF fusion).
+    See body_lexical_search() for the parallel helper over body_tsv.
+    """
     with conn.cursor() as cur:
         cur.execute(
             LEXICAL_SQL,
+            {
+                "bank_id": bank_id,
+                "qt": query_text,
+                "limit": int(limit),
+                "meta": _meta_param(metadata_filter),
+            },
+        )
+        cols = [c.name for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+BODY_LEXICAL_SQL = """
+SELECT m.id, m.document_id, m.content, m.original_chunk, d.source,
+       m.metadata, m.tags,
+       ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_body_score
+FROM memory_items m
+JOIN documents d ON d.id = m.document_id
+WHERE m.bank_id = %(bank_id)s
+  AND m.body_tsv @@ websearch_to_tsquery('english', %(qt)s)
+  AND (%(meta)s::jsonb IS NULL OR m.metadata @> %(meta)s::jsonb)
+ORDER BY lex_body_score DESC
+LIMIT %(limit)s
+"""
+
+
+def body_lexical_search(
+    conn, *, bank_id: str, query_text: str,
+    limit: int = 10, metadata_filter: dict | None = None,
+) -> list[dict]:
+    """Lexical search over body_tsv (the original_chunk / source body channel).
+
+    Parallel to lexical_search but matches against the body_tsv GENERATED
+    column over original_chunk. Used internally by hybrid_search; not
+    currently surfaced as its own Memory.search mode in v0.1 (the body
+    rescue fires through mode='hybrid' RRF fusion). Exposed here for
+    forward-compat and direct callers.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            BODY_LEXICAL_SQL,
             {
                 "bank_id": bank_id,
                 "qt": query_text,

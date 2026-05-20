@@ -561,18 +561,33 @@ def search(
 
 def _row_to_recalled(row: dict, bank_id: str, *, mode: str) -> RecalledMemory:
     sem = float(row.get("sem_score") or 0.0)
-    lex = float(row.get("lex_score") or 0.0)
+    # Hybrid SQL returns lex_content_score + lex_body_score (T19 three-channel).
+    # Single-mode (semantic/lexical) helpers return lex_score / sem_score only.
+    lex_c = float(
+        row.get("lex_content_score")
+        or row.get("lex_score")
+        or 0.0
+    )
+    lex_b = float(row.get("lex_body_score") or 0.0)
     rrf = float(row.get("rrf_score") or 0.0)
-    return _make_recalled(row, bank_id, sem_score=sem, lex_score=lex, rrf=rrf)
+    return _make_recalled(
+        row, bank_id,
+        sem_score=sem, lex_score=lex_c, lex_body_score=lex_b, rrf=rrf,
+    )
 
 
 def _make_recalled(
     row: dict, bank_id: str,
-    *, sem_score: float, lex_score: float, rrf: float,
+    *, sem_score: float, lex_score: float, lex_body_score: float = 0.0,
+    rrf: float,
 ) -> RecalledMemory:
+    # Per option γ (T19): preserve `lexical` as lexical_content alias for
+    # backward compatibility. New key `lexical_body` exposes the body channel
+    # additively. All four keys always-numeric per A6 invariant.
     scores = {
         "semantic": float(sem_score),
         "lexical": float(lex_score),
+        "lexical_body": float(lex_body_score),
         "rrf": float(rrf),
     }
     return RecalledMemory(
