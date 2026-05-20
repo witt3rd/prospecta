@@ -23,6 +23,10 @@ dependencies = [
 dev = [
     "pytest>=7",
     "testcontainers[postgres]>=4",
+    "litellm>=1.0",
+]
+defaults = [
+    "litellm>=1.0",
 ]
 embed-st = [
     "sentence-transformers>=2.5",
