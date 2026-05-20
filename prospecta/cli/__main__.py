@@ -31,6 +31,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # ---- init (T22, P16) -------------------------------------------------
+    init_p = sub.add_parser(
+        "init",
+        help="One-command bootstrap: substrate up + migrate + default bank",
+    )
+    init_p.add_argument(
+        "--no-substrate",
+        action="store_true",
+        help="Skip docker-compose substrate detection (use existing DATABASE_URL)",
+    )
+    init_p.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=None,
+        help="Embedding dim for default bank (default: PROSPECTA_EMBEDDING_DIM or 1536)",
+    )
+    init_p.add_argument(
+        "--substrate-timeout",
+        type=float,
+        default=60.0,
+        help="Max seconds to wait for docker compose healthcheck (default: 60)",
+    )
+
     # ---- migrate (T3) ---------------------------------------------------
     sub.add_parser("migrate", help="Apply pending database migrations")
 
@@ -111,6 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    if args.command == "init":
+        from prospecta.cli.init import cmd_init
+        return cmd_init(args)
     if args.command == "migrate":
         from prospecta.cli import migrate as migrate_cmd
         return migrate_cmd.run(args)
