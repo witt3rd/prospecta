@@ -132,6 +132,16 @@ The spine (P1) is the value proposition; the hybrid retrieval ensures the value 
 
 **Prevents:** silent retrieval failure when LLM-generated `index_text` is wrong-shape; the spine being all-or-nothing rather than gracefully degrading; the safety net being marketed but not actually present in the substrate.
 
+## P19 — Observability is durable, not ephemeral
+
+Every event a user might want to inspect after the fact is persisted in Postgres event tables, not flushed to stderr. The six event types (`retain_events`, `recall_events`, `formulate_events`, `llm_calls`, `sweep_passes`, `sweeper_state`) are append-only — except `sweeper_state` which is upsert — and carry the full payload, not summaries: verbatim user messages, verbatim LLM JSON expansions, verbatim generated `index_text`, verbatim prompts and responses, the actual chunks that surfaced with their per-channel scores, the actual synthesis text.
+
+The tracer fan-out (P3-shaped: `Tracer` is an injected Protocol, `PostgresSink` is the default; callers can supply `NoOpTracer`, `RecordingTracer`, `CompositeTracer`, or their own) means the persistence is one consumer of the event stream, not the only one. But the *default* must be durable. Logs to stderr are forgotten as soon as the agent's session ends; the questions an operator or a user will ask — *what did the agent retain last week? which chunks surfaced for that recall? did the formulate step fall back to identity on a malformed LLM response?* — only have honest answers if the record outlasts the process.
+
+Concretely, this means: when adding a feature that produces a load-bearing event, the default action is **add a column** to the relevant event table (or a new table), not **log a line**. Logs are for transient operator-facing breadcrumbs (warnings, performance hints); the durable trace is for the questions that arrive later.
+
+**Prevents:** the system being inspectable only via live attached debuggers; "what just happened" being an unanswerable question once the session ends; debugging by spelunking ephemeral logs that may or may not have rotated; the inspection surface drifting from the architecture surface because nobody touched the documented schema when shipping a new feature.
+
 ---
 
 *Authored 2026-05-18 by Forge ⚒️ as PRINCIPLES.md for the prospecta ralplan. Distilled from the assessment doc (`~/forge/wiki/2026-05-18_memory-library-and-plugin-assessment.md`) and animus's CODING.md operating philosophy.*
