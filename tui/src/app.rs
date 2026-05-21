@@ -55,6 +55,10 @@ pub struct App {
     events_state: observability::EventStreamState,
     last_events_refresh: Instant,
 
+    // Recall-thread view state (overlay on events tab when active).
+    recall_thread_open: bool,
+    recall_thread_state: crate::views::recall_thread::RecallThreadState,
+
     help_open: bool,
     status: String,
     should_quit: bool,
@@ -81,6 +85,8 @@ impl App {
             last_events_refresh: Instant::now()
                 .checked_sub(EVENTS_POLL_INTERVAL * 2)
                 .unwrap_or_else(Instant::now),
+            recall_thread_open: false,
+            recall_thread_state: crate::views::recall_thread::RecallThreadState::new(),
             help_open: false,
             status: "Tab to switch · ? for help · q to quit".to_string(),
             should_quit: false,
@@ -206,6 +212,41 @@ impl App {
         }
     }
 
+    async fn open_recall_thread_for_selected_event(&mut self) {
+        let Some(i) = self.events_state.table.selected() else {
+            return;
+        };
+        let Some(ev) = self.events.get(i) else {
+            return;
+        };
+        if ev.kind != db::EventKind::Recall {
+            self.status = "Enter only opens a thread on a recall row".into();
+            return;
+        }
+        let id = ev.id;
+        self.recall_thread_state.reset_scroll();
+        self.recall_thread_state.error = None;
+        self.recall_thread_state.thread = None;
+        self.recall_thread_open = true;
+        match db::recall_thread::fetch(&self.pool, id).await {
+            Ok(t) => {
+                self.recall_thread_state.thread = Some(t);
+                self.status = format!("recall thread id={id}");
+            }
+            Err(e) => {
+                self.recall_thread_state.error = Some(format!("{e}"));
+                self.status = format!("recall thread load failed: {e}");
+            }
+        }
+    }
+
+    fn close_recall_thread(&mut self) {
+        self.recall_thread_open = false;
+        self.recall_thread_state.thread = None;
+        self.recall_thread_state.error = None;
+        self.recall_thread_state.reset_scroll();
+    }
+
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -234,6 +275,37 @@ impl App {
     async fn handle_key(&mut self, key: KeyEvent) {
         if self.help_open {
             self.help_open = false;
+            return;
+        }
+
+        // Recall-thread overlay swallows navigation keys while open.
+        if self.recall_thread_open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('q'), _) => self.should_quit = true,
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
+                    self.close_recall_thread();
+                }
+                (KeyCode::Char('?'), _) => self.help_open = true,
+                (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                    self.recall_thread_state.scroll_down()
+                }
+                (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.recall_thread_state.scroll_up(),
+                (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+                    for _ in 0..10 {
+                        self.recall_thread_state.scroll_down();
+                    }
+                }
+                (KeyCode::PageUp, _) => {
+                    for _ in 0..10 {
+                        self.recall_thread_state.scroll_up();
+                    }
+                }
+                (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+                    self.recall_thread_state.reset_scroll()
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -301,7 +373,6 @@ impl App {
                     Tab::Events => self.reload_events().await,
                 }
             }
-
             // Drill-down: Enter / → descends; Esc / ← ascends.
             (KeyCode::Enter, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => match self.tab {
                 Tab::Banks => self.enter_docs_for_current_bank().await,
@@ -310,7 +381,7 @@ impl App {
                         self.enter_items_for_selected_document().await;
                     }
                 }
-                Tab::Events => {}
+                Tab::Events => self.open_recall_thread_for_selected_event().await,
             },
             (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.tab {
                 Tab::Docs => self.ascend_docs(),
@@ -419,14 +490,24 @@ impl App {
                 self.banks_error.as_deref(),
             ),
             Tab::Docs => docs::render(frame, chunks[0], &mut self.docs_state),
-            Tab::Events => observability::render(
-                frame,
-                chunks[0],
-                &self.events,
-                &mut self.events_state,
-                None,
-                self.events_error.as_deref(),
-            ),
+            Tab::Events => {
+                if self.recall_thread_open {
+                    crate::views::recall_thread::render(
+                        frame,
+                        chunks[0],
+                        &mut self.recall_thread_state,
+                    );
+                } else {
+                    observability::render(
+                        frame,
+                        chunks[0],
+                        &self.events,
+                        &mut self.events_state,
+                        None,
+                        self.events_error.as_deref(),
+                    );
+                }
+            }
         }
 
         let status_line = ratatui::text::Line::from(vec![ratatui::text::Span::styled(
@@ -452,14 +533,28 @@ impl App {
                 ("?", "help"),
                 ("q", "quit"),
             ],
-            Tab::Events => &[
-                ("Tab", "next tab"),
-                ("↑↓/j/k", "select"),
-                ("f", "auto-scroll"),
-                ("r", "refresh"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
+            Tab::Events => {
+                if self.recall_thread_open {
+                    &[
+                        ("Esc/←", "back"),
+                        ("↑↓/j/k", "scroll"),
+                        ("Space/PgDn", "page down"),
+                        ("g", "top"),
+                        ("?", "help"),
+                        ("q", "quit"),
+                    ]
+                } else {
+                    &[
+                        ("Enter", "thread (recall row)"),
+                        ("Tab", "next tab"),
+                        ("↑↓/j/k", "select"),
+                        ("f", "auto-scroll"),
+                        ("r", "refresh"),
+                        ("?", "help"),
+                        ("q", "quit"),
+                    ]
+                }
+            }
         };
         common::render_footer(frame, footer_area, hints);
 

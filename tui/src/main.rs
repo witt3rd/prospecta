@@ -45,6 +45,11 @@ struct Cli {
     /// instead of listing the bank's documents.
     #[arg(long, value_name = "UUID")]
     doc_id: Option<uuid::Uuid>,
+
+    /// Dump the full recall thread (preceding formulate + recall body +
+    /// paired llm_calls) for a given recall_event id and exit.
+    #[arg(long, value_name = "RECALL_ID")]
+    dump_recall_thread: Option<i64>,
 }
 
 #[tokio::main]
@@ -149,6 +154,41 @@ async fn main() -> Result<()> {
                     println!("  [{}] {}", src, it.content);
                 }
             }
+        }
+        return Ok(());
+    }
+
+    if let Some(recall_id) = cli.dump_recall_thread {
+        let thread = prospecta_tui::db::recall_thread::fetch(&pool, recall_id)
+            .await
+            .wrap_err("loading recall thread")?;
+        println!(
+            "prospecta-tui dump_recall_thread: id={} bank={}",
+            thread.recall.id, thread.recall.bank_id
+        );
+        println!(
+            "  recall:    mode={} n={} dur={}ms",
+            thread.recall.mode, thread.recall.n_results, thread.recall.duration_ms
+        );
+        match &thread.formulate {
+            Some(f) => println!(
+                "  formulate: id={} parse_fallback={} msg={:?}",
+                f.id, f.parse_fallback, f.message
+            ),
+            None => println!("  formulate: (none in window)"),
+        }
+        println!("  llm_calls: {} in ±10s window", thread.llm_calls.len());
+        for c in &thread.llm_calls {
+            println!(
+                "    [{}] {:<10} dur={}ms {}",
+                c.id,
+                c.prompt_name,
+                c.duration_ms,
+                if c.error.is_some() { "ERR" } else { "" }
+            );
+        }
+        if let Some(s) = &thread.recall.synthesis {
+            println!("  synthesis: {}", s);
         }
         return Ok(());
     }

@@ -7,7 +7,9 @@
 pub mod banks;
 pub mod documents;
 pub mod events;
+pub mod recall_thread;
 
 pub use banks::{Bank, BankSummary};
 pub use documents::{Document, MemoryItem};
 pub use events::{Event, EventKind};
+pub use recall_thread::{FormulateRow, LlmCallRow, RecallRow, RecallThread};
