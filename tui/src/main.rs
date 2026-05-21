@@ -55,6 +55,10 @@ struct Cli {
     /// paired index_text llm_call) for a given retain_event id and exit.
     #[arg(long, value_name = "RETAIN_ID")]
     dump_retain_thread: Option<i64>,
+
+    /// Dump per-bank dashboard stats (24h health signals) and exit.
+    #[arg(long, value_name = "BANK")]
+    dump_dashboard: Option<String>,
 }
 
 #[tokio::main]
@@ -229,6 +233,53 @@ async fn main() -> Result<()> {
                 println!("  index_text llm_call: (skipped — caller-supplied)")
             }
             None => println!("  index_text llm_call: (none in ±10s window)"),
+        }
+        return Ok(());
+    }
+
+    if let Some(bank) = cli.dump_dashboard.as_deref() {
+        let s = prospecta_tui::db::dashboard::fetch(&pool, bank)
+            .await
+            .wrap_err("loading dashboard")?;
+        println!(
+            "prospecta-tui dump_dashboard: bank={} dim={}",
+            s.bank_id, s.embedding_dim
+        );
+        println!(
+            "  substrate: documents={} memory_items={}",
+            s.documents, s.memory_items
+        );
+        println!(
+            "  activity (24h): retains={} recalls={} formulates={}",
+            s.retains_24h, s.recalls_24h, s.formulates_24h
+        );
+        let mr = s
+            .mean_recall_ms_24h
+            .map(|v| format!("{:.0}ms", v))
+            .unwrap_or_else(|| "—".into());
+        let mre = s
+            .mean_retain_ms_24h
+            .map(|v| format!("{:.0}ms", v))
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "  latency (24h): mean recall={} mean retain={} Σ llm={}ms",
+            mr, mre, s.total_llm_ms_24h
+        );
+        let fb = s
+            .formulate_fallback_rate_24h
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "—".into());
+        println!("  health (24h): parse_fallback={}", fb);
+        if s.llm_calls.is_empty() {
+            println!("  llm_calls (24h): none");
+        } else {
+            println!("  llm_calls (24h):");
+            for c in &s.llm_calls {
+                println!(
+                    "    {:<12} calls={:<4} avg={:.0}ms max={}ms err={}",
+                    c.prompt_name, c.calls, c.avg_ms, c.max_ms, c.errors
+                );
+            }
         }
         return Ok(());
     }

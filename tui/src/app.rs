@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use crate::{
     db::{self, BankSummary},
     theme,
-    views::{common, docs, manage, observability},
+    views::{common, dashboard, docs, manage, observability},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,7 @@ pub enum Tab {
     Banks,
     Docs,
     Events,
+    Dashboard,
 }
 
 impl Tab {
@@ -32,6 +33,7 @@ impl Tab {
             Tab::Banks => "banks",
             Tab::Docs => "docs",
             Tab::Events => "events",
+            Tab::Dashboard => "dashboard",
         }
     }
 }
@@ -63,6 +65,10 @@ pub struct App {
     retain_thread_open: bool,
     retain_thread_state: crate::views::retain_thread::RetainThreadState,
 
+    // Dashboard view state.
+    dashboard_state: dashboard::DashboardState,
+    last_dashboard_refresh: Instant,
+
     help_open: bool,
     status: String,
     should_quit: bool,
@@ -72,6 +78,7 @@ const EVENTS_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const EVENTS_PER_KIND: i64 = 50;
 const EVENTS_TOTAL_CAP: usize = 200;
 const DOCS_PAGE_LIMIT: i64 = 200;
+const DASHBOARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl App {
     pub async fn new(pool: PgPool, redacted_url: String) -> Self {
@@ -93,6 +100,10 @@ impl App {
             recall_thread_state: crate::views::recall_thread::RecallThreadState::new(),
             retain_thread_open: false,
             retain_thread_state: crate::views::retain_thread::RetainThreadState::new(),
+            dashboard_state: dashboard::DashboardState::new(),
+            last_dashboard_refresh: Instant::now()
+                .checked_sub(DASHBOARD_POLL_INTERVAL * 2)
+                .unwrap_or_else(Instant::now),
             help_open: false,
             status: "Tab to switch · ? for help · q to quit".to_string(),
             should_quit: false,
@@ -289,6 +300,35 @@ impl App {
         self.retain_thread_state.reset_scroll();
     }
 
+    /// Reload dashboard for the bank currently selected in the dashboard view,
+    /// or fall back to the bank-list selection. No-op if no bank is available.
+    async fn reload_dashboard(&mut self) {
+        let bank_id = self.dashboard_state.bank_id.clone().or_else(|| {
+            self.manage_state
+                .table
+                .selected()
+                .and_then(|i| self.banks.get(i))
+                .map(|b| b.bank.bank_id.clone())
+        });
+        let Some(bank_id) = bank_id else {
+            self.dashboard_state.stats = None;
+            self.dashboard_state.error = None;
+            self.last_dashboard_refresh = Instant::now();
+            return;
+        };
+        self.dashboard_state.bank_id = Some(bank_id.clone());
+        match db::dashboard::fetch(&self.pool, &bank_id).await {
+            Ok(stats) => {
+                self.dashboard_state.stats = Some(stats);
+                self.dashboard_state.error = None;
+            }
+            Err(e) => {
+                self.dashboard_state.error = Some(format!("{e}"));
+            }
+        }
+        self.last_dashboard_refresh = Instant::now();
+    }
+
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -303,6 +343,11 @@ impl App {
                 self.reload_events().await;
             }
 
+            if self.tab == Tab::Dashboard
+                && self.last_dashboard_refresh.elapsed() >= DASHBOARD_POLL_INTERVAL
+            {
+                self.reload_dashboard().await;
+            }
             if event::poll(Duration::from_millis(100)).wrap_err("event poll")? {
                 if let Event::Key(key) = event::read().wrap_err("event read")? {
                     if key.kind == KeyEventKind::Press {
@@ -402,11 +447,18 @@ impl App {
                     self.reload_events().await;
                 }
             }
+            (KeyCode::Char('4'), _) => {
+                self.tab = Tab::Dashboard;
+                if self.dashboard_state.stats.is_none() && self.dashboard_state.error.is_none() {
+                    self.reload_dashboard().await;
+                }
+            }
             (KeyCode::Tab, _) => {
                 self.tab = match self.tab {
                     Tab::Banks => Tab::Docs,
                     Tab::Docs => Tab::Events,
-                    Tab::Events => Tab::Banks,
+                    Tab::Events => Tab::Dashboard,
+                    Tab::Dashboard => Tab::Banks,
                 };
                 if self.tab == Tab::Docs && self.docs_state.bank_id.is_none() {
                     // Auto-bind the currently selected bank if user tabs over with no context yet.
@@ -416,12 +468,19 @@ impl App {
                 {
                     self.reload_events().await;
                 }
+                if self.tab == Tab::Dashboard
+                    && self.dashboard_state.stats.is_none()
+                    && self.dashboard_state.error.is_none()
+                {
+                    self.reload_dashboard().await;
+                }
             }
             (KeyCode::BackTab, _) => {
                 self.tab = match self.tab {
-                    Tab::Banks => Tab::Events,
+                    Tab::Banks => Tab::Dashboard,
                     Tab::Docs => Tab::Banks,
                     Tab::Events => Tab::Docs,
+                    Tab::Dashboard => Tab::Events,
                 };
             }
 
@@ -444,6 +503,7 @@ impl App {
                         }
                     },
                     Tab::Events => self.reload_events().await,
+                    Tab::Dashboard => self.reload_dashboard().await,
                 }
             }
             // Drill-down: Enter / → descends; Esc / ← ascends.
@@ -474,6 +534,7 @@ impl App {
                         None => {}
                     }
                 }
+                Tab::Dashboard => {}
             },
             (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.tab {
                 Tab::Docs => self.ascend_docs(),
@@ -490,11 +551,13 @@ impl App {
                 Tab::Banks => self.manage_state.select_next(self.banks.len()),
                 Tab::Docs => self.docs_state.select_next(),
                 Tab::Events => self.events_state.select_next(self.events.len()),
+                Tab::Dashboard => {}
             },
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.tab {
                 Tab::Banks => self.manage_state.select_prev(self.banks.len()),
                 Tab::Docs => self.docs_state.select_prev(),
                 Tab::Events => self.events_state.select_prev(self.events.len()),
+                Tab::Dashboard => {}
             },
             (KeyCode::Home, _) | (KeyCode::Char('g'), _) => match self.tab {
                 Tab::Banks => {
@@ -515,6 +578,7 @@ impl App {
                     }
                 },
                 Tab::Events => self.events_state.jump_top(self.events.len()),
+                Tab::Dashboard => {}
             },
             (KeyCode::End, _) | (KeyCode::Char('G'), _) => match self.tab {
                 Tab::Banks => {
@@ -543,6 +607,7 @@ impl App {
                         self.events_state.auto_scroll = false;
                     }
                 }
+                Tab::Dashboard => {}
             },
             (KeyCode::Char('f'), _) if self.tab == Tab::Events => {
                 self.events_state.auto_scroll = !self.events_state.auto_scroll;
@@ -606,6 +671,9 @@ impl App {
                     );
                 }
             }
+            Tab::Dashboard => {
+                dashboard::render(frame, chunks[0], &mut self.dashboard_state);
+            }
         }
 
         let status_line = ratatui::text::Line::from(vec![ratatui::text::Span::styled(
@@ -653,6 +721,12 @@ impl App {
                     ]
                 }
             }
+            Tab::Dashboard => &[
+                ("Tab", "next tab"),
+                ("r", "refresh now"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
         };
         common::render_footer(frame, footer_area, hints);
 
@@ -661,8 +735,8 @@ impl App {
                 frame,
                 area,
                 &[
-                    ("Tab / ⇧Tab", "cycle banks → docs → events"),
-                    ("1 / 2 / 3", "jump to banks / docs / events"),
+                    ("Tab / ⇧Tab", "cycle banks → docs → events → dashboard"),
+                    ("1 / 2 / 3 / 4", "jump to banks / docs / events / dashboard"),
                     ("Enter / → / l", "drill down (bank → docs → items)"),
                     ("Esc / ← / h", "ascend one level (items → docs → banks)"),
                     ("↑ / k", "previous row"),
