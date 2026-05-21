@@ -34,12 +34,30 @@ struct Cli {
     /// Useful for sanity-checking the substrate without launching the TUI.
     #[arg(long)]
     dump_events: bool,
+
+    /// Dump documents (and optionally memory_items) for a bank and exit.
+    /// Pass --dump-docs default to list documents; add --doc-id <uuid>
+    /// to descend into memory_items for one document.
+    #[arg(long, value_name = "BANK")]
+    dump_docs: Option<String>,
+
+    /// When set with --dump-docs, descend into this document's memory_items
+    /// instead of listing the bank's documents.
+    #[arg(long, value_name = "UUID")]
+    doc_id: Option<uuid::Uuid>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let _ = dotenvy::dotenv(); // opt-in for local dev; ignore not-found.
+
+    // Treat broken-pipe (head, less, etc.) as a clean exit rather than a panic.
+    // Only matters for the --dump-* paths; harmless for the TUI.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 
     let cli = Cli::parse();
     config::validate(&cli.database_url)?;
@@ -91,6 +109,46 @@ async fn main() -> Result<()> {
                 marker,
                 e.summary,
             );
+        }
+        return Ok(());
+    }
+
+    if let Some(bank) = cli.dump_docs.as_deref() {
+        match cli.doc_id {
+            None => {
+                let docs_ = prospecta_tui::db::documents::list_for_bank(&pool, bank, 100, 0)
+                    .await
+                    .wrap_err("loading documents")?;
+                println!(
+                    "prospecta-tui dump_docs: bank={} count={}",
+                    bank,
+                    docs_.len()
+                );
+                for d in docs_ {
+                    println!(
+                        "  {}  items={:<3} source={}  tags=[{}]  created={}",
+                        d.id,
+                        d.item_count,
+                        d.source.unwrap_or_else(|| "—".into()),
+                        d.tags.join(","),
+                        d.created_at.format("%Y-%m-%d %H:%M:%S"),
+                    );
+                }
+            }
+            Some(doc_id) => {
+                let items = prospecta_tui::db::documents::list_for_document(&pool, doc_id)
+                    .await
+                    .wrap_err("loading memory_items")?;
+                println!(
+                    "prospecta-tui dump_docs: doc={} items={}",
+                    doc_id,
+                    items.len()
+                );
+                for it in items {
+                    let src = if it.llm_generated { "llm" } else { "caller" };
+                    println!("  [{}] {}", src, it.content);
+                }
+            }
         }
         return Ok(());
     }

@@ -28,3 +28,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 color-eyre = "0.6"
 dotenvy = "0.15"
 url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

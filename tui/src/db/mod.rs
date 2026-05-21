@@ -5,7 +5,9 @@
 //! / `query_as!` so they're checked against the live schema at compile time.
 
 pub mod banks;
+pub mod documents;
 pub mod events;
 
 pub use banks::{Bank, BankSummary};
+pub use documents::{Document, MemoryItem};
 pub use events::{Event, EventKind};

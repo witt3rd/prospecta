@@ -1685,6 +1685,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "dotenvy",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
