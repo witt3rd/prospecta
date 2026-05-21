@@ -59,6 +59,10 @@ pub struct App {
     recall_thread_open: bool,
     recall_thread_state: crate::views::recall_thread::RecallThreadState,
 
+    // Retain-thread view state (overlay on events tab when active).
+    retain_thread_open: bool,
+    retain_thread_state: crate::views::retain_thread::RetainThreadState,
+
     help_open: bool,
     status: String,
     should_quit: bool,
@@ -87,6 +91,8 @@ impl App {
                 .unwrap_or_else(Instant::now),
             recall_thread_open: false,
             recall_thread_state: crate::views::recall_thread::RecallThreadState::new(),
+            retain_thread_open: false,
+            retain_thread_state: crate::views::retain_thread::RetainThreadState::new(),
             help_open: false,
             status: "Tab to switch · ? for help · q to quit".to_string(),
             should_quit: false,
@@ -247,6 +253,42 @@ impl App {
         self.recall_thread_state.reset_scroll();
     }
 
+    async fn open_retain_thread_for_selected_event(&mut self) {
+        let Some(i) = self.events_state.table.selected() else {
+            return;
+        };
+        let Some(ev) = self.events.get(i) else {
+            return;
+        };
+        if ev.kind != db::EventKind::Retain {
+            self.status =
+                "Enter on retain rows opens retain thread; recall rows open recall thread".into();
+            return;
+        }
+        let id = ev.id;
+        self.retain_thread_state.reset_scroll();
+        self.retain_thread_state.error = None;
+        self.retain_thread_state.thread = None;
+        self.retain_thread_open = true;
+        match db::retain_thread::fetch(&self.pool, id).await {
+            Ok(t) => {
+                self.retain_thread_state.thread = Some(t);
+                self.status = format!("retain thread id={id}");
+            }
+            Err(e) => {
+                self.retain_thread_state.error = Some(format!("{e}"));
+                self.status = format!("retain thread load failed: {e}");
+            }
+        }
+    }
+
+    fn close_retain_thread(&mut self) {
+        self.retain_thread_open = false;
+        self.retain_thread_state.thread = None;
+        self.retain_thread_state.error = None;
+        self.retain_thread_state.reset_scroll();
+    }
+
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -303,6 +345,37 @@ impl App {
                 }
                 (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
                     self.recall_thread_state.reset_scroll()
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Retain-thread overlay mirrors recall-thread overlay's key handling.
+        if self.retain_thread_open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('q'), _) => self.should_quit = true,
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
+                    self.close_retain_thread();
+                }
+                (KeyCode::Char('?'), _) => self.help_open = true,
+                (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                    self.retain_thread_state.scroll_down()
+                }
+                (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.retain_thread_state.scroll_up(),
+                (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+                    for _ in 0..10 {
+                        self.retain_thread_state.scroll_down();
+                    }
+                }
+                (KeyCode::PageUp, _) => {
+                    for _ in 0..10 {
+                        self.retain_thread_state.scroll_up();
+                    }
+                }
+                (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+                    self.retain_thread_state.reset_scroll()
                 }
                 _ => {}
             }
@@ -381,7 +454,26 @@ impl App {
                         self.enter_items_for_selected_document().await;
                     }
                 }
-                Tab::Events => self.open_recall_thread_for_selected_event().await,
+                Tab::Events => {
+                    let kind = self
+                        .events_state
+                        .table
+                        .selected()
+                        .and_then(|i| self.events.get(i))
+                        .map(|ev| ev.kind);
+                    match kind {
+                        Some(db::EventKind::Recall) => {
+                            self.open_recall_thread_for_selected_event().await
+                        }
+                        Some(db::EventKind::Retain) => {
+                            self.open_retain_thread_for_selected_event().await
+                        }
+                        Some(_) => {
+                            self.status = "Enter opens threads on recall or retain rows".into();
+                        }
+                        None => {}
+                    }
+                }
             },
             (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.tab {
                 Tab::Docs => self.ascend_docs(),
@@ -497,6 +589,12 @@ impl App {
                         chunks[0],
                         &mut self.recall_thread_state,
                     );
+                } else if self.retain_thread_open {
+                    crate::views::retain_thread::render(
+                        frame,
+                        chunks[0],
+                        &mut self.retain_thread_state,
+                    );
                 } else {
                     observability::render(
                         frame,
@@ -534,7 +632,7 @@ impl App {
                 ("q", "quit"),
             ],
             Tab::Events => {
-                if self.recall_thread_open {
+                if self.recall_thread_open || self.retain_thread_open {
                     &[
                         ("Esc/←", "back"),
                         ("↑↓/j/k", "scroll"),
@@ -545,7 +643,7 @@ impl App {
                     ]
                 } else {
                     &[
-                        ("Enter", "thread (recall row)"),
+                        ("Enter", "thread (recall/retain row)"),
                         ("Tab", "next tab"),
                         ("↑↓/j/k", "select"),
                         ("f", "auto-scroll"),

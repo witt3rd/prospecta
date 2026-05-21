@@ -50,6 +50,11 @@ struct Cli {
     /// paired llm_calls) for a given recall_event id and exit.
     #[arg(long, value_name = "RECALL_ID")]
     dump_recall_thread: Option<i64>,
+
+    /// Dump the full retain thread (retain_event + document + memory_items +
+    /// paired index_text llm_call) for a given retain_event id and exit.
+    #[arg(long, value_name = "RETAIN_ID")]
+    dump_retain_thread: Option<i64>,
 }
 
 #[tokio::main]
@@ -189,6 +194,41 @@ async fn main() -> Result<()> {
         }
         if let Some(s) = &thread.recall.synthesis {
             println!("  synthesis: {}", s);
+        }
+        return Ok(());
+    }
+
+    if let Some(retain_id) = cli.dump_retain_thread {
+        let t = prospecta_tui::db::retain_thread::fetch(&pool, retain_id)
+            .await
+            .wrap_err("loading retain thread")?;
+        println!(
+            "prospecta-tui dump_retain_thread: id={} bank={}",
+            t.retain.id, t.retain.bank_id
+        );
+        println!(
+            "  retain:    items={} caller_supplied={} dur={}ms",
+            t.retain.items_count, t.retain.index_text_caller_supplied, t.retain.duration_ms
+        );
+        match &t.document {
+            Some(d) => println!(
+                "  document:  id={} source={}",
+                d.id,
+                d.source.clone().unwrap_or_else(|| "—".into())
+            ),
+            None => println!("  document:  (none linked)"),
+        }
+        println!("  items:     {} memory_items", t.items.len());
+        for (i, it) in t.items.iter().enumerate() {
+            let src = if it.llm_generated { "llm" } else { "caller" };
+            println!("    {:>2}. [{}] {}", i + 1, src, it.content);
+        }
+        match &t.index_text_call {
+            Some(c) => println!("  index_text llm_call: id={} dur={}ms", c.id, c.duration_ms),
+            None if t.retain.index_text_caller_supplied => {
+                println!("  index_text llm_call: (skipped — caller-supplied)")
+            }
+            None => println!("  index_text llm_call: (none in ±10s window)"),
         }
         return Ok(());
     }
