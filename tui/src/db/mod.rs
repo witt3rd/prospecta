@@ -10,6 +10,7 @@ pub mod documents;
 pub mod events;
 pub mod recall_thread;
 pub mod retain_thread;
+pub mod search;
 
 pub use banks::{Bank, BankSummary};
 pub use dashboard::{DashboardStats, LlmCallStat, SweepStat};
@@ -17,3 +18,4 @@ pub use documents::{Document, MemoryItem};
 pub use events::{Event, EventKind};
 pub use recall_thread::{FormulateRow, LlmCallRow, RecallRow, RecallThread};
 pub use retain_thread::{DocumentRow, IndexTextCall, ItemRow, RetainRow, RetainThread};
+pub use search::SearchHit;
