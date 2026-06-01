@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::{
-    db::{DashboardStats, LlmCallStat},
+    db::{DashboardStats, LlmCallStat, SweepStat},
     theme,
 };
 
@@ -70,14 +70,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut DashboardState) {
         return;
     };
 
-    // Split: 2x2 card grid on top (~12 rows), llm_calls table below.
+    // Split: 2x2 card grid on top (~14 rows), then a bottom region holding
+    // the llm_calls table and the sweep-status table side by side.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(14), Constraint::Min(5)])
         .split(area);
 
     render_cards(frame, outer[0], stats);
-    render_llm_table(frame, outer[1], stats);
+
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(outer[1]);
+
+    render_llm_table(frame, bottom[0], stats);
+    render_sweep_table(frame, bottom[1], stats);
 }
 
 fn render_cards(frame: &mut Frame, area: Rect, s: &DashboardStats) {
@@ -279,6 +287,73 @@ fn render_llm_table(frame: &mut Frame, area: Rect, s: &DashboardStats) {
 
 // --- helpers ---
 
+fn render_sweep_table(frame: &mut Frame, area: Rect, s: &DashboardStats) {
+    if s.sweeps.is_empty() {
+        let block = card_block("sweep status");
+        let body = Line::from(Span::styled(
+            "  (this bank has never been swept)",
+            theme::respect_no_color(theme::dim()),
+        ));
+        frame.render_widget(Paragraph::new(body).block(block), area);
+        return;
+    }
+
+    let rows: Vec<Row> = s
+        .sweeps
+        .iter()
+        .map(|sw: &SweepStat| {
+            // A pass with a fatal error or any per-file errors is unhealthy.
+            let unhealthy = sw.error.is_some() || sw.errors_count > 0;
+            // Mid-flight pass (started, never ended) is worth flagging too.
+            let in_flight = sw.ended_at.is_none();
+
+            let status = if in_flight {
+                Span::styled("running", theme::respect_no_color(theme::accent()))
+            } else if unhealthy {
+                Span::styled("error", theme::respect_no_color(theme::error()))
+            } else {
+                Span::styled("ok", Style::default().fg(Color::LightGreen))
+            };
+
+            let errors_cell = if sw.errors_count > 0 {
+                Span::styled(
+                    sw.errors_count.to_string(),
+                    theme::respect_no_color(theme::error()),
+                )
+            } else {
+                Span::raw(sw.errors_count.to_string())
+            };
+
+            Row::new(vec![
+                Line::from(shorten_path(&sw.corpus_path)),
+                Line::from(status),
+                Line::from(format!("{}/{}", sw.files_indexed, sw.files_seen)),
+                Line::from(errors_cell),
+                Line::from(Span::styled(
+                    format_age(sw.started_at),
+                    theme::respect_no_color(theme::dim()),
+                )),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Min(12),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(6),
+        Constraint::Length(8),
+    ];
+
+    let header = Row::new(vec!["corpus", "status", "idx/seen", "errs", "age"])
+        .style(theme::respect_no_color(theme::table_header()));
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(card_block("sweep status · latest pass per corpus"));
+    frame.render_widget(table, area);
+}
+
 fn format_ms(ms: f64) -> String {
     if ms >= 1000.0 {
         format!("{:.1}s", ms / 1000.0)
@@ -294,5 +369,39 @@ fn format_total_ms(ms: i64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{}ms", ms)
+    }
+}
+
+/// Tail a long corpus path so the table cell stays legible:
+/// `/home/dt/notes` → `notes`, `/a/b/c/d` → `…/c/d`.
+fn shorten_path(path: &str) -> String {
+    let parts: Vec<&str> = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        _ => {
+            let tail = &parts[parts.len().saturating_sub(2)..];
+            format!("…/{}", tail.join("/"))
+        }
+    }
+}
+
+/// Coarse "time since" for the sweep age column. The load-bearing signal is
+/// "did the sweeper stop running?" — so a stale last-pass should read loud:
+/// `12s`, `5m`, `3h`, `4d`.
+fn format_age(ts: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = (chrono::Utc::now() - ts).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
 }
