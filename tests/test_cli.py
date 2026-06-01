@@ -189,3 +189,89 @@ def test_redact_database_url():
     # None or empty
     assert redact_database_url(None) == "(unset)"
     assert redact_database_url("") == "(unset)"
+
+
+# ---------------------------------------------------------------------------
+# Embedder selection (PROSPECTA_EMBEDDER) — issue #2
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_embedder_default_is_litellm(monkeypatch):
+    """Unset PROSPECTA_EMBEDDER routes to the LiteLLM default factory."""
+    from prospecta.cli import _common
+
+    monkeypatch.delenv("PROSPECTA_EMBEDDER", raising=False)
+    sentinel = object()
+
+    import prospecta.defaults as defaults
+    monkeypatch.setattr(
+        defaults, "make_default_embedder", lambda: sentinel, raising=False
+    )
+    assert _common._resolve_embedder() is sentinel
+
+
+def test_resolve_embedder_litellm_explicit(monkeypatch):
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "litellm")
+    sentinel = object()
+    import prospecta.defaults as defaults
+    monkeypatch.setattr(
+        defaults, "make_default_embedder", lambda: sentinel, raising=False
+    )
+    assert _common._resolve_embedder() is sentinel
+
+
+def test_resolve_embedder_sentence_transformers(monkeypatch):
+    """PROSPECTA_EMBEDDER=sentence-transformers routes to the offline factory
+    with the model from PROSPECTA_EMBED_MODEL (default all-MiniLM-L6-v2)."""
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "sentence-transformers")
+    monkeypatch.delenv("PROSPECTA_EMBED_MODEL", raising=False)
+
+    captured = {}
+    sentinel = object()
+
+    import prospecta.embed as embed_mod
+
+    def fake_st(model_name="all-MiniLM-L6-v2"):
+        captured["model"] = model_name
+        return sentinel
+
+    monkeypatch.setattr(embed_mod, "sentence_transformers", fake_st)
+    result = _common._resolve_embedder()
+    assert result is sentinel
+    assert captured["model"] == "all-MiniLM-L6-v2"
+
+
+def test_resolve_embedder_st_alias_and_custom_model(monkeypatch):
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "st")
+    monkeypatch.setenv("PROSPECTA_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+    captured = {}
+    import prospecta.embed as embed_mod
+
+    def fake_st(model_name="all-MiniLM-L6-v2"):
+        captured["model"] = model_name
+        return object()
+
+    monkeypatch.setattr(embed_mod, "sentence_transformers", fake_st)
+    _common._resolve_embedder()
+    assert captured["model"] == "BAAI/bge-small-en-v1.5"
+
+
+def test_resolve_embedder_unknown_errors(monkeypatch, capsys):
+    """Unknown PROSPECTA_EMBEDDER fails loud (no silent fallback) — a
+    wrong-embedder mismatch corrupts a bank's vector space."""
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "magic-beans")
+    with pytest.raises(SystemExit) as exc:
+        _common._resolve_embedder()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "magic-beans" in err
+    assert "sentence-transformers" in err

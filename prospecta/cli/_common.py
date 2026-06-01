@@ -40,17 +40,25 @@ def make_memory(args) -> "Memory":
         )
         raise SystemExit(1)
 
-    llm = None
+    # Resolve embed and llm independently so an offline embedder
+    # (PROSPECTA_EMBEDDER=sentence-transformers) works even when LiteLLM is
+    # not installed. Combined with `retain --index-text "..."` (which skips
+    # LLM index_text generation), this gives a fully offline retain path.
     embed = None
+    try:
+        embed = _resolve_embedder()
+    except ImportError:
+        # Selected embedder's provider lib missing. embed stays None;
+        # write subcommands surface a RuntimeError at use time.
+        pass
+
+    llm = None
     try:
         from prospecta import defaults  # type: ignore[import-not-found]
         llm = defaults.make_default_llm()  # type: ignore[attr-defined]
-        embed = defaults.make_default_embedder()  # type: ignore[attr-defined]
     except (ImportError, AttributeError):
-        # T23 (prospecta.defaults extras) not yet shipped. Build a Memory
-        # without llm/embed; subcommands that need them will surface a
-        # RuntimeError at use time. Read-only paths (stats, config) work
-        # fine without llm/embed.
+        # LiteLLM not installed / T23 defaults absent. Read-only paths
+        # (stats, config) and offline retain (--index-text) work without llm.
         pass
 
     return Memory(
@@ -59,6 +67,43 @@ def make_memory(args) -> "Memory":
         llm=llm,
         embed=embed,
     )
+
+
+def _resolve_embedder():
+    """Resolve an EmbedCallable from PROSPECTA_EMBEDDER (offline-selectable).
+
+    Selection (case-insensitive):
+      - unset / "litellm" / "default" → prospecta.defaults.make_default_embedder()
+        (LiteLLM, multi-provider; honors PROSPECTA_EMBED_MODEL).
+      - "sentence-transformers" / "st" → prospecta.embed.sentence_transformers(...)
+        (offline, no API key; model from PROSPECTA_EMBED_MODEL, default
+        all-MiniLM-L6-v2 / 384-dim).
+
+    Unknown values raise SystemExit(1) with the valid set, rather than
+    silently falling back — wrong-embedder mismatches corrupt a bank's
+    vector space, so failing loud is the honest default.
+
+    Provider-import failures (ImportError) propagate to make_memory's
+    try/except, which builds a Memory without embed (same contract as the
+    LiteLLM-missing path).
+    """
+    kind = os.environ.get("PROSPECTA_EMBEDDER", "default").strip().lower()
+
+    if kind in ("", "default", "litellm"):
+        from prospecta import defaults  # type: ignore[import-not-found]
+        return defaults.make_default_embedder()  # type: ignore[attr-defined]
+
+    if kind in ("sentence-transformers", "sentence_transformers", "st"):
+        from prospecta.embed import sentence_transformers
+        model = os.environ.get("PROSPECTA_EMBED_MODEL", "all-MiniLM-L6-v2")
+        return sentence_transformers(model)
+
+    print(
+        f"error: unknown PROSPECTA_EMBEDDER={kind!r}; "
+        "valid: default | litellm | sentence-transformers",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------

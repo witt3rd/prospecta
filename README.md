@@ -50,6 +50,22 @@ prospecta search "Kelly birthday"
 
 `prospecta init` is idempotent — re-runs detect already-up containers, already-applied migrations, and the already-created default bank. See `docs/deployments/{local-direct,neon,azure}.md` for non-Docker substrates.
 
+### Offline / keyless retain
+
+The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. To run the write path with **no API key** — local sentence-transformers embeddings — pair it with `--index-text` (which skips the LLM `index_text` generation, per P4):
+
+```bash
+pip install 'prospecta[embed-sentence-transformers]'
+prospecta create-bank --id local --embedding-dim 384   # all-MiniLM-L6-v2 is 384-dim
+PROSPECTA_EMBEDDER=sentence-transformers \
+PROSPECTA_BANK=local \
+prospecta retain "Kelly was born March 4th 1990" \
+    --source kelly.md \
+    --index-text "When was Kelly born?"
+```
+
+`PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (default `all-MiniLM-L6-v2`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
+
 ---
 
 ## API at three layers
