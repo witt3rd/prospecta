@@ -28,6 +28,9 @@ pub struct DashboardStats {
     pub llm_calls: Vec<LlmCallStat>,
     /// Sum of all LLM-call durations in the last 24h. Cost-estimate proxy.
     pub total_llm_ms_24h: i64,
+    /// Latest sweep pass per corpus_path. Empty if the bank has never swept.
+    /// "Is the sweeper running? Did it stop? Is it erroring?" at a glance.
+    pub sweeps: Vec<SweepStat>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,13 +42,32 @@ pub struct LlmCallStat {
     pub errors: i64,
 }
 
+/// The most recent sweep pass for one corpus_path. Derived from the
+/// append-only sweep_passes history (DISTINCT ON), not the sweeper_state
+/// snapshot — the history is the durable truth and survives a snapshot
+/// that was never written.
+#[derive(Debug, Clone)]
+pub struct SweepStat {
+    pub corpus_path: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// None while a pass is mid-flight (started, not yet ended).
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub files_seen: i32,
+    pub files_indexed: i32,
+    pub files_pruned: i32,
+    pub errors_count: i32,
+    /// Fatal pass error (distinct from per-file errors_count).
+    pub error: Option<String>,
+}
+
 pub async fn fetch(pool: &PgPool, bank_id: &str) -> sqlx::Result<DashboardStats> {
-    let (bank_meta, doc_counts, retain_recall, formulate, llm) = tokio::try_join!(
+    let (bank_meta, doc_counts, retain_recall, formulate, llm, sweeps) = tokio::try_join!(
         fetch_bank_meta(pool, bank_id),
         fetch_doc_counts(pool, bank_id),
         fetch_retain_recall(pool, bank_id),
         fetch_formulate(pool, bank_id),
         fetch_llm(pool, bank_id),
+        fetch_sweeps(pool, bank_id),
     )?;
 
     Ok(DashboardStats {
@@ -61,6 +83,7 @@ pub async fn fetch(pool: &PgPool, bank_id: &str) -> sqlx::Result<DashboardStats>
         formulates_24h: formulate.count,
         llm_calls: llm.0,
         total_llm_ms_24h: llm.1,
+        sweeps,
     })
 }
 
@@ -204,4 +227,45 @@ async fn fetch_llm(pool: &PgPool, bank_id: &str) -> sqlx::Result<(Vec<LlmCallSta
         .collect();
 
     Ok((stats, total_ms.total_ms.unwrap_or(0)))
+}
+
+async fn fetch_sweeps(pool: &PgPool, bank_id: &str) -> sqlx::Result<Vec<SweepStat>> {
+    // Latest pass per corpus_path from the append-only history. DISTINCT ON
+    // keeps the most recent (started_at DESC) row for each corpus_path, then
+    // we re-sort the result set by corpus_path for stable display order.
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT ON (corpus_path)
+            corpus_path,
+            started_at,
+            ended_at,
+            files_seen,
+            files_indexed,
+            files_pruned,
+            errors_count,
+            error
+        FROM sweep_passes
+        WHERE bank_id = $1
+        ORDER BY corpus_path, started_at DESC
+        "#,
+        bank_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let sweeps = rows
+        .into_iter()
+        .map(|r| SweepStat {
+            corpus_path: r.corpus_path,
+            started_at: r.started_at,
+            ended_at: r.ended_at,
+            files_seen: r.files_seen,
+            files_indexed: r.files_indexed,
+            files_pruned: r.files_pruned,
+            errors_count: r.errors_count,
+            error: r.error,
+        })
+        .collect();
+
+    Ok(sweeps)
 }

@@ -12,7 +12,7 @@ pub mod recall_thread;
 pub mod retain_thread;
 
 pub use banks::{Bank, BankSummary};
-pub use dashboard::{DashboardStats, LlmCallStat};
+pub use dashboard::{DashboardStats, LlmCallStat, SweepStat};
 pub use documents::{Document, MemoryItem};
 pub use events::{Event, EventKind};
 pub use recall_thread::{FormulateRow, LlmCallRow, RecallRow, RecallThread};

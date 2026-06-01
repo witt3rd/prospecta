@@ -1,6 +1,6 @@
 //! Headless render tests for the dashboard view.
 
-use prospecta_tui::db::{DashboardStats, LlmCallStat};
+use prospecta_tui::db::{DashboardStats, LlmCallStat, SweepStat};
 use prospecta_tui::views::{common, dashboard};
 use ratatui::{backend::TestBackend, Terminal};
 
@@ -33,6 +33,28 @@ fn dummy_stats() -> DashboardStats {
             },
         ],
         total_llm_ms_24h: 13_240,
+        sweeps: vec![
+            SweepStat {
+                corpus_path: "/home/dt/notes".into(),
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(7),
+                ended_at: Some(chrono::Utc::now() - chrono::Duration::minutes(6)),
+                files_seen: 142,
+                files_indexed: 3,
+                files_pruned: 0,
+                errors_count: 0,
+                error: None,
+            },
+            SweepStat {
+                corpus_path: "/home/dt/archive".into(),
+                started_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                ended_at: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
+                files_seen: 88,
+                files_indexed: 0,
+                files_pruned: 0,
+                errors_count: 4,
+                error: None,
+            },
+        ],
     }
 }
 
@@ -114,6 +136,14 @@ fn dashboard_full_render_paints_all_cards() {
     assert!(s.contains("synthesize"), "synthesize prompt missing");
     assert!(s.contains("prompt"), "llm header missing");
     assert!(s.contains("max"), "llm header missing");
+    // Sweep table
+    assert!(s.contains("sweep status"), "sweep panel title missing");
+    assert!(s.contains("corpus"), "sweep header missing");
+    assert!(s.contains("idx/seen"), "sweep header missing");
+    assert!(s.contains("notes"), "sweep corpus tail missing");
+    // healthy pass reads ok, errored pass reads error
+    assert!(s.contains("ok"), "healthy sweep status missing");
+    assert!(s.contains("error"), "errored sweep status missing");
 }
 
 #[test]
@@ -148,4 +178,63 @@ fn dashboard_no_activity_shows_dashes() {
         "empty llm-table hint missing"
     );
     assert!(s.contains("scratch"), "bank id missing in render");
+}
+
+#[test]
+fn dashboard_never_swept_shows_hint() {
+    let mut state = dashboard::DashboardState::new();
+    state.bank_id = Some("fresh".into());
+    let mut stats = dummy_stats();
+    stats.bank_id = "fresh".into();
+    stats.sweeps = vec![];
+    state.stats = Some(stats);
+
+    let backend = TestBackend::new(160, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            let [_, body, _] = common::chrome_layout(area);
+            dashboard::render(f, body, &mut state);
+        })
+        .unwrap();
+    let s = buf_to_string(&terminal);
+    assert!(
+        s.contains("never been swept"),
+        "never-swept hint missing from sweep panel"
+    );
+}
+
+#[test]
+fn dashboard_sweep_in_flight_reads_running() {
+    let mut state = dashboard::DashboardState::new();
+    state.bank_id = Some("default".into());
+    let mut stats = dummy_stats();
+    // One corpus mid-sweep: started, not yet ended.
+    stats.sweeps = vec![SweepStat {
+        corpus_path: "/home/dt/live".into(),
+        started_at: chrono::Utc::now() - chrono::Duration::seconds(12),
+        ended_at: None,
+        files_seen: 30,
+        files_indexed: 5,
+        files_pruned: 0,
+        errors_count: 0,
+        error: None,
+    }];
+    state.stats = Some(stats);
+
+    let backend = TestBackend::new(160, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            let [_, body, _] = common::chrome_layout(area);
+            dashboard::render(f, body, &mut state);
+        })
+        .unwrap();
+    let s = buf_to_string(&terminal);
+    assert!(
+        s.contains("running"),
+        "in-flight sweep should read 'running'"
+    );
 }

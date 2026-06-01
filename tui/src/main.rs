@@ -281,6 +281,29 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        if s.sweeps.is_empty() {
+            println!("  sweeps: none (bank never swept)");
+        } else {
+            println!("  sweeps (latest pass per corpus):");
+            for sw in &s.sweeps {
+                let status = if sw.ended_at.is_none() {
+                    "running"
+                } else if sw.error.is_some() || sw.errors_count > 0 {
+                    "error"
+                } else {
+                    "ok"
+                };
+                println!(
+                    "    {:<24} {:<8} idx/seen={}/{} pruned={} errs={}",
+                    sw.corpus_path,
+                    status,
+                    sw.files_indexed,
+                    sw.files_seen,
+                    sw.files_pruned,
+                    sw.errors_count
+                );
+            }
+        }
         return Ok(());
     }
 
