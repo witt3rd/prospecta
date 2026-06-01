@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use crate::{
     db::{self, BankSummary},
     theme,
-    views::{common, dashboard, docs, manage, observability},
+    views::{common, dashboard, docs, manage, observability, search},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub enum Tab {
     Docs,
     Events,
     Dashboard,
+    Search,
 }
 
 impl Tab {
@@ -34,6 +35,7 @@ impl Tab {
             Tab::Docs => "docs",
             Tab::Events => "events",
             Tab::Dashboard => "dashboard",
+            Tab::Search => "search",
         }
     }
 }
@@ -68,6 +70,9 @@ pub struct App {
     // Dashboard view state.
     dashboard_state: dashboard::DashboardState,
     last_dashboard_refresh: Instant,
+
+    // Search view state.
+    search_state: search::SearchState,
 
     help_open: bool,
     status: String,
@@ -104,6 +109,7 @@ impl App {
             last_dashboard_refresh: Instant::now()
                 .checked_sub(DASHBOARD_POLL_INTERVAL * 2)
                 .unwrap_or_else(Instant::now),
+            search_state: search::SearchState::new(),
             help_open: false,
             status: "Tab to switch · ? for help · q to quit".to_string(),
             should_quit: false,
@@ -329,6 +335,63 @@ impl App {
         self.last_dashboard_refresh = Instant::now();
     }
 
+    /// Bind the search tab to a bank if it has none yet — falls through to the
+    /// bank selected on the banks tab. Mirrors how dashboard auto-binds.
+    fn bind_search_bank(&mut self) {
+        if self.search_state.bank_id.is_none() {
+            let bank_id = self
+                .manage_state
+                .table
+                .selected()
+                .and_then(|i| self.banks.get(i))
+                .map(|b| b.bank.bank_id.clone());
+            self.search_state.bank_id = bank_id;
+        }
+    }
+
+    const SEARCH_LIMIT: i64 = 100;
+
+    /// Run the current query against both lexical channels for the bound bank.
+    async fn run_search(&mut self) {
+        self.bind_search_bank();
+        let Some(bank_id) = self.search_state.bank_id.clone() else {
+            self.search_state.error = Some("no bank to search — pick one on the banks tab".into());
+            return;
+        };
+        if self.search_state.query.trim().is_empty() {
+            self.search_state.hits.clear();
+            self.search_state.searched = false;
+            self.search_state.table.select(None);
+            self.status = "empty query".into();
+            return;
+        }
+        match db::search::search(
+            &self.pool,
+            &bank_id,
+            &self.search_state.query,
+            Self::SEARCH_LIMIT,
+        )
+        .await
+        {
+            Ok(hits) => {
+                self.search_state.searched = true;
+                self.search_state.error = None;
+                if hits.is_empty() {
+                    self.search_state.table.select(None);
+                } else {
+                    self.search_state.table.select(Some(0));
+                }
+                self.status = format!("{} hits for \"{}\"", hits.len(), self.search_state.query);
+                self.search_state.hits = hits;
+            }
+            Err(e) => {
+                self.search_state.error = Some(format!("{e}"));
+                self.search_state.hits.clear();
+                self.search_state.table.select(None);
+            }
+        }
+    }
+
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -427,6 +490,36 @@ impl App {
             return;
         }
 
+        // Search tab in Editing mode swallows text input. Enter runs the query;
+        // Esc drops back to Browsing (or quits if the result list is empty).
+        if self.tab == Tab::Search && self.search_state.mode == search::SearchMode::Editing {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                (KeyCode::Enter, _) => {
+                    self.run_search().await;
+                    // Land in the results so arrows navigate immediately.
+                    if !self.search_state.hits.is_empty() {
+                        self.search_state.mode = search::SearchMode::Browsing;
+                    }
+                }
+                (KeyCode::Esc, _) => {
+                    if self.search_state.hits.is_empty() {
+                        self.should_quit = true;
+                    } else {
+                        self.search_state.mode = search::SearchMode::Browsing;
+                    }
+                }
+                (KeyCode::Backspace, _) => self.search_state.backspace(),
+                (KeyCode::Char(c), m)
+                    if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                {
+                    self.search_state.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => self.should_quit = true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
@@ -453,12 +546,19 @@ impl App {
                     self.reload_dashboard().await;
                 }
             }
+            (KeyCode::Char('5'), _) => {
+                self.tab = Tab::Search;
+                self.bind_search_bank();
+                // Entering search lands in the query box ready to type.
+                self.search_state.mode = search::SearchMode::Editing;
+            }
             (KeyCode::Tab, _) => {
                 self.tab = match self.tab {
                     Tab::Banks => Tab::Docs,
                     Tab::Docs => Tab::Events,
                     Tab::Events => Tab::Dashboard,
-                    Tab::Dashboard => Tab::Banks,
+                    Tab::Dashboard => Tab::Search,
+                    Tab::Search => Tab::Banks,
                 };
                 if self.tab == Tab::Docs && self.docs_state.bank_id.is_none() {
                     // Auto-bind the currently selected bank if user tabs over with no context yet.
@@ -474,14 +574,23 @@ impl App {
                 {
                     self.reload_dashboard().await;
                 }
+                if self.tab == Tab::Search {
+                    self.bind_search_bank();
+                    self.search_state.mode = search::SearchMode::Editing;
+                }
             }
             (KeyCode::BackTab, _) => {
                 self.tab = match self.tab {
-                    Tab::Banks => Tab::Dashboard,
+                    Tab::Banks => Tab::Search,
                     Tab::Docs => Tab::Banks,
                     Tab::Events => Tab::Docs,
                     Tab::Dashboard => Tab::Events,
+                    Tab::Search => Tab::Dashboard,
                 };
+                if self.tab == Tab::Search {
+                    self.bind_search_bank();
+                    self.search_state.mode = search::SearchMode::Editing;
+                }
             }
 
             (KeyCode::Char('r'), _) => {
@@ -504,6 +613,7 @@ impl App {
                     },
                     Tab::Events => self.reload_events().await,
                     Tab::Dashboard => self.reload_dashboard().await,
+                    Tab::Search => self.run_search().await,
                 }
             }
             // Drill-down: Enter / → descends; Esc / ← ascends.
@@ -535,9 +645,17 @@ impl App {
                     }
                 }
                 Tab::Dashboard => {}
+                Tab::Search => {
+                    // In browsing mode, Enter re-opens the query box to edit.
+                    self.search_state.mode = search::SearchMode::Editing;
+                }
             },
             (KeyCode::Esc, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.tab {
                 Tab::Docs => self.ascend_docs(),
+                Tab::Search => {
+                    // Esc from browsing goes back to the query box rather than quitting.
+                    self.search_state.mode = search::SearchMode::Editing;
+                }
                 _ => {
                     // Esc with nothing to ascend = quit, matches v0.1 spec from earlier commit.
                     if key.code == KeyCode::Esc {
@@ -552,12 +670,14 @@ impl App {
                 Tab::Docs => self.docs_state.select_next(),
                 Tab::Events => self.events_state.select_next(self.events.len()),
                 Tab::Dashboard => {}
+                Tab::Search => self.search_state.select_next(),
             },
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.tab {
                 Tab::Banks => self.manage_state.select_prev(self.banks.len()),
                 Tab::Docs => self.docs_state.select_prev(),
                 Tab::Events => self.events_state.select_prev(self.events.len()),
                 Tab::Dashboard => {}
+                Tab::Search => self.search_state.select_prev(),
             },
             (KeyCode::Home, _) | (KeyCode::Char('g'), _) => match self.tab {
                 Tab::Banks => {
@@ -579,6 +699,11 @@ impl App {
                 },
                 Tab::Events => self.events_state.jump_top(self.events.len()),
                 Tab::Dashboard => {}
+                Tab::Search => {
+                    if !self.search_state.hits.is_empty() {
+                        self.search_state.table.select(Some(0));
+                    }
+                }
             },
             (KeyCode::End, _) | (KeyCode::Char('G'), _) => match self.tab {
                 Tab::Banks => {
@@ -608,6 +733,12 @@ impl App {
                     }
                 }
                 Tab::Dashboard => {}
+                Tab::Search => {
+                    let len = self.search_state.hits.len();
+                    if len > 0 {
+                        self.search_state.table.select(Some(len - 1));
+                    }
+                }
             },
             (KeyCode::Char('f'), _) if self.tab == Tab::Events => {
                 self.events_state.auto_scroll = !self.events_state.auto_scroll;
@@ -630,7 +761,7 @@ impl App {
         let [header_area, body_area, footer_area] = common::chrome_layout(area);
 
         let active = self.tab.title();
-        let title = format!("{}  ·  1/2/3 or Tab", active);
+        let title = format!("{}  ·  1/2/3/4/5 or Tab", active);
         common::render_header(frame, header_area, &title, &self.redacted_url);
 
         let chunks = Layout::default()
@@ -673,6 +804,9 @@ impl App {
             }
             Tab::Dashboard => {
                 dashboard::render(frame, chunks[0], &mut self.dashboard_state);
+            }
+            Tab::Search => {
+                search::render(frame, chunks[0], &mut self.search_state);
             }
         }
 
@@ -727,6 +861,25 @@ impl App {
                 ("?", "help"),
                 ("q", "quit"),
             ],
+            Tab::Search => {
+                if self.search_state.mode == search::SearchMode::Editing {
+                    &[
+                        ("type", "edit query"),
+                        ("Enter", "search"),
+                        ("Esc", "results"),
+                        ("?", "help"),
+                        ("Ctrl-C", "quit"),
+                    ]
+                } else {
+                    &[
+                        ("Enter/Esc", "edit query"),
+                        ("↑↓/j/k", "select"),
+                        ("Tab", "next tab"),
+                        ("?", "help"),
+                        ("q", "quit"),
+                    ]
+                }
+            }
         };
         common::render_footer(frame, footer_area, hints);
 
@@ -735,8 +888,14 @@ impl App {
                 frame,
                 area,
                 &[
-                    ("Tab / ⇧Tab", "cycle banks → docs → events → dashboard"),
-                    ("1 / 2 / 3 / 4", "jump to banks / docs / events / dashboard"),
+                    (
+                        "Tab / ⇧Tab",
+                        "cycle banks → docs → events → dashboard → search",
+                    ),
+                    (
+                        "1 / 2 / 3 / 4 / 5",
+                        "jump to banks / docs / events / dashboard / search",
+                    ),
                     ("Enter / → / l", "drill down (bank → docs → items)"),
                     ("Esc / ← / h", "ascend one level (items → docs → banks)"),
                     ("↑ / k", "previous row"),
@@ -744,6 +903,10 @@ impl App {
                     ("g / Home", "first row"),
                     ("G / End", "last row"),
                     ("f", "toggle auto-scroll (events tab)"),
+                    (
+                        "type + Enter",
+                        "run search (search tab); Esc toggles edit/browse",
+                    ),
                     ("r", "reload current view from substrate"),
                     ("?", "toggle this help"),
                     ("q / Ctrl-C", "quit"),

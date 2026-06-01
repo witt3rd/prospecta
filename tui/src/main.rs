@@ -59,6 +59,11 @@ struct Cli {
     /// Dump per-bank dashboard stats (24h health signals) and exit.
     #[arg(long, value_name = "BANK")]
     dump_dashboard: Option<String>,
+
+    /// Dump search hits for a "BANK:QUERY" pair across both lexical channels
+    /// and exit. Example: --dump-search "default:bilateral synthesis".
+    #[arg(long, value_name = "BANK:QUERY")]
+    dump_search: Option<String>,
 }
 
 #[tokio::main]
@@ -307,10 +312,46 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(spec) = cli.dump_search.as_deref() {
+        let (bank, query) = spec
+            .split_once(':')
+            .ok_or_else(|| color_eyre::eyre::eyre!("--dump-search expects BANK:QUERY"))?;
+        let hits = prospecta_tui::db::search::search(&pool, bank, query, 50)
+            .await
+            .wrap_err("running search")?;
+        println!(
+            "prospecta-tui dump_search: bank={} query={:?} hits={}",
+            bank,
+            query,
+            hits.len()
+        );
+        for h in &hits {
+            println!(
+                "  [{:<8}] rank={:.3}  {}  ({})",
+                h.channel_label(),
+                h.best_rank(),
+                truncate_dump(&h.content, 60),
+                h.source.as_deref().unwrap_or("—")
+            );
+        }
+        return Ok(());
+    }
+
     let result = run_tui(pool, redacted).await;
     // Always restore the terminal on the way out, even on error.
     let _ = restore_terminal();
     result
+}
+
+/// Flatten + tail a string for one-line --dump-search output.
+fn truncate_dump(s: &str, max: usize) -> String {
+    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let head: String = flat.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 async fn run_tui(pool: sqlx::PgPool, redacted_url: String) -> Result<()> {
