@@ -2,7 +2,6 @@
 
 use ratatui::{
     layout::{Constraint, Rect},
-    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Row, Table, TableState},
     Frame,
@@ -120,16 +119,4 @@ pub fn render(
         );
 
     frame.render_stateful_widget(table, area, &mut state.table);
-
-    // Detail strip below: show created_at + embedding_model_id of the selected row.
-    if let Some(i) = state.table.selected() {
-        if let Some(b) = banks.get(i) {
-            // Inline detail rendered as a one-line block-less paragraph below the table?
-            // Actually we already gave the whole area to the table; skip detail strip for v0.1.
-            let _ = b; // suppress unused warning when this is unimplemented.
-        }
-    }
-
-    // Silence the unused-import warning if Style ends up unused above.
-    let _ = Style::default;
 }
