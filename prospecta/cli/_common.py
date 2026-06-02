@@ -48,8 +48,11 @@ def make_memory(args) -> "Memory":
     try:
         embed = _resolve_embedder()
     except ImportError:
-        # Selected embedder's provider lib missing. embed stays None;
-        # write subcommands surface a RuntimeError at use time.
+        # Only the default/litellm path reaches here — _resolve_embedder
+        # converts an EXPLICIT offline selection's import failure into a
+        # loud SystemExit. So this swallow is the litellm-missing case:
+        # embed stays None; write subcommands surface a RuntimeError at use
+        # time, while read-only paths (stats, config) still work.
         pass
 
     llm = None
@@ -83,9 +86,13 @@ def _resolve_embedder():
     silently falling back — wrong-embedder mismatches corrupt a bank's
     vector space, so failing loud is the honest default.
 
-    Provider-import failures (ImportError) propagate to make_memory's
-    try/except, which builds a Memory without embed (same contract as the
-    LiteLLM-missing path).
+    Provider-import behavior is asymmetric by design:
+      - The default/litellm path soft-fails: if LiteLLM is missing the
+        ImportError propagates to make_memory, which builds a Memory without
+        embed so read-only commands (stats, config) still work.
+      - An EXPLICIT offline selection that can't import its provider fails
+        loud here with the actionable install hint, rather than devolving
+        into a confusing downstream RuntimeError about Memory(embed=...).
     """
     kind = os.environ.get("PROSPECTA_EMBEDDER", "default").strip().lower()
 
@@ -96,11 +103,18 @@ def _resolve_embedder():
     if kind in ("sentence-transformers", "sentence_transformers", "st"):
         from prospecta.embed import sentence_transformers
         model = os.environ.get("PROSPECTA_EMBED_MODEL", "all-MiniLM-L6-v2")
-        return sentence_transformers(model)
+        try:
+            return sentence_transformers(model)
+        except ImportError as e:
+            # User explicitly asked for the offline embedder but the extra
+            # isn't installed. Surface the factory's actionable install hint
+            # instead of letting make_memory swallow it.
+            print(f"error: {e}", file=sys.stderr)
+            raise SystemExit(1) from e
 
     print(
         f"error: unknown PROSPECTA_EMBEDDER={kind!r}; "
-        "valid: default | litellm | sentence-transformers",
+        "valid: default | litellm | sentence-transformers (alias: st)",
         file=sys.stderr,
     )
     raise SystemExit(1)

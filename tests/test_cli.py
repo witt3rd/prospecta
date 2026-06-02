@@ -275,3 +275,61 @@ def test_resolve_embedder_unknown_errors(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "magic-beans" in err
     assert "sentence-transformers" in err
+
+
+def test_resolve_embedder_unknown_lists_st_alias(monkeypatch, capsys):
+    """The unknown-value error advertises the `st` alias (matches the docs)."""
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "nope")
+    with pytest.raises(SystemExit):
+        _common._resolve_embedder()
+    assert "st" in capsys.readouterr().err
+
+
+def test_resolve_embedder_st_missing_extra_fails_loud(monkeypatch, capsys):
+    """An EXPLICIT sentence-transformers selection whose extra isn't installed
+    fails loud with the factory's install hint — not a swallowed ImportError
+    that devolves into a confusing downstream RuntimeError (issue #2 review)."""
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "sentence-transformers")
+
+    import prospecta.embed as embed_mod
+
+    def boom(model_name="all-MiniLM-L6-v2"):
+        raise ImportError(
+            "prospecta.embed.sentence_transformers requires the "
+            "sentence-transformers library. Install with: "
+            "pip install 'prospecta[embed-sentence-transformers]'"
+        )
+
+    monkeypatch.setattr(embed_mod, "sentence_transformers", boom)
+    with pytest.raises(SystemExit) as exc:
+        _common._resolve_embedder()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "embed-sentence-transformers" in err
+
+
+def test_make_memory_st_missing_extra_propagates_systemexit(monkeypatch):
+    """make_memory does NOT swallow the explicit-offline-missing SystemExit —
+    its ImportError guard only catches the litellm-default soft-fail path."""
+    from prospecta.cli import _common
+
+    monkeypatch.setenv("PROSPECTA_EMBEDDER", "st")
+
+    import prospecta.embed as embed_mod
+
+    def boom(model_name="all-MiniLM-L6-v2"):
+        raise ImportError("install with: pip install 'prospecta[embed-sentence-transformers]'")
+
+    monkeypatch.setattr(embed_mod, "sentence_transformers", boom)
+
+    class _Args:
+        database_url = "postgres://u:p@localhost/db"
+        bank = "default"
+
+    with pytest.raises(SystemExit) as exc:
+        _common.make_memory(_Args())
+    assert exc.value.code == 1
