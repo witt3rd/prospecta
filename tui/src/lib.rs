@@ -4,5 +4,6 @@
 pub mod app;
 pub mod config;
 pub mod db;
+pub mod shell;
 pub mod theme;
 pub mod views;
