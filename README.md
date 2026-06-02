@@ -126,6 +126,10 @@ Every load-bearing event of the bilateral spine is recorded in Postgres event ta
 
 Inspect a session end-to-end with a few SQL queries from `pgcli` or any Postgres client. See [`docs/observability.md`](docs/observability.md) for the inspection guide, the cheat-sheet of queries, custom-tracer patterns, and the opt-outs.
 
+### prospecta-tui — the interactive inspection surface
+
+[`tui/`](tui/README.md) is a Rust + Ratatui terminal UI that makes the durable trace legible without SQL: five tabs covering bank/document browsing, a live event-stream with end-to-end recall/retain thread views, a per-bank health dashboard (24h signals + sweep status), cross-channel search, and a manual retain form. Read paths go direct via `sqlx` (schema-checked at compile time); the retain write path shells out to this CLI so the spine stays library-owned. Install with `cargo install --path tui`; see [`tui/README.md`](tui/README.md) for tabs, keybindings, and the offline-build notes.
+
 ---
 
 ## Where prospecta sits in the agent-memory landscape

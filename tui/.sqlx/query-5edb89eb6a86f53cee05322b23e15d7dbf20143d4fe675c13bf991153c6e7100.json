@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            (SELECT count(*) FROM retain_events\n                WHERE bank_id = $1\n                  AND created_at >= now() - INTERVAL '24 hours') AS retains,\n            (SELECT count(*) FROM recall_events\n                WHERE bank_id = $1\n                  AND created_at >= now() - INTERVAL '24 hours') AS recalls,\n            (SELECT AVG(duration_ms)::float8 FROM recall_events\n                WHERE bank_id = $1\n                  AND created_at >= now() - INTERVAL '24 hours') AS mean_recall_ms,\n            (SELECT AVG(duration_ms)::float8 FROM retain_events\n                WHERE bank_id = $1\n                  AND created_at >= now() - INTERVAL '24 hours') AS mean_retain_ms\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retains",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "recalls",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "mean_recall_ms",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "mean_retain_ms",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "5edb89eb6a86f53cee05322b23e15d7dbf20143d4fe675c13bf991153c6e7100"
+}

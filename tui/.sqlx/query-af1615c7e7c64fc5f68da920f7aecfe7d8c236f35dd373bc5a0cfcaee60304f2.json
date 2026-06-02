@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            (SELECT count(*) FROM documents    WHERE bank_id = $1) AS documents,\n            (SELECT count(*) FROM memory_items WHERE bank_id = $1) AS memory_items\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "documents",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "memory_items",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "af1615c7e7c64fc5f68da920f7aecfe7d8c236f35dd373bc5a0cfcaee60304f2"
+}

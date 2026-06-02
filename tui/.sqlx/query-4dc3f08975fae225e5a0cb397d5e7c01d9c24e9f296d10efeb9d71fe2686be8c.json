@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, created_at, prompt_name, duration_ms, json_mode, error,\n               prompt_text, response_text\n        FROM llm_calls\n        WHERE bank_id = $1\n          AND created_at BETWEEN ($2::timestamptz - INTERVAL '10 seconds')\n                             AND ($2::timestamptz + INTERVAL '10 seconds')\n        ORDER BY created_at ASC, id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "prompt_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "duration_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "json_mode",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "prompt_text",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "response_text",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "4dc3f08975fae225e5a0cb397d5e7c01d9c24e9f296d10efeb9d71fe2686be8c"
+}

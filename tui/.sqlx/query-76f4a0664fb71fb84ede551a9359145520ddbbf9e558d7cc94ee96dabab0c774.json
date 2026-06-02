@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, bank_id, created_at, duration_ms, mode, n_results,\n               synthesis IS NOT NULL AS has_synth\n        FROM recall_events\n        WHERE ($1::text IS NULL OR bank_id = $1)\n        ORDER BY created_at DESC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "bank_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "duration_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "n_results",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "has_synth",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "76f4a0664fb71fb84ede551a9359145520ddbbf9e558d7cc94ee96dabab0c774"
+}

@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, bank_id, created_at, duration_ms, n_queries_out,\n               parse_fallback, error_kind\n        FROM formulate_events\n        WHERE ($1::text IS NULL OR bank_id = $1)\n        ORDER BY created_at DESC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "bank_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "duration_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "n_queries_out",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "parse_fallback",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_kind",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "0e31ead873bf598cc23b7148b4f6f6115885be16c1b6e03a754bc253935b5ec7"
+}

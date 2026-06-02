@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            mi.id            AS item_id,\n            mi.document_id   AS document_id,\n            d.source         AS source,\n            mi.content       AS content,\n            mi.original_chunk AS original_chunk,\n            mi.llm_generated AS llm_generated,\n            mi.created_at    AS created_at,\n            ts_rank(mi.content_tsv, q) AS content_rank,\n            ts_rank(mi.body_tsv, q)    AS body_rank,\n            (mi.content_tsv @@ q)      AS content_hit,\n            (mi.body_tsv @@ q)         AS body_hit\n        FROM memory_items mi\n        JOIN documents d ON d.id = mi.document_id\n        CROSS JOIN websearch_to_tsquery('english', $2) AS q\n        WHERE mi.bank_id = $1\n          AND (mi.content_tsv @@ q OR mi.body_tsv @@ q)\n        ORDER BY GREATEST(ts_rank(mi.content_tsv, q), ts_rank(mi.body_tsv, q)) DESC,\n                 mi.created_at DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "document_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "original_chunk",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "llm_generated",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "content_rank",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 8,
+        "name": "body_rank",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "content_hit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "body_hit",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "38d74f1e800e5016e6294a869b6c822ac8906e2072513e859ca68093f1dd2587"
+}

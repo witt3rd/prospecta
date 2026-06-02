@@ -1,0 +1,55 @@
+name: tui-ci
+
+# Lints and tests the Rust TUI. Tests are hermetic — they use in-memory
+# fixtures (ratatui TestBackend + dummy structs) and the committed .sqlx/
+# offline query cache, so no Postgres is needed in CI.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tui/**"
+      - ".github/workflows/tui-ci.yml"
+  pull_request:
+    paths:
+      - "tui/**"
+      - ".github/workflows/tui-ci.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  test:
+    name: fmt + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tui/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tui/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked

@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            b.bank_id,\n            b.embedding_dim,\n            b.mission,\n            b.embedding_model_id,\n            b.created_at,\n            (SELECT count(*) FROM documents     WHERE bank_id = b.bank_id) AS documents,\n            (SELECT count(*) FROM memory_items  WHERE bank_id = b.bank_id) AS memory_items,\n            (SELECT count(*) FROM retain_events WHERE bank_id = b.bank_id) AS retain_events,\n            (SELECT count(*) FROM recall_events WHERE bank_id = b.bank_id) AS recall_events\n        FROM banks b\n        ORDER BY b.bank_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "embedding_dim",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "mission",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "embedding_model_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "documents",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "memory_items",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "retain_events",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "recall_events",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "1ac0645e1f1bb6bf04be8fa1af7896903ac09374a68aa54804d961b1430c36af"
+}
