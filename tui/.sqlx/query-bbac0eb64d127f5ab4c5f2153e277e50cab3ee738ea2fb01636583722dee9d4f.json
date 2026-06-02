@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT bank_id, embedding_dim FROM banks WHERE bank_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "embedding_dim",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "bbac0eb64d127f5ab4c5f2153e277e50cab3ee738ea2fb01636583722dee9d4f"
+}

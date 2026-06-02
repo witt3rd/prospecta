@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, created_at, message, n_queries_out, json_mode_used,\n               parse_fallback, raw_response, duration_ms, error_kind\n        FROM formulate_events\n        WHERE bank_id = $1 AND created_at <= $2\n        ORDER BY created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "n_queries_out",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "json_mode_used",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "parse_fallback",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "raw_response",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "duration_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "error_kind",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "2526e9744ef464aa4fa49f3278c833c105fdbca566580b373ef7ca09f56fb600"
+}

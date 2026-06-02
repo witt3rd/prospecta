@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT ON (corpus_path)\n            corpus_path,\n            started_at,\n            ended_at,\n            files_seen,\n            files_indexed,\n            files_pruned,\n            errors_count,\n            error\n        FROM sweep_passes\n        WHERE bank_id = $1\n        ORDER BY corpus_path, started_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "corpus_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "ended_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "files_seen",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "files_indexed",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "files_pruned",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "errors_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "error",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "93bba2459ec72364def23751398693acf2398a3cd6c4da1f27d4814e589aa5eb"
+}

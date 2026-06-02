@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, bank_id, created_at, document_id, items_count,\n               index_text_caller_supplied, index_text_generated,\n               duration_ms, raw_llm_response, error\n        FROM retain_events\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "bank_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "document_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "items_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "index_text_caller_supplied",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "index_text_generated",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "duration_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "raw_llm_response",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "error",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "1c3cde708f73858657bdf1720958ae1d7274ce70603f675e2348e7d691955183"
+}
