@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use crate::{
     db::{self, BankSummary},
     theme,
-    views::{common, dashboard, docs, manage, observability, search},
+    views::{common, dashboard, docs, manage, observability, retain, search},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,10 @@ pub struct App {
     // Search view state.
     search_state: search::SearchState,
 
+    // Retain form (modal overlay, opened from the search tab with `R`).
+    retain_open: bool,
+    retain_state: retain::RetainState,
+
     help_open: bool,
     status: String,
     should_quit: bool,
@@ -110,6 +114,8 @@ impl App {
                 .checked_sub(DASHBOARD_POLL_INTERVAL * 2)
                 .unwrap_or_else(Instant::now),
             search_state: search::SearchState::new(),
+            retain_open: false,
+            retain_state: retain::RetainState::new(),
             help_open: false,
             status: "Tab to switch · ? for help · q to quit".to_string(),
             should_quit: false,
@@ -392,6 +398,74 @@ impl App {
         }
     }
 
+    /// Open the retain modal, binding it to the search tab's (or banks tab's)
+    /// current bank.
+    fn open_retain(&mut self) {
+        self.bind_search_bank();
+        self.retain_state.reset_fields();
+        self.retain_state.bank_id = self.search_state.bank_id.clone().or_else(|| {
+            self.manage_state
+                .table
+                .selected()
+                .and_then(|i| self.banks.get(i))
+                .map(|b| b.bank.bank_id.clone())
+        });
+        self.retain_open = true;
+    }
+
+    /// Submit the retain form via shell-out. Records the honest outcome —
+    /// the document UUID on success, or the CLI's verbatim stderr on failure.
+    async fn submit_retain(&mut self) {
+        let Some(bank_id) = self.retain_state.bank_id.clone() else {
+            self.retain_state.status =
+                retain::RetainStatus::Failed("no bank bound to the form".into());
+            return;
+        };
+        if !self.retain_state.can_submit() {
+            return;
+        }
+
+        self.retain_state.status = retain::RetainStatus::Running;
+
+        let index_text: Vec<String> = self
+            .retain_state
+            .index_text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+
+        let args = crate::shell::RetainArgs {
+            bank_id,
+            content: self.retain_state.content.clone(),
+            source: opt(&self.retain_state.source),
+            tags: opt(&self.retain_state.tags),
+            index_text,
+        };
+
+        match crate::shell::retain(&args).await {
+            Ok(out) if out.ok => {
+                let id = out
+                    .document_id
+                    .unwrap_or_else(|| "(no id in stdout)".into());
+                self.retain_state.status = retain::RetainStatus::Ok(id.clone());
+                self.status = format!("retained → {id}");
+            }
+            Ok(out) => {
+                // Honest failure: surface the CLI's real stderr tail + exit code.
+                let reason = stderr_tail(&out.stderr, out.code);
+                self.retain_state.status = retain::RetainStatus::Failed(reason);
+            }
+            Err(e) => {
+                // The shell-out itself failed (binary not found, etc.).
+                self.retain_state.status = retain::RetainStatus::Failed(format!(
+                    "could not run prospecta CLI: {e} (set PROSPECTA_CLI / PROSPECTA_CLI_CWD)"
+                ));
+            }
+        }
+    }
+
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -484,6 +558,43 @@ impl App {
                 }
                 (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
                     self.retain_thread_state.reset_scroll()
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Retain modal swallows all input while open: text edits the focused
+        // field, Tab/arrows move between fields, Ctrl-S submits, Esc cancels.
+        if self.retain_open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.retain_open = false;
+                }
+                (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                    self.submit_retain().await;
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                (KeyCode::Tab, _) | (KeyCode::Down, _) => {
+                    self.retain_state.field = self.retain_state.field.next();
+                }
+                (KeyCode::BackTab, _) | (KeyCode::Up, _) => {
+                    self.retain_state.field = self.retain_state.field.prev();
+                }
+                (KeyCode::Enter, _) => {
+                    // Newline only in the multiline content field; elsewhere
+                    // Enter advances to the next field (form convenience).
+                    if self.retain_state.field == retain::RetainField::Content {
+                        self.retain_state.push_char('\n');
+                    } else {
+                        self.retain_state.field = self.retain_state.field.next();
+                    }
+                }
+                (KeyCode::Backspace, _) => self.retain_state.backspace(),
+                (KeyCode::Char(c), m)
+                    if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                {
+                    self.retain_state.push_char(c);
                 }
                 _ => {}
             }
@@ -593,6 +704,10 @@ impl App {
                 }
             }
 
+            // Open the retain modal (manual write path) from the search tab.
+            (KeyCode::Char('R'), _) if self.tab == Tab::Search => {
+                self.open_retain();
+            }
             (KeyCode::Char('r'), _) => {
                 self.status = "reloading…".into();
                 match self.tab {
@@ -810,6 +925,11 @@ impl App {
             }
         }
 
+        // Retain modal overlays everything (drawn last, over the full frame).
+        if self.retain_open {
+            retain::render(frame, area, &self.retain_state);
+        }
+
         let status_line = ratatui::text::Line::from(vec![ratatui::text::Span::styled(
             format!(" {}", self.status),
             theme::respect_no_color(theme::dim()),
@@ -874,6 +994,7 @@ impl App {
                     &[
                         ("Enter/Esc", "edit query"),
                         ("↑↓/j/k", "select"),
+                        ("R", "retain"),
                         ("Tab", "next tab"),
                         ("?", "help"),
                         ("q", "quit"),
@@ -907,11 +1028,106 @@ impl App {
                         "type + Enter",
                         "run search (search tab); Esc toggles edit/browse",
                     ),
+                    ("R", "open retain form (search tab) · Ctrl-S submits"),
                     ("r", "reload current view from substrate"),
                     ("?", "toggle this help"),
                     ("q / Ctrl-C", "quit"),
                 ],
             );
         }
+    }
+}
+
+/// Trim a form field; None when empty so we omit the CLI flag entirely.
+fn opt(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Build a compact failure reason from the CLI's stderr + exit code. Prefers
+/// an explicit `error:`-prefixed line (the library's actual failure message),
+/// then the last meaningful line; litellm/provider warnings and progress-bar
+/// carriage-return noise are filtered out.
+fn stderr_tail(stderr: &str, code: Option<i32>) -> String {
+    let cleaned: Vec<String> = stderr
+        .replace('\r', "\n")
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with("Batches")
+                && !l.contains("LiteLLM:")
+                && !l.starts_with("litellm:")
+        })
+        .collect();
+
+    // The library prints `error: retain failed: ...` — prefer that line.
+    if let Some(err) = cleaned.iter().rev().find(|l| l.starts_with("error:")) {
+        return err.clone();
+    }
+    // Otherwise the last meaningful line (e.g. a DETAIL: constraint hint).
+    if let Some(last) = cleaned.last() {
+        return last.clone();
+    }
+    match code {
+        Some(c) => format!("prospecta retain exited with code {c}"),
+        None => "prospecta retain failed (no output)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{opt, stderr_tail};
+
+    #[test]
+    fn opt_trims_and_nones_empty() {
+        assert_eq!(opt(""), None);
+        assert_eq!(opt("   "), None);
+        assert_eq!(opt("  hi "), Some("hi".to_string()));
+    }
+
+    #[test]
+    fn stderr_tail_prefers_error_line_over_litellm_noise() {
+        let stderr = "\
+17:21:31 - LiteLLM:WARNING: common_utils.py:24 - litellm: could not pre-load sagemaker
+litellm: could not pre-load bedrock-runtime response stream shape
+error: retain failed: insert or update on table \"documents\" violates foreign key constraint
+DETAIL:  Key (bank_id)=(no-such-bank) is not present in table \"banks\".
+litellm: could not pre-load bedrock-runtime response stream shape";
+        let reason = stderr_tail(stderr, Some(2));
+        assert!(
+            reason.starts_with("error: retain failed:"),
+            "should surface the error: line, got: {reason}"
+        );
+        assert!(
+            !reason.contains("litellm"),
+            "litellm noise leaked: {reason}"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_strips_progress_bars() {
+        let stderr = "Batches: 100%|####| 1/1\nerror: boom";
+        assert_eq!(stderr_tail(stderr, Some(1)), "error: boom");
+    }
+
+    #[test]
+    fn stderr_tail_falls_back_to_last_meaningful_line() {
+        // No error: prefix — take the last meaningful line.
+        let stderr = "some warning\nDETAIL: constraint hint";
+        assert_eq!(stderr_tail(stderr, Some(1)), "DETAIL: constraint hint");
+    }
+
+    #[test]
+    fn stderr_tail_falls_back_to_code_when_empty() {
+        assert_eq!(
+            stderr_tail("Batches: 50%\n", Some(3)),
+            "prospecta retain exited with code 3"
+        );
+        assert_eq!(stderr_tail("", None), "prospecta retain failed (no output)");
     }
 }

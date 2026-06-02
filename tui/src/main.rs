@@ -64,6 +64,13 @@ struct Cli {
     /// and exit. Example: --dump-search "default:bilateral synthesis".
     #[arg(long, value_name = "BANK:QUERY")]
     dump_search: Option<String>,
+
+    /// Exercise the retain shell-out for a "BANK:CONTENT" pair and exit. The
+    /// index_text is auto-derived ("verifier: <content>") so it runs offline
+    /// when PROSPECTA_EMBEDDER=sentence-transformers. Prints the honest CLI
+    /// outcome (document_id or stderr). Verifier in the --dump-* family.
+    #[arg(long, value_name = "BANK:CONTENT")]
+    dump_retain: Option<String>,
 }
 
 #[tokio::main]
@@ -333,6 +340,41 @@ async fn main() -> Result<()> {
                 truncate_dump(&h.content, 60),
                 h.source.as_deref().unwrap_or("—")
             );
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = cli.dump_retain.as_deref() {
+        let (bank, content) = spec
+            .split_once(':')
+            .ok_or_else(|| color_eyre::eyre::eyre!("--dump-retain expects BANK:CONTENT"))?;
+        let args = prospecta_tui::shell::RetainArgs {
+            bank_id: bank.to_string(),
+            content: content.to_string(),
+            source: Some("dump-retain-verifier".to_string()),
+            tags: None,
+            index_text: vec![format!("verifier: {content}")],
+        };
+        let out = prospecta_tui::shell::retain(&args)
+            .await
+            .wrap_err("retain shell-out")?;
+        println!(
+            "prospecta-tui dump_retain: bank={} ok={} code={:?}",
+            bank, out.ok, out.code
+        );
+        if out.ok {
+            println!(
+                "  document_id={}",
+                out.document_id.as_deref().unwrap_or("(none)")
+            );
+        } else {
+            println!("  stderr (tail):");
+            for line in out.stderr.replace('\r', "\n").lines().rev().take(5) {
+                let l = line.trim();
+                if !l.is_empty() {
+                    println!("    {l}");
+                }
+            }
         }
         return Ok(());
     }
