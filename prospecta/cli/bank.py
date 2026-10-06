@@ -53,3 +53,38 @@ def run_stats(args) -> int:
     }
     print(json.dumps(output, indent=2))
     return 0
+
+
+def run_migrate_bank(args) -> int:
+    """`prospecta migrate-bank`: see docs/embedding-migration.md (dump first)."""
+    from prospecta._embed_migrate import migrate_bank
+
+    if not args.database_url:
+        print("error: --database-url or DATABASE_URL env var required", file=sys.stderr)
+        return 2
+    try:
+        from prospecta import defaults
+        embed = defaults.make_default_embedder(
+            args.embed_model, dimensions=args.embedding_dim
+        )
+    except ImportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    mem = Memory(database_url=args.database_url, bank_id=args.source_bank)
+    try:
+        report = migrate_bank(
+            mem, args.source_bank, target_bank=args.target_bank, embed=embed,
+            embedding_dim=args.embedding_dim,
+            embedding_model_id=args.embedding_model_id,
+            batch_size=args.batch_size, max_documents=args.max_documents,
+        )
+    except BankConfigConflict as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:
+        print(f"error: {e} (re-run the same command to resume)", file=sys.stderr)
+        return 4
+    finally:
+        mem.close()
+    print(json.dumps(report.__dict__, indent=2))
+    return 0 if report.remaining == 0 else 5
