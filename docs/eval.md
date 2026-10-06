@@ -10,7 +10,7 @@ document ids]` that resolves to 1–12 notes, the whole scope set. The model
 cites `[note name]` for every claim and answers `not in memory` when the
 evidence lacks it. `RAGResult.citations` (`note`, `document_id`, `known`; unknown
 = the model cited a name not in the evidence), `.evidence` and `.synth_call`
-(model, tokens, cost, latency) come back, and the citation list is stored in
+(model, tokens, cost, latency) come back. The synthesis model is the `Memory(synth_model=...)` setting (default Sonnet 5.5), independent of the rerank model; `synth_call['model']` prefers the model the LLM reports. The citation list is stored in
 `recall_events.citations` (migration 0011, one nullable column). Default
 `recall_synth` is unchanged.
 
