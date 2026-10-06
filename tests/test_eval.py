@@ -103,7 +103,7 @@ def test_verdict_ablation_and_addition_margin():
 def test_ablation_variants():
     rc = {"rerank": {"enabled": True}, "gate": {"enabled": True}, "reader": {"enabled": False}}
     vs = {v["name"]: v for v in ev.ablation_variants(DEFAULT_CHANNEL_CONFIG, rc)}
-    assert set(vs) == {"-dense_chunk", "-question", "+bm25", "-rerank", "-gate"}
+    assert set(vs) == {"-dense_chunk", "-question", "-graph", "+bm25", "-rerank", "-gate"}
     off = [e for e in vs["-question"]["channels"] if e["name"] == "question"][0]
     assert off["enabled"] is False
     assert [e["name"] for e in DEFAULT_CHANNEL_CONFIG if not e.get("enabled", True)] == []
