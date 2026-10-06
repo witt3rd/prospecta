@@ -174,7 +174,7 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     assert stages["stage:rerank_listwise"]["cost_usd"] == pytest.approx(0.002)
     assert "channel:dense_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
     abl = {a["name"]: a for a in rep["ablations"]}
-    assert set(abl) == {"-dense_chunk", "-question", "+bm25", "-rerank"}
+    assert set(abl) == {"-dense_chunk", "-question", "-graph", "+bm25", "-rerank"}
     assert abl["-rerank"]["summary"]["gold"]["hit1"] == 0.0
     assert abl["-rerank"]["earns"] and "gold.hit1" in abl["-rerank"]["because"]
     assert not abl["-question"]["earns"]
