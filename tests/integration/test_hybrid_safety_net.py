@@ -1,7 +1,7 @@
 """Hybrid safety-net integration test (T18, M7).
 
 Validates P14: when LLM-anticipated index_text drifts away from the
-query's semantic shape, the lexical (BM25 / ts_rank) half of hybrid
+query's semantic shape, the lexical (`ts_rank_cd`, not BM25) half of hybrid
 RRF retrieval recovers the document via keyword overlap on the SAME
 indexed string.
 
@@ -58,7 +58,7 @@ Under the bilateral_embedder:
     8 dims, lifting cosine vs the question-shaped query above the
     target's near-zero token+shape contribution.
 
-Under ts_rank (BM25-style):
+Under ts_rank_cd (not BM25; AND semantics, so this passes because its queries are short):
   - target stems = {celebr, record, march, archiv}
   - query stems   = {kelli, birthday, celebr, march}  (stopwords dropped)
   - target matches `celebr` AND `march` → positive lex_score.

@@ -187,7 +187,7 @@ ORDER BY b.bank_id;
 A worked example: walk through what happens when an agent calls `m.recall_synth("when's kelly's birthday?")`, in order.
 
 1. **`formulate_events` row inserted** — the LLM expanded the user's message into N sub-questions. `raw_response` has the verbatim JSON the LLM returned; `parse_fallback` tells you whether parsing succeeded; `error_kind` discriminates the failure mode (`malformed_json` vs `schema_mismatch` vs NULL). The parsed sub-questions become the input to recall.
-2. **Per-channel retrieval runs** (HNSW + content_tsv BM25 + body_tsv BM25), three CTEs FULL OUTER JOIN'd via RRF. No event row per channel — this is in-flight SQL, not a logged event.
+2. **Per-channel retrieval runs** (HNSW + content_tsv ts_rank_cd + body_tsv ts_rank_cd), three CTEs FULL OUTER JOIN'd via RRF. No event row per channel — this is in-flight SQL, not a logged event.
 3. **`recall_events` row inserted** — `queries` lists the sub-questions, `mode='hybrid'` (or `semantic`/`lexical`), `n_results=N`, `results` is a JSONB array with one entry per surfaced chunk (source, document_id, rank, per-channel scores dict, 200-char content preview), `synthesis` is the RAG output text, `duration_ms` is total wall-clock for the recall+synth.
 4. **`llm_calls` row inserted for the synthesize call** — `prompt_name='synthesize'`, `prompt_text` is the rendered RAG-synthesize template with the retrieved chunks substituted in, `response_text` is the verbatim synthesis.
 
