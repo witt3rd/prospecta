@@ -100,6 +100,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override LLM index_text generation (repeat for multi)",
     )
 
+    # ---- import ---------------------------------------------------------
+    im = sub.add_parser("import", help="Import memories from another system")
+    im_sub = im.add_subparsers(dest="import_kind", required=True)
+    hs = im_sub.add_parser("hindsight", help="Import a Hindsight bank dump")
+    hs.add_argument("dump", type=Path)
+    hs.add_argument("--synthesize", action="store_true",
+                    help="LLM-generate index_text (default: use the fact text, no LLM)")
+    hs.add_argument("--json", action="store_true", help="Emit report as JSON")
+
     # ---- stats (T15) ----------------------------------------------------
     st = sub.add_parser("stats", help="Show counters across substrate")
     st.add_argument(
@@ -163,6 +172,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "retain":
         from prospecta.cli.retain import cmd_retain
         return cmd_retain(args)
+    if args.command == "import":
+        from prospecta.cli.import_ import cmd_import
+        return cmd_import(args)
     if args.command == "stats":
         from prospecta.cli.stats import cmd_stats
         return cmd_stats(args)
