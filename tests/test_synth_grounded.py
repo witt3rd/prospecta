@@ -113,6 +113,24 @@ def test_grounded_scope_set_gives_whole_set(mem):
     assert "whole set of notes in scope" in mem.llm.prompts[-1]
 
 
+def test_grounded_scope_of_twenty_notes_uses_all(mem):
+    srcs = [f"many{i:02d}.md" for i in range(20)]
+    for src in srcs:
+        mem.retain(f"{src} cat sat", source=src, index_text=f"{src} cat sat")
+    with psycopg.connect(mem.database_url) as conn:
+        for src in srcs:
+            text = f"{src} cat sat"
+            conn.execute(
+                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
+                " embedding, kind, ordinal, char_start, char_end) "
+                "SELECT 'b', d.id, %s, %s, %s::vector, 'chunk', 0, 0, %s FROM documents d "
+                "WHERE d.source = %s", (text, text, vec(text), len(text), src))
+        conn.commit()
+    res = mem.recall_synth("cat sat", grounded=True, scope=srcs)
+    assert sorted(e["note"] for e in res.evidence) == srcs
+    assert "whole set of notes in scope" in mem.llm.prompts[-1]
+
+
 def test_grounded_scope_too_large_falls_back_to_top(mem):
     res = mem.recall_synth("cat sat", grounded=True, evidence_top=2, scope=["nope.md"])
     assert len(res.evidence) == 2   # empty scope match: top notes
@@ -163,3 +181,74 @@ def test_synth_falls_back_to_general_llm_label_from_result(fresh_db):
     res = m.recall_synth("cat sat", grounded=True)
     assert general.prompts and res.synth_call["model"] == "stub-sonnet"
     m.close()
+
+
+def test_grounded_runs_one_recall_and_no_formulation(mem, monkeypatch):
+    """F13: one search per question, no formulate call; scope from the filter."""
+    calls = []
+    real = mem.search
+
+    def counting(text, **kw):
+        calls.append(text)
+        return real(text, **kw)
+
+    monkeypatch.setattr(mem, "search", counting)
+    monkeypatch.setattr(mem, "formulate_queries",
+                        lambda *a, **k: pytest.fail("grounded must not formulate"))
+    res = mem.recall_synth("cat sat", grounded=True)
+    assert calls == ["cat sat"] and [q.text for q in res.queries] == ["cat sat"]
+
+
+def test_grounded_scope_filled_from_promoted_filter(mem, monkeypatch):
+    real = mem.search
+
+    def promoting(text, **kw):
+        out = real(text, **kw)
+        kw["_trace"][-1].setdefault("fusion", {})["scope_promoted"] = [
+            str(r.document_id) for r in out if r.source in ("delta.md", "charlie.md")]
+        return out
+
+    monkeypatch.setattr(mem, "search", promoting)
+    res = mem.recall_synth("cat sat", grounded=True)   # default top, no scope=
+    assert sorted(e["note"] for e in res.evidence) == ["charlie.md", "delta.md"]
+    assert res.evidence and "whole set of notes in scope" in mem.llm.prompts[-1]
+
+
+def test_latency_model_before_after():
+    """Stubbed latency model: 5 full recalls (before) vs 1 (after)."""
+    recall_s, recall_usd, formulate_s = 13.0, 0.04, 3.0
+    before = (formulate_s + 5 * recall_s, 5 * recall_usd)
+    after = (1 * recall_s, 1 * recall_usd)
+    assert before == (68.0, 0.2) and after == (13.0, 0.04)
+
+
+class _Rec:
+    def __init__(self, document_id, source, score):
+        self.document_id, self.source, self.score = document_id, source, score
+        self.original_chunk = NOTES[source][0]
+
+
+def _gather(mem, scores, **kw):
+    from prospecta._synth import gather_evidence
+    with psycopg.connect(mem.database_url) as conn:
+        ids = dict(conn.execute("SELECT source, id::text FROM documents WHERE bank_id='b'").fetchall())
+        names = list(NOTES)[:len(scores)]
+        recalled = [_Rec(ids[n], n, s) for n, s in zip(names, scores)]
+        notes, _ = gather_evidence(conn, "b", recalled, **kw)
+    return names, [n.name for n in notes]
+
+
+def test_default_selection_stops_before_first_note_below_cutoff(mem):
+    names, got = _gather(mem, [1.0, 0.9, 0.3, 0.2])
+    assert got == names[:2]
+
+
+@pytest.mark.parametrize("scores", [[-0.1, -0.5, -0.6], [-0.5, -0.6, -0.7]])
+def test_default_selection_non_positive_top_score(mem, scores):
+    names, got = _gather(mem, scores)
+    assert got == names[:1]
+
+
+def test_explicit_top_still_caps(mem):
+    names, got = _gather(mem, [1.0, 0.9, 0.8, 0.7], top=3)
+    assert got == names[:3]

@@ -7,15 +7,18 @@ the citation list comes back with the answer and is stored on the recall event.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 
 from prospecta._template import render_prompt
 
-TOP_NOTES = 6
+logger = logging.getLogger(__name__)
+
 CHUNKS_PER_NOTE = 3
-SCOPE_MAX = 12   # a scope set larger than this is not a "set": fall back to top notes
+SCORE_FRACTION = 0.5          # default selection: notes scoring >= this fraction of the top score
+MAX_CONTEXT_CHARS = 400_000   # physical context window bound for the evidence block
 
 _CHUNKS_SQL = """
 SELECT original_chunk, ordinal
@@ -88,7 +91,7 @@ def resolve_scope(conn, bank_id: str, scope: list[str]) -> list[tuple[str, str]]
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
-def gather_evidence(conn, bank_id: str, recalled: list, *, top: int = TOP_NOTES,
+def gather_evidence(conn, bank_id: str, recalled: list, *, top: int | None = None,
                     scope: list[str] | None = None,
                     per_note: int = CHUNKS_PER_NOTE) -> tuple[list[NoteEvidence], bool]:
     """Evidence notes for the synthesizer. `recalled` is the blended recall in
@@ -98,17 +101,24 @@ def gather_evidence(conn, bank_id: str, recalled: list, *, top: int = TOP_NOTES,
     order: list[tuple[str, str]] = []
     if scope:
         members = resolve_scope(conn, bank_id, scope)
-        if 0 < len(members) <= SCOPE_MAX:
+        if members:
             set_mode = True
             order = members
     if not order:
         seen: set[str] = set()
+        cutoff = None
+        if top is None and recalled:
+            lead = recalled[0].score
+            cutoff = SCORE_FRACTION * lead if lead > 0 else lead
         for r in recalled:
             d = str(r.document_id)
-            if d not in seen:
-                seen.add(d)
-                order.append((d, r.source))
-            if len(order) >= top:
+            if d in seen:
+                continue
+            if cutoff is not None and r.score < cutoff:
+                break
+            seen.add(d)
+            order.append((d, r.source))
+            if top is not None and len(order) >= top:
                 break
     notes = []
     for doc_id, source in order:
@@ -117,7 +127,16 @@ def gather_evidence(conn, bank_id: str, recalled: list, *, top: int = TOP_NOTES,
         chunks = pick_chunks(_chunk_rows(conn, bank_id, doc_id), best_text, None, per_note)
         if chunks:
             notes.append(NoteEvidence(name=source or doc_id, document_id=doc_id, chunks=chunks))
-    return notes, set_mode
+    used, kept = 0, []
+    for n in notes:
+        used += sum(len(c) for c in n.chunks)
+        if used > MAX_CONTEXT_CHARS and kept:
+            break
+        kept.append(n)
+    if len(kept) < len(notes):
+        logger.warning("evidence exceeds the context window (%d chars); dropped notes: %s",
+                       MAX_CONTEXT_CHARS, ", ".join(n.name for n in notes[len(kept):]))
+    return kept, set_mode
 
 
 def render_context(notes: list[NoteEvidence]) -> str:
