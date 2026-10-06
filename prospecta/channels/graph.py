@@ -1,8 +1,8 @@
 """GraphExpand: the `expand` channel over memory_links (design 8.7).
 
-Seeds are the best items of the pool the recall channels found. One hop is a
-join over memory_links (both directions); a second hop is the recursive step of
-WITH RECURSIVE. Every step multiplies the score by a decay, the link's type
+Seeds are the best items of the pool the recall channels found. Two bounded
+hops follow memory_links in both directions, and the entity table for hub
+entities (see _EDGES / _HUBS below). Every step multiplies the score by a decay, the link's type
 weight and its confidence; the walk keeps at most `node_cap` neighbour items
 (Jev-Mem's 60), best first, and reports them as documents. A document reached
 only through its own seed's links is not an expansion and is dropped.
