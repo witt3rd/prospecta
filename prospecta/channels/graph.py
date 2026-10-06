@@ -33,8 +33,8 @@ _RRF_K = 60
 # side). After hop 1 only the best `frontier` items (by score) are expanded:
 # scores only fall along a path (decay, weight, confidence are all <= 1), so
 # the frontier holds every item that could still reach the node cap. Hub
-# entities (more than `hub` items) carry no per-anchor links; hop 1 reaches the
-# other holders of a seed item's hub entities through the memory_item_entities
+# entities (more than `hub` items) carry no per-anchor links; hops 1 and 2 reach the
+# other holders of a frontier item's hub entities through the memory_item_entities
 # join, up to `hub_cap` per entity.
 _EDGES = """
     SELECT f.item, f.origin_doc, f.score, f.hops, f.via, f.link_types, f.parent,
@@ -47,20 +47,11 @@ _EDGES = """
     FROM {frm} f JOIN memory_links l ON l.dst = f.item AND l.bank_id = %(bank)s
 """
 
-_SQL = """
-WITH seed(doc, w) AS (
-    SELECT * FROM unnest(%(docs)s::uuid[], %(ws)s::float8[])
-),
-s0 AS (
-    SELECT m.id AS item, m.document_id AS origin_doc, s.w AS score, 0 AS hops,
-           ARRAY[]::text[] AS via, ARRAY[]::text[] AS link_types, m.id AS parent, m.kind
-    FROM seed s JOIN memory_items m ON m.document_id = s.doc AND m.bank_id = %(bank)s
-),
-e1 AS (""" + _EDGES.format(frm="s0") + """),
-hubs AS (
+_HUBS = """
     SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent, b.item_id AS nid,
            'ENTITY'::text AS link_type, 'SHARED_ENTITY'::text AS subtype, 1.0::real AS confidence
-    FROM s0 s
+    FROM {frm} s
+    JOIN memory_items si ON si.id = s.item
     JOIN memory_item_entities ie ON ie.item_id = s.item
     CROSS JOIN LATERAL (
         SELECT count(*) AS n FROM (SELECT 1 FROM memory_item_entities x
@@ -69,12 +60,24 @@ hubs AS (
     CROSS JOIN LATERAL (
         SELECT ie2.item_id FROM memory_item_entities ie2
         JOIN memory_items bi ON bi.id = ie2.item_id
-        WHERE ie2.entity_id = ie.entity_id AND bi.kind = s.kind
+        WHERE ie2.entity_id = ie.entity_id AND bi.kind = si.kind
           AND bi.document_id <> s.origin_doc
         ORDER BY ie2.n DESC, ie2.item_id LIMIT %(hub_cap)s
     ) b
     WHERE hc.n > %(hub)s AND %(hub_cap)s > 0
+"""
+
+_SQL = """
+WITH seed(doc, w) AS (
+    SELECT * FROM unnest(%(docs)s::uuid[], %(ws)s::float8[])
 ),
+s0 AS (
+    SELECT m.id AS item, m.document_id AS origin_doc, s.w AS score, 0 AS hops,
+           ARRAY[]::text[] AS via, ARRAY[]::text[] AS link_types, m.id AS parent
+    FROM seed s JOIN memory_items m ON m.document_id = s.doc AND m.bank_id = %(bank)s
+),
+e1 AS (""" + _EDGES.format(frm="s0") + """),
+hubs AS (""" + _HUBS.format(frm="s0") + """),
 h1 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 1 AS hops, item AS parent,
            score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
@@ -86,7 +89,10 @@ frontier AS (
     SELECT * FROM h1 WHERE score > 0 AND %(max_hops)s >= 2
     ORDER BY score DESC, item LIMIT %(frontier)s
 ),
-e2 AS (""" + _EDGES.format(frm="frontier") + """),
+e2 AS (""" + _EDGES.format(frm="frontier") + """
+    UNION ALL
+    SELECT * FROM (""" + _HUBS.format(frm="frontier") + """) hb2
+),
 h2 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 2 AS hops,
            score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,

@@ -430,3 +430,23 @@ def test_hub_entity_reached_by_entity_join_not_capped_links(mem):
     with conn_of(mem) as c:
         assert c.execute("SELECT count(*) FROM memory_links WHERE link_type='ENTITY'"
                          ).fetchone()[0] == n * (n - 1)
+
+
+def test_hub_entity_reached_at_hop_two_through_a_link(mem):
+    """seed -link-> X, X holds a hub entity: the other holders are reached at hop 2."""
+    n = 8
+    for i in range(n):
+        mem.retain(f"Kelly note {i}", source=f"h{i}", index_text=f"qh{i}")
+    mem.retain("seed note", source="S", index_text="qs")
+    link_all(mem, Linker(llm=EntityLLM(("Kelly",)), entity_hub=3))
+    ids = docs(mem)
+    with conn_of(mem) as c:
+        s_item, x_item = (c.execute("SELECT id FROM memory_items WHERE document_id=%s",
+                                    (ids[k],)).fetchone()[0] for k in ("S", "h0"))
+        c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype) "
+                  "VALUES ('b', %s, %s, 'SEMANTIC', 'RELATED_TO')", (s_item, x_item))
+        c.commit()
+    out = expand(mem, ids, ["S"], hub=3, node_cap=100)
+    got = {c.source: c.detail["hops"] for c in out}
+    assert got["h0"] == 1
+    assert {got[f"h{i}"] for i in range(1, n)} == {2}
