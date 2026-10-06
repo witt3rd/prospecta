@@ -5,7 +5,7 @@ See plan-v2.md §3.4 for the canonical contract.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol
 
 
@@ -93,6 +93,10 @@ class RAGResult:
     sources: list[RecalledMemory]
     queries: list[Query]
     queries_to_results: dict[str, list[RecalledMemory]]
+    # Grounded synthesis only (recall_synth(grounded=True)); empty otherwise.
+    citations: list[dict] = field(default_factory=list)   # [{note, document_id, known}]
+    evidence: list[dict] = field(default_factory=list)    # [{note, document_id, chunks}]
+    synth_call: dict = field(default_factory=dict)        # model, tokens, cost_usd, duration_ms
 
 
 class DocumentSourceConflictError(Exception):

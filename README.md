@@ -127,6 +127,7 @@ prospecta migrate                        # apply pending migrations
 prospecta create-bank --id alice --embedding-dim 384
 prospecta index ./corpus                 # walk a directory; chunk + retain
 prospecta search "query" --mode hybrid   # or semantic / lexical
+prospecta eval questions.md --ablate     # score recall, ablate channels, cost/latency per stage (docs/eval.md)
 prospecta retain "content..." --source X --tags a,b
 prospecta sweep ./corpus --watch         # background sweeper for filesystem drift
 prospecta stats                          # bank/document/event counters
