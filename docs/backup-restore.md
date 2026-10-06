@@ -15,7 +15,8 @@ need `pg_dump` / `psql` on PATH.
   failed restore leaves nothing half-applied. Target must be a fresh database
   (create it first: `createdb prospecta_new`); it does not drop or merge.
 - A newer `pg_dump` client than the server emits `SET transaction_timeout`;
-  restore strips that line, so version skew is harmless.
+  restore strips that line from the dump header only (never from COPY data),
+  so version skew is harmless.
 - Restore into a different database than the source to verify a backup; never
   point it at a live database that already holds data.
 
