@@ -198,6 +198,9 @@ def upsert_document(
 
 def delete_memory_items_for_document(conn, *, document_id: str) -> int:
     with conn.cursor() as cur:
+        # the items' links and entity rows cascade; the Linker must run again
+        cur.execute("DELETE FROM memory_link_state WHERE document_id = %(doc)s",
+                    {"doc": document_id})
         cur.execute(
             "DELETE FROM memory_items WHERE document_id = %(doc)s",
             {"doc": document_id},
@@ -350,6 +353,7 @@ def append_recall_event(
     tokens_in: int | None = None,
     tokens_out: int | None = None,
     n_llm_calls: int | None = None,
+    citations: list[dict] | None = None,
 ) -> int:
     """INSERT a row into recall_events (and its recall_event_candidates).
 
@@ -373,14 +377,14 @@ def append_recall_event(
             INSERT INTO recall_events
                 (bank_id, queries, mode, n_results, duration_ms, trace,
                  results, synthesis, plan, channels, fusion, rerank, hops,
-                 cost_usd, tokens_in, tokens_out, n_llm_calls)
+                 cost_usd, tokens_in, tokens_out, n_llm_calls, citations)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
                  %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
                  %(results)s::jsonb, %(synthesis)s, %(plan)s::jsonb,
                  %(channels)s::jsonb, %(fusion)s::jsonb, %(rerank)s::jsonb,
                  %(hops)s::jsonb, %(cost_usd)s, %(tokens_in)s,
-                 %(tokens_out)s, %(n_llm_calls)s)
+                 %(tokens_out)s, %(n_llm_calls)s, %(citations)s::jsonb)
             RETURNING id
             """,
             {
@@ -401,6 +405,7 @@ def append_recall_event(
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
                 "n_llm_calls": n_llm_calls,
+                "citations": _dumps(citations),
             },
         )
         event_id = cur.fetchone()[0]

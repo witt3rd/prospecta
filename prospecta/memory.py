@@ -89,6 +89,20 @@ def _channel_trace_payload(traces: "list[dict]") -> dict:
     return out
 
 
+def _interleave(queries_to_results: "dict[str, list[RecalledMemory]]") -> "list[RecalledMemory]":
+    """One recall per note across the formulations: round-robin by rank, the
+    first formulation first, a note kept at its best position."""
+    lists = list(queries_to_results.values())
+    out: list = []
+    seen: set[str] = set()
+    for rank in range(max((len(x) for x in lists), default=0)):
+        for lst in lists:
+            if rank < len(lst) and str(lst[rank].document_id) not in seen:
+                seen.add(str(lst[rank].document_id))
+                out.append(lst[rank])
+    return out
+
+
 class BankConfigConflict(Exception):
     """Raised when create_bank is called with a different embedding_dim
     than an existing bank with the same bank_id."""
@@ -124,7 +138,9 @@ class Memory:
         shadow_embed: EmbedCallable | None = None,
         rerank_llm: LLMCallable | None = None,
         rerank_model: str | None = None,
+        synth_llm: LLMCallable | None = None,
         jev: "Any | None" = None,
+        linker: "Any | None" = None,
     ) -> None:
         if not database_url:
             raise ValueError("database_url is required")
@@ -135,7 +151,13 @@ class Memory:
         # back to `llm`; `jev` is a prospecta.stages.JevScore (None = no Jev).
         self._rerank_llm = rerank_llm
         self._rerank_model = rerank_model
+        self._synth_llm = synth_llm
         self._jev = jev
+        # Linker (prospecta._linker.Linker): typed links + entities after retain.
+        # None = no linking; with `asynchronous` it runs on one worker thread.
+        self._linker = linker
+        self._link_executor = None
+        self._link_futures: list = []
         self._default_bank_id = bank_id
         # Shadow reads (embedding migration): recall() also queries this bank
         # with shadow_embed and stores both runs in recall_events.
@@ -301,8 +323,65 @@ class Memory:
             )
 
     def close(self) -> None:
-        """Close the connection pool."""
+        """Close the connection pool (after the link worker drains)."""
+        self.wait_for_links()
+        if self._link_executor is not None:
+            self._link_executor.shutdown(wait=True)
         self._pool.close()
+
+    # ------------------------------------------------------------------
+    # Linker (migration 0006): typed links and entities, after retain
+    # ------------------------------------------------------------------
+
+    def link_document(self, document_id: str, bank_id: str | None = None) -> dict:
+        """Link one document now (needs Memory(linker=...)). Returns its stats."""
+        if self._linker is None:
+            raise RuntimeError("link_document needs Memory(linker=...)")
+        calls: list[dict] = []
+        with self._pool.connection() as conn:
+            stats = self._linker.link_document(
+                conn, bank_id or self._default_bank_id, document_id, calls)
+        for c in calls:
+            try:
+                self._tracer("llm_call", {"bank_id": bank_id or self._default_bank_id, **c})
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised on llm_call; ignoring")
+        return stats
+
+    def link_pending(self, limit: int = 100, bank_id: str | None = None) -> int:
+        """Link up to `limit` documents that have no link state yet (the safety
+        net for documents written by the sweeper or before a Linker was set)."""
+        from prospecta._linker import pending_documents
+        bank = bank_id or self._default_bank_id
+        with self._pool.connection() as conn:
+            docs = pending_documents(conn, bank, limit)
+        for d in docs:
+            self.link_document(d, bank)
+        return len(docs)
+
+    def _enqueue_link(self, document_id: str) -> None:
+        if self._linker is None:
+            return
+        if not self._linker.asynchronous:
+            self.link_document(document_id)
+            return
+        if self._link_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._link_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="linker")
+        bank = self._default_bank_id
+
+        def run():
+            try:
+                self.link_document(document_id, bank)
+            except Exception:
+                logger.exception("linker failed for document %s", document_id)
+        self._link_futures.append(self._link_executor.submit(run))
+
+    def wait_for_links(self) -> None:
+        """Block until the link worker has drained its queue."""
+        futs, self._link_futures = self._link_futures, []
+        for f in futs:
+            f.result()
 
     # ------------------------------------------------------------------
     # T9 — index/search/remove (delegate to _index)
@@ -504,10 +583,21 @@ class Memory:
         mode: "Literal['hybrid','semantic','lexical']" = "hybrid",
         metadata_filter: dict | None = None,
         rrf_k: int = 60,
+        grounded: bool = False,
+        scope: "list[str] | None" = None,
+        evidence_top: int = 6,
     ) -> RAGResult:
         """Chain: formulate_queries → recall → synthesize. Returns RAGResult.
 
         See plan-v2.md §3.4 for canonical semantics.
+
+        grounded=True (opt-in) swaps the final step for the cited synthesis of
+        design 8.8: the evidence is the best chunk plus neighbours (at most 3
+        per note) of the top `evidence_top` notes of the blended recall, or,
+        when `scope` (note sources or document ids, at most 12 found) names a
+        set, all of those notes. The answer cites [note name] per claim, may
+        say "not in memory", and RAGResult.citations is stored on the recall
+        event (recall_events.citations). `synth_prompt_override` is ignored.
         """
         import time as _time
 
@@ -549,12 +639,23 @@ class Memory:
 
         # 3. Synthesize — full content (P5), no truncation.
         synth_t0 = _time.monotonic()
-        synthesis, synth_prompt = _rag.synthesize(
-            message,
-            flat_results,
-            self._llm,
-            prompt_override=synth_prompt_override,
-        )
+        grounded_res = None
+        if grounded:
+            from prospecta import _synth
+            blended = _interleave(queries_to_results)
+            with self._pool.connection() as conn:
+                notes, set_mode = _synth.gather_evidence(
+                    conn, bank_id, blended, top=evidence_top, scope=scope)
+            grounded_res = _synth.synthesize_grounded(
+                message, notes, self._synth_llm or self._llm, set_mode=set_mode)
+            synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt
+        else:
+            synthesis, synth_prompt = _rag.synthesize(
+                message,
+                flat_results,
+                self._llm,
+                prompt_override=synth_prompt_override,
+            )
         synth_duration_ms = int((_time.monotonic() - synth_t0) * 1000)
 
         duration_ms = int((_time.monotonic() - t_start) * 1000)
@@ -566,7 +667,7 @@ class Memory:
         try:
             self._tracer("llm_call", {
                 "bank_id": bank_id,
-                "purpose": "synthesize",
+                "purpose": "synthesize_grounded" if grounded else "synthesize",
                 "json_mode": False,
                 "duration_ms": synth_duration_ms,
                 "messages_count": 1,
@@ -586,6 +687,7 @@ class Memory:
                 "trace": None,
                 "results": _serialize_recall_results(flat_results),
                 "synthesis": synthesis,
+                "citations": grounded_res.citations if grounded_res else None,
                 **_channel_trace_payload(traces),
             })
         except Exception:  # pragma: no cover
@@ -596,6 +698,11 @@ class Memory:
             sources=flat_results,
             queries=formulated,
             queries_to_results=queries_to_results,
+            citations=grounded_res.citations if grounded_res else [],
+            evidence=[{"note": n.name, "document_id": n.document_id,
+                       "chunks": list(n.chunks)} for n in grounded_res.notes]
+            if grounded_res else [],
+            synth_call=dict(grounded_res.call) if grounded_res else {},
         )
 
     # ------------------------------------------------------------------
