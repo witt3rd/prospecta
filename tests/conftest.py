@@ -18,9 +18,31 @@ def _normalize_url(url: str) -> str:
     return url
 
 
+class _ExternalPg:
+    """Stand-in for a container when PROSPECTA_TEST_PG_URL points at a
+    throwaway Postgres+pgvector (e.g. a user-space pgserver)."""
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    def get_connection_url(self) -> str:
+        return self._url
+
+    def stop(self) -> None:
+        pass
+
+
 @pytest.fixture(scope="session")
 def pg_container():
     """Session-scoped Postgres testcontainer with pgvector pre-enabled."""
+    import os
+
+    ext = os.environ.get("PROSPECTA_TEST_PG_URL")
+    if ext:
+        with psycopg.connect(ext, autocommit=True) as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        yield _ExternalPg(ext)
+        return
     container = PostgresContainer("pgvector/pgvector:pg16")
     container.start()
     try:

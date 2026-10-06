@@ -7,6 +7,7 @@ Serializes concurrent migration attempts via pg_advisory_xact_lock.
 from __future__ import annotations
 
 import logging
+import time
 import re
 from pathlib import Path
 
@@ -88,7 +89,90 @@ def run_migrations(database_url: str) -> dict:
 
         conn.commit()
 
+    if 4 in current or 4 in applied:
+        finish_0004(database_url)
+
     return {"applied": applied, "skipped": skipped}
+
+
+BACKFILL_BATCH = 5000
+
+
+def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
+    """Post-commit half of migration 0004; idempotent, safe to re-run.
+
+    1. Batched backfill (one short transaction per batch): rows the
+       directory-index path wrote carry chunk_index/start_char/end_char in
+       their metadata (Chunk.to_metadata); they become kind='chunk' with
+       ordinal/char_start/char_end filled. Everything else stays 'question'.
+    2. CREATE INDEX CONCURRENTLY on (bank_id, kind).
+    3. Per bank and per kind, a partial HNSW index (embedding::vector(N)).
+    """
+    from prospecta.db.queries import (
+        KIND_INDEX_KINDS,
+        ensure_kind_hnsw_indexes,
+        hnsw_kind_index_name,
+    )
+
+    backfilled = 0
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        # Poll with try-lock rather than block: CREATE INDEX CONCURRENTLY waits on
+        # every running statement/transaction, so a peer blocked inside
+        # pg_advisory_lock (or queued on MIGRATE_LOCK_KEY) would deadlock it.
+        while not conn.execute(
+            "SELECT pg_try_advisory_lock(%s)", (MIGRATE_LOCK_KEY + 1,)
+        ).fetchone()[0]:
+            time.sleep(0.05)
+        while True:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH batch AS (
+                        SELECT id FROM memory_items
+                        WHERE kind = 'question'
+                          AND created_at <= (SELECT applied_at FROM prospecta_schema_version
+                                             WHERE version = 4)
+                          AND metadata->>'chunk_index' ~ '^[0-9]{1,9}$'
+                          AND metadata->>'start_char' ~ '^[0-9]{1,9}$'
+                          AND metadata->>'end_char' ~ '^[0-9]{1,9}$'
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE memory_items m
+                    SET kind = 'chunk',
+                        ordinal = (m.metadata->>'chunk_index')::integer,
+                        char_start = (m.metadata->>'start_char')::integer,
+                        char_end = (m.metadata->>'end_char')::integer
+                    FROM batch WHERE m.id = batch.id
+                    """,
+                    (batch_size,),
+                )
+                n = cur.rowcount
+            backfilled += n
+            if n == 0:
+                break
+        with conn.cursor() as cur:
+            cur.execute("SELECT bank_id, embedding_dim FROM banks")
+            banks = cur.fetchall()
+        ours = ["memory_items_bank_kind_idx"] + [
+            hnsw_kind_index_name(b, k) for b, _ in banks for k in KIND_INDEX_KINDS
+        ]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = 'memory_items'::regclass AND NOT i.indisvalid "
+                "AND c.relname = ANY(%s)",
+                (ours,),
+            )
+            for (name,) in cur.fetchall():
+                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+            cur.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS memory_items_bank_kind_idx "
+                "ON memory_items (bank_id, kind)"
+            )
+        for bank_id, dim in banks:
+            ensure_kind_hnsw_indexes(conn, bank_id, dim)
+    return {"backfilled": backfilled, "banks": len(banks), "kinds": list(KIND_INDEX_KINDS)}
 
 
 def get_schema_version(database_url: str) -> int | None:

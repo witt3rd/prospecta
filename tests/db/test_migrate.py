@@ -48,8 +48,9 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 1 in result["applied"]
     assert 2 in result["applied"]
     assert 3 in result["applied"]
+    assert 4 in result["applied"]
     assert 10 in result["applied"]
-    # Highest applied is now 10 (0010_comments).
+    # Highest applied is now 10 (0010_comments, after 0004_item_kind_parent).
     assert get_schema_version(fresh_db) == 10
 
 
@@ -60,6 +61,7 @@ def test_run_migrations_idempotent(fresh_db):
     assert 1 in result["skipped"]
     assert 2 in result["skipped"]
     assert 3 in result["skipped"]
+    assert 4 in result["skipped"]
     assert 10 in result["skipped"]
     assert get_schema_version(fresh_db) == 10
 

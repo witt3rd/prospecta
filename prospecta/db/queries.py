@@ -74,6 +74,54 @@ def hnsw_index_name(bank_id: str) -> str:
     return f"memory_items_embedding_{safe}_idx"
 
 
+# Per-bank, per-kind partial HNSW indexes (design 8.3): the predicate repeats
+# bank_id and kind literally so the planner can use them, and a kind-filtered
+# scan is not starved by the other kind sharing one index.
+KIND_INDEX_KINDS = ("question", "chunk")
+
+HNSW_KIND_INDEX_TEMPLATE = """
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
+    ON memory_items USING hnsw ((embedding::vector({embedding_dim})) vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE bank_id = '{bank_id_literal}' AND kind = '{kind}'
+"""
+
+
+def hnsw_kind_index_name(bank_id: str, kind: str) -> str:
+    """memory_items_embedding_<bank>_<kind>_idx, kept within Postgres' 63 bytes.
+
+    When the natural name is too long the bank part is cut and an md5 of the
+    full bank_id is appended so two long bank ids never collide.
+    """
+    import hashlib
+
+    validate_bank_id(bank_id)
+    if kind not in KIND_INDEX_KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+    safe = bank_id.replace("-", "_")
+    name = f"memory_items_embedding_{safe}_{kind}_idx"
+    if len(name) <= 63:
+        return name
+    digest = hashlib.md5(bank_id.encode()).hexdigest()[:8]
+    fixed = f"memory_items_embedding__{digest}_{kind}_idx"
+    room = 63 - len(fixed)
+    return f"memory_items_embedding_{safe[:room]}_{digest}_{kind}_idx"
+
+
+def ensure_kind_hnsw_indexes(conn, bank_id: str, embedding_dim: int) -> None:
+    """Create both per-kind partial HNSW indexes. `conn` MUST be autocommit."""
+    validate_bank_id(bank_id)
+    for kind in KIND_INDEX_KINDS:
+        sql = HNSW_KIND_INDEX_TEMPLATE.format(
+            index_name=hnsw_kind_index_name(bank_id, kind),
+            bank_id_literal=bank_id,
+            embedding_dim=int(embedding_dim),
+            kind=kind,
+        )
+        with conn.cursor() as cur:
+            cur.execute(sql)
+
+
 # ---------------------------------------------------------------------------
 # T9 — Document + memory_item write helpers
 # ---------------------------------------------------------------------------
@@ -201,10 +249,12 @@ def upsert_memory_items(
                 """
                 INSERT INTO memory_items
                     (bank_id, document_id, content, original_chunk, embedding,
-                     metadata, tags, update_mode, llm_generated)
+                     metadata, tags, update_mode, llm_generated,
+                     kind, ordinal, char_start, char_end)
                 VALUES
                     (%(bank_id)s, %(doc)s, %(content)s, %(orig)s, %(emb)s::vector,
-                     %(metadata)s::jsonb, %(tags)s, %(update_mode)s, %(llm_gen)s)
+                     %(metadata)s::jsonb, %(tags)s, %(update_mode)s, %(llm_gen)s,
+                     %(kind)s, %(ordinal)s, %(char_start)s, %(char_end)s)
                 """,
                 {
                     "bank_id": bank_id,
@@ -216,6 +266,10 @@ def upsert_memory_items(
                     "tags": list(it.get("tags") or []),
                     "update_mode": it.get("update_mode", "append"),
                     "llm_gen": bool(it.get("llm_generated", False)),
+                    "kind": it.get("kind", "question"),
+                    "ordinal": it.get("ordinal"),
+                    "char_start": it.get("char_start"),
+                    "char_end": it.get("char_end"),
                 },
             )
     return len(items)

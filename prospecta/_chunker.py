@@ -10,6 +10,7 @@ Ported from animus (animus/memory/chunker.py). No behavior changes.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -149,3 +150,98 @@ def chunk_file(
         return
 
     yield from chunk_text(content, path, chunk_size, overlap)
+
+
+@dataclass(frozen=True)
+class ParagraphChunk:
+    """A child chunk: content == original_text[char_start:char_end]."""
+
+    ordinal: int
+    char_start: int
+    char_end: int
+    content: str
+
+
+_PARA_BREAK = re.compile(r"\n[ \t]*\n+")
+
+
+def _paragraph_spans(text: str) -> list[tuple[int, int]]:
+    """Stripped (start, end) spans of the paragraphs of text."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for m in list(_PARA_BREAK.finditer(text)) + [None]:
+        end = m.start() if m else len(text)
+        nxt = m.end() if m else len(text)
+        seg = text[pos:end]
+        lead = len(seg) - len(seg.lstrip())
+        stripped = seg.strip()
+        if stripped:
+            spans.append((pos + lead, pos + lead + len(stripped)))
+        pos = nxt
+    return spans
+
+
+def _split_long(text: str, start: int, end: int, max_chars: int, overlap: int):
+    """Split one over-long paragraph at whitespace into <= max_chars pieces."""
+    pieces: list[tuple[int, int]] = []
+    s = start
+    while s < end:
+        e = min(s + max_chars, end)
+        if e < end:
+            ws = max(text.rfind(" ", s + 1, e), text.rfind("\n", s + 1, e))
+            if ws > s:
+                e = ws
+        piece = text[s:e]
+        lead = len(piece) - len(piece.lstrip())
+        stripped = piece.strip()
+        if stripped:
+            pieces.append((s + lead, s + lead + len(stripped)))
+        if e >= end:
+            break
+        # next piece starts `overlap` chars back, moved forward to a word start
+        ns = max(e - overlap, s + 1)
+        while ns < e and not text[ns - 1].isspace():
+            ns += 1
+        s = ns if ns < e else e
+    return pieces
+
+
+def chunk_paragraphs(
+    text: str, max_chars: int = 1000, overlap: int = 100
+) -> list[ParagraphChunk]:
+    """Child chunks of at most max_chars at paragraph boundaries.
+
+    Paragraphs (blank-line separated) are packed greedily; a paragraph longer
+    than max_chars is split at whitespace. Consecutive chunks share a small
+    overlap: the trailing units of a chunk (paragraphs or pieces) totalling at
+    most `overlap` chars are repeated at the start of the next. Offsets index
+    the original text exactly.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    overlap = max(0, min(overlap, max_chars // 2))
+    units: list[tuple[int, int]] = []
+    for s, e in _paragraph_spans(text):
+        if e - s <= max_chars:
+            units.append((s, e))
+        else:
+            units.extend(_split_long(text, s, e, max_chars, overlap))
+    chunks: list[ParagraphChunk] = []
+    i = 0
+    while i < len(units):
+        j = i + 1
+        while j < len(units) and units[j][1] - units[i][0] <= max_chars:
+            j += 1
+        chunks.append(ParagraphChunk(
+            len(chunks), units[i][0], units[j - 1][1],
+            text[units[i][0]:units[j - 1][1]],
+        ))
+        if j >= len(units):
+            break
+        # next chunk starts at the earliest unit within `overlap` of this end
+        # (never at i itself: it must make progress)
+        k = j
+        while k - 1 > i and units[j - 1][1] - units[k - 1][0] <= overlap:
+            k -= 1
+        i = k
+    return chunks

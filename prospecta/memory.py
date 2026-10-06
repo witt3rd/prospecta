@@ -21,6 +21,7 @@ from prospecta.db.queries import (
     INSERT_BANK,
     SELECT_BANK,
     SELECT_BANK_STATS,
+    ensure_kind_hnsw_indexes,
     hnsw_index_name,
     validate_bank_id,
 )
@@ -183,7 +184,8 @@ class Memory:
         with psycopg.connect(self._database_url, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
-        logger.info("Created per-bank HNSW index %s", index_name)
+            ensure_kind_hnsw_indexes(conn, bank_id, embedding_dim)
+        logger.info("Created per-bank HNSW index %s (+ per-kind indexes)", index_name)
 
     def bank_stats(self, bank_id: str | None = None) -> BankStats:
         """Return basic counts for a bank (defaults to default_bank_id)."""
