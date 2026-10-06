@@ -67,15 +67,15 @@ ON CONFLICT DO NOTHING
 _TEMPORAL = """
 WITH me AS (
     SELECT d.id, d.bank_id, d.created_at,
-           prospecta_doc_date(d.document_metadata, d.created_at) AS dt,
-           d.document_metadata->>'person' AS person
+           prospecta_doc_date(d.document_metadata, d.created_at, d.created_on) AS dt,
+           COALESCE(d.person, d.document_metadata->>'person') AS person
     FROM documents d WHERE d.id = %(doc)s
 ),
 others AS (
-    SELECT d.id, d.created_at, prospecta_doc_date(d.document_metadata, d.created_at) AS dt
+    SELECT d.id, d.created_at, prospecta_doc_date(d.document_metadata, d.created_at, d.created_on) AS dt
     FROM documents d, me
     WHERE d.bank_id = me.bank_id AND d.id <> me.id
-      AND d.document_metadata->>'person' IS NOT DISTINCT FROM me.person
+      AND COALESCE(d.person, d.document_metadata->>'person') IS NOT DISTINCT FROM me.person
 ),
 prev AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) < (me.dt, me.created_at, me.id)
          ORDER BY o.dt DESC, o.created_at DESC, o.id DESC LIMIT 1),

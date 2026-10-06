@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
-from prospecta._chunker import chunk_text
+from prospecta._chunker import chunk_paragraphs, chunk_text
 from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
 from prospecta.channels import (
@@ -324,6 +324,31 @@ def _write_parsed_docs(
                         "update_mode": "append",
                         "llm_generated": False,
                     })
+                # The body must not be invisible to dense_chunk / bm25: also
+                # write it as child chunks (kind='chunk', frontmatter-free).
+                if parsed.original_text.strip():
+                    body_chunks = list(chunk_paragraphs(
+                        parsed.original_text, chunk_size, min(chunk_overlap, chunk_size // 2)))
+                    chunk_vectors = memory._embed([c.content for c in body_chunks]) if body_chunks else []
+                    if len(chunk_vectors) != len(body_chunks):
+                        raise RuntimeError(
+                            f"embed() returned {len(chunk_vectors)} vectors "
+                            f"for {len(body_chunks)} chunks"
+                        )
+                    for c, vec in zip(body_chunks, chunk_vectors):
+                        items.append({
+                            "content": c.content,
+                            "original_chunk": c.content,
+                            "embedding": list(vec),
+                            "metadata": {**(parsed.metadata or {})},
+                            "tags": list(parsed.tags or []),
+                            "update_mode": "append",
+                            "llm_generated": False,
+                            "kind": "chunk",
+                            "ordinal": c.ordinal,
+                            "char_start": c.char_start,
+                            "char_end": c.char_end,
+                        })
                 upsert_memory_items(
                     conn,
                     bank_id=bank_id,
