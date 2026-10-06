@@ -15,6 +15,9 @@ class LLMCallable(Protocol):
     json_mode is keyword-only. When True, the return value MUST be valid JSON.
     The caller wires the provider's JSON-mode flag (OpenAI response_format,
     Anthropic tool-use, Hermes ctx.llm.complete_structured, etc.).
+
+    A callable may also accept an optional `model` keyword hint; callers pass
+    it only to callables whose signature accepts it.
     """
 
     def __call__(

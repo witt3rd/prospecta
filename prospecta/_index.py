@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_text
 from prospecta.stages import StageDeps, read_recall_config, run_stages
+from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
 from prospecta.channels import (
     QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
     run_channels, scope_members,
@@ -597,6 +598,7 @@ def _search_channels(
             conn.rollback()
             plan = QueryPlan(text=text, filters=extract_filters(
                 text, llm=memory._llm, people_vocab=vocab, now=plan.now,
+                model=(meta_cfg.get("params") or {}).get("extract_model") or DEFAULT_EXTRACT_MODEL,
             ))
         state = RecallState(
             conn=conn, bank_id=bank_id, embed=memory._embed,

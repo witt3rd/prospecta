@@ -2,10 +2,12 @@
 date_from, date_to and hard; a regex baseline (month names, ISO dates, years
 and the bank's own vocabulary of people) is the fallback when there is no
 LLM, the call fails, or its JSON is unusable. The LLM is the supplied
-`llm` callable (Sonnet-5.5 in the default wiring)."""
+`llm` callable, asked for DEFAULT_EXTRACT_MODEL (Sonnet-5.5) via an optional
+`model` keyword when the callable accepts one."""
 from __future__ import annotations
 
 import calendar
+import inspect
 import json
 import logging
 import re
@@ -13,6 +15,8 @@ from datetime import datetime
 
 from prospecta.channels.base import Filters
 from prospecta._filters import coerce_date
+
+DEFAULT_EXTRACT_MODEL = "anthropic/claude-sonnet-5.5"
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +65,23 @@ def regex_filters(text: str, people_vocab: list[str], now: datetime) -> Filters:
     return Filters(people=people, date_from=date_from, date_to=date_to, hard=False)
 
 
-def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm) -> Filters:
+def _accepts_model(llm) -> bool:
+    try:
+        params = inspect.signature(llm).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "model" and p.kind != p.VAR_POSITIONAL
+               or p.kind == p.VAR_KEYWORD for p in params)
+
+
+def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm,
+                 model: str) -> Filters:
     prompt = _PROMPT.format(
         today=now.date().isoformat(), question=text,
         people=", ".join(people_vocab) if people_vocab else "(none)",
     )
-    raw = llm(messages=[{"role": "user", "content": prompt}], json_mode=True)
+    kwargs = {"model": model} if _accepts_model(llm) else {}
+    raw = llm(messages=[{"role": "user", "content": prompt}], json_mode=True, **kwargs)
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("extraction JSON is not an object")
@@ -89,10 +104,11 @@ def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm) -> Filt
     )
 
 
-def extract_filters(text: str, *, llm, people_vocab: list[str], now: datetime) -> Filters:
+def extract_filters(text: str, *, llm, people_vocab: list[str], now: datetime,
+                    model: str = DEFAULT_EXTRACT_MODEL) -> Filters:
     if llm is not None:
         try:
-            return _llm_filters(text, people_vocab, now, llm)
+            return _llm_filters(text, people_vocab, now, llm, model)
         except Exception as exc:  # fall back, never fail the recall
             logger.warning("filter extraction fell back to regex: %s: %s",
                            type(exc).__name__, exc)

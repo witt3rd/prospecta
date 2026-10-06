@@ -219,3 +219,46 @@ def test_no_llm_failure_means_regex_and_recall_still_works(mem):
     mem._llm = llm_returning("garbage")
     res = mem.search("what did Bob Stone do", limit=10)
     assert len(res) == 4
+
+
+# ------------------------------------------------------ extraction model
+
+def _recording_llm(seen):
+    def llm(messages, *, json_mode=False, model=None):
+        seen.append(model)
+        return "{}"
+    return llm
+
+
+def test_default_extract_model_reaches_llm(mem):
+    from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
+    seen: list = []
+    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem._llm = _recording_llm(seen)
+    mem.search("walk the dog", limit=5)
+    assert seen == [DEFAULT_EXTRACT_MODEL] == ["anthropic/claude-sonnet-5.5"]
+
+
+def test_extract_model_param_override_reaches_llm(mem):
+    seen: list = []
+    cfg = [dict(e) for e in DEFAULT_CHANNEL_CONFIG]
+    for e in cfg:
+        if e["name"] == "meta":
+            e["params"] = {**e["params"], "extract_model": "x/small"}
+    mem.set_channel_config(cfg)
+    mem._llm = _recording_llm(seen)
+    mem.search("walk the dog", limit=5)
+    assert seen == ["x/small"]
+
+
+def test_kwargs_llm_receives_model_and_plain_llm_still_works():
+    seen: dict = {}
+
+    def kw_llm(messages, **kwargs):
+        seen.update(kwargs)
+        return "{}"
+    extract_filters("hi", llm=kw_llm, people_vocab=[], now=NOW, model="m1")
+    assert seen == {"json_mode": True, "model": "m1"}
+    f = extract_filters("Alice", llm=llm_returning({"people": ["Alice"]}),
+                        people_vocab=VOCAB, now=NOW, model="m1")
+    assert f.people == ["Alice"]
