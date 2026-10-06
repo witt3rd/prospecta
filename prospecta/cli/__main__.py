@@ -129,6 +129,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sw.add_argument("--interval", type=float, default=86400.0)
 
+    # ---- backup / restore ----------------------------------------------
+    bk = sub.add_parser("backup", help="pg_dump the database to a file")
+    bk.add_argument("path", type=Path)
+    rs = sub.add_parser(
+        "restore", help="Restore a backup file into an empty database"
+    )
+    rs.add_argument("path", type=Path)
+
     return parser
 
 
@@ -167,6 +175,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sweep":
         from prospecta.cli.sweep import cmd_sweep
         return cmd_sweep(args)
+    if args.command == "backup":
+        from prospecta.cli.backup import cmd_backup
+        return cmd_backup(args)
+    if args.command == "restore":
+        from prospecta.cli.backup import cmd_restore
+        return cmd_restore(args)
     return 1
 
 
