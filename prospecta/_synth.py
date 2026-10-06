@@ -106,14 +106,19 @@ def gather_evidence(conn, bank_id: str, recalled: list, *, top: int | None = Non
             order = members
     if not order:
         seen: set[str] = set()
+        cutoff = None
+        if top is None and recalled:
+            lead = recalled[0].score
+            cutoff = SCORE_FRACTION * lead if lead > 0 else lead
         for r in recalled:
             d = str(r.document_id)
-            if d not in seen:
-                seen.add(d)
-                order.append((d, r.source))
-            if top is not None and len(order) >= top:
+            if d in seen:
+                continue
+            if cutoff is not None and r.score < cutoff:
                 break
-            if top is None and r.score < SCORE_FRACTION * recalled[0].score:
+            seen.add(d)
+            order.append((d, r.source))
+            if top is not None and len(order) >= top:
                 break
     notes = []
     for doc_id, source in order:
