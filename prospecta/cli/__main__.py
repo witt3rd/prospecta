@@ -105,6 +105,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit JSON (else pretty output)"
     )
 
+    # ---- eval (design 8.10) --------------------------------------------
+    ev = sub.add_parser(
+        "eval", help="Score recall on a questions.md file; ablate; cost and latency per stage")
+    ev.add_argument("questions", type=Path, help="questions.md (see prospecta.evaluation)")
+    ev.add_argument("--ablate", action="store_true",
+                    help="Also run each channel/stage off (and unused channels on)")
+    ev.add_argument("--synth", action="store_true",
+                    help="Also run grounded recall_synth on every question")
+    ev.add_argument("--judge", action="store_true",
+                    help="With --synth: judge answers against `answer:` lines (implies --synth)")
+    ev.add_argument("--json", action="store_true", help="Emit the full report as JSON")
+
     # ---- retain (T15) ---------------------------------------------------
     rt = sub.add_parser("retain", help="Write a document via the spine")
     rt.add_argument("content", help="Body content, or @path/to/file")
@@ -194,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "search":
         from prospecta.cli.search import cmd_search
         return cmd_search(args)
+    if args.command == "eval":
+        from prospecta.cli.evaluate import cmd_eval
+        return cmd_eval(args)
     if args.command == "retain":
         from prospecta.cli.retain import cmd_retain
         return cmd_retain(args)
