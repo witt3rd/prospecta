@@ -5,7 +5,7 @@ The Jev-Mem techniques, Postgres-native (hybrid retrieval design 8.7).
 **Tables** (additive; `memory_entities`, `memory_item_entities`, `memory_links`,
 `memory_link_state`; links and entity rows cascade on item delete).
 
-**Linker** (`prospecta.Linker`, `Memory(linker=Linker(llm=..., judge=...))`) runs after
+**Linker** (`prospecta._linker.Linker`, `JevRelationJudge`; `Memory(linker=Linker(llm=..., judge=...))`) runs after
 `retain` / `index_single_file` on one worker thread (`asynchronous=False` runs inline;
 `Memory.wait_for_links()` drains; `Memory.link_document(id)` and `Memory.link_pending()`
 are the on-demand and safety-net paths). Per document:
