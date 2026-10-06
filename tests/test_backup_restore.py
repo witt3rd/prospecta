@@ -29,7 +29,7 @@ def test_backup_restore_roundtrip(populated_corpus, fresh_db, pg_url, tmp_path):
             hits = mem.recall(["When is Kelly's birthday?"])
             assert any("Kelly" in h.content for h in hits)
             hits = mem.recall(["zebra marker"])
-            assert any(h.content == tricky for h in hits)
+            assert any(h.original_chunk == tricky for h in hits)
         finally:
             mem.close()
     finally:

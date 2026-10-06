@@ -1,48 +1,46 @@
-# Importing a Hindsight bank dump
+# Importing a Hindsight bank
 
 ```bash
-prospecta --bank mybank import hindsight dump.json [--synthesize] [--json]
+# restore a Hindsight pg_dump / cold copy into a scratch Postgres first (read-only use), then:
+prospecta --bank mybank import hindsight postgres://.../hindsight --hindsight-bank hermes
+prospecta import hindsight postgres://.../hindsight --all-banks     # each lands in a same-named bank
 ```
 
-Exit code 0 = everything accounted for with no failures; 3 = some records failed (listed in the report; the rest were still imported).
+Options: `--batch N` (rows per batch, default 1000), `--json` (machine report). Exit 0 = no failures, 3 = some rows failed (listed; the rest imported), 1/2 = bad arguments / source unreadable.
 
-## Assumed dump schema
+The source is only read. The format is the real Hindsight schema (Postgres, pgvector, alembic `b3e8d1c6f4a9`); the tests use a synthetic database generated with that table/column layout, generic content, scaled-down counts.
 
-No Hindsight dump format or code was found under `~/src` or `~/Documents`, so the reader targets this minimal schema, modelled on Hindsight's memory-unit/entity/link model. Unknown fields are never dropped (kept in metadata).
+## Where each of the 17 Hindsight tables goes
 
-A single JSON object, or JSONL with one record per line carrying `"kind": "memory_unit" | "entity" | "link"`:
+| Hindsight table | Lands in prospecta as |
+|---|---|
+| `memory_units` | one `documents` row (`source = hindsight:<unit id>`, `original_text` = text verbatim, `created_at`/`updated_at` kept) + one `memory_items` row (content = text). Whole unit row (fact_type, context, event_date, occurred_*, mentioned_at, proof_count, source_memory_ids = observation provenance, consolidated_at, metadata, ids…) kept in `documents.document_metadata.hindsight`. Tags: `hindsight`, `fact_type:<t>`, `entity:<slug>`, unit tags. |
+| `unit_entities` | `imported_edges` kind `unit_entity` |
+| `entity_cooccurrences` | `imported_edges` kind `cooccurrence` (count, last_cooccurred) |
+| `memory_links` (3.37M in the real dump) | `imported_edges` kind `memory_link` (type, entity, weight, created_at) |
+| `entities`, `documents`, `chunks`, `observation_history`, `mental_models`, `mental_model_history`, `knowledge_pages`, `invalidated_memory_units`, `directives`, `file_storage`, `audit_log`, `llm_requests`, `banks` | `imported_records` (kind per table), one row each, the full source row as JSON (primary key as `source_key`). Nothing is interpreted; it is preserved so nothing is lost. Hindsight `documents`/`chunks` keep their original text here; the units reference them by id. |
 
-```json
-{
-  "bank_id": "demo",
-  "entities": [{"id": "e1", "name": "Alice", "aliases": ["Al"]}],
-  "memory_units": [{
-    "id": "u1", "text": "Alice works at Acme.", "fact_type": "world",
-    "entities": ["e1"], "tags": ["work"], "context": "chat",
-    "created_at": "2024-03-01T10:00:00Z", "occurred_start": "...", "occurred_end": "...",
-    "event_date": "...", "mentioned_at": "...", "document_id": "d1",
-    "metadata": {}, "source_unit_ids": ["u0"], "proof_count": 2
-  }],
-  "links": [{"from_unit_id": "u1", "to_unit_id": "u2", "link_type": "entity", "weight": 1.0}]
-}
-```
+`imported_records` and `imported_edges` are created on first import (`CREATE TABLE IF NOT EXISTS`, cascade-deleted with the bank). Edges and records are inserted in batches (`INSERT … SELECT unnest(…) ON CONFLICT DO NOTHING`), so the 3.37M links stream through a server-side cursor in `--batch`-sized chunks.
 
-`fact_type` is `world`, `experience` or `observation` (observations carry `source_unit_ids` / `proof_count` provenance). A unit's `entities` may be entity ids or bare names. Only `id` and `text` are required on a unit.
+### Deliberately not carried (counted and reported as `not carried`)
 
-## Mapping
+- `alembic_version` — Hindsight's migration marker.
+- `async_operations`, `graph_maintenance_queue` — transient job queues; their products are imported.
+- `bank_stats_cache` — derived cache.
+- `webhooks` — outbound endpoint config with signing secrets; secrets are not copied.
+- Derived columns not copied: `memory_units.search_vector` (prospecta regenerates its own tsvector) and the `memory_units_bm25` view.
 
-- Each memory unit → one prospecta document, `source = hindsight:<unit id>`, body = `text` (verbatim), `index_text` = the text itself (no LLM, no spend). `--synthesize` uses the configured LLM to author anticipated questions instead (P1).
-- Tags: `hindsight`, `fact_type:<type>`, `entity:<slug>`, plus the unit's own tags.
-- Document metadata keeps: `hindsight_id`, fact type, context, document id, resolved entity records, outgoing links, all timestamps, original metadata, observation provenance, and any unrecognised fields.
-- `created_at` becomes the document/item `created_at` (an unparseable value is a warning; the raw value stays in metadata).
-- Links are stored on the source unit's metadata (prospecta has no link table). Entities are stored inside the units that reference them.
+## Embeddings (dim-384 decision)
+
+Hindsight embeds each unit's text with MiniLM (384-dim) — the same as prospecta's offline default `all-MiniLM-L6-v2`. So each unit's vector is **carried verbatim** into `memory_items.embedding` when its dimension equals the target bank's. If the target bank doesn't exist it is created with the source's dimension (384). Units with no embedding, or a different dimension than an existing bank, are **re-embedded** with the configured embedder (`PROSPECTA_EMBEDDER`); with no working embedder those units are reported as failed, never dropped. The report shows `embeddings: carried=… re_embedded=…`.
+
+Consequence: imported items are indexed on the fact text (content-space), not on LLM-authored anticipated questions. Recall queries against a carried bank must be embedded with the same 384-dim MiniLM model (`PROSPECTA_EMBEDDER=sentence-transformers`).
 
 ## Idempotency
 
-A unit whose `hindsight:<id>` source already exists in the bank is skipped, so re-running the same dump adds nothing. Existing documents are never replaced.
+- Units: a document with source `hindsight:<id>` already in the bank → skipped as duplicate. `content_hash` is `sha256("hindsight:<id>\n<text>")`, so two units with identical text are both kept (the unique content hash would otherwise collapse them).
+- Records/edges: primary-keyed, `ON CONFLICT DO NOTHING`. Existing rows are never updated; re-running the same dump adds nothing.
 
 ## No-loss report
 
-Links are carried in their source unit, so a link counts as imported only if its source unit was imported; if the source unit was skipped or failed, the link is reported skipped or failed with that reason.
-
-For units, entities and links: `in = imported + skipped_duplicate + failed`. Every skipped/failed record is listed with its reason, e.g. already imported; identical text already stored under another source; empty text or missing id; link endpoint not in the dump; entity with no id/name; entity no imported unit references.
+Per Hindsight table: `in = imported + skipped_duplicate + failed` (or `in = not_carried`). Failed rows are listed with table, key and reason; a failing batch is retried row by row so one bad row doesn't hide the rest. Also reported: embeddings carried vs re-embedded, and notes (bank created, tables missing from the source).

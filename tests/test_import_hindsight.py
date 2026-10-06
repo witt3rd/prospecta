@@ -1,95 +1,131 @@
-"""Hindsight import: synthetic dump, idempotency, no-loss report."""
+"""Hindsight import against a synthetic DB with the real Hindsight layout."""
 from __future__ import annotations
 
 import json
+import time
+from urllib.parse import urlparse, urlunparse
 
-from prospecta._import_hindsight import import_hindsight, load_dump
+import psycopg
+import pytest
 
+from prospecta import _import_hindsight as ih
+from prospecta.memory import Memory
+from tests import _hindsight_synth as synth
+from tests._stub_embedder import EMBED_DIM, stub_embed
 
-def _dump():
-    return {
-        "bank_id": "demo",
-        "entities": [
-            {"id": "e1", "name": "Alice", "aliases": ["Al"]},
-            {"id": "e2", "name": "Acme Corp"},
-            {"id": "e3", "name": "Orphan"},
-            {"name": "no id"},
-        ],
-        "memory_units": [
-            {"id": "u1", "text": "Alice works at Acme Corp.", "fact_type": "world",
-             "entities": ["e1", "e2"], "tags": ["work"], "context": "chat",
-             "created_at": "2024-03-01T10:00:00Z", "occurred_start": "2023-01-01T00:00:00Z",
-             "metadata": {"k": "v"}, "document_id": "d1"},
-            {"id": "u2", "text": "Alice prefers tea.", "fact_type": "experience",
-             "entities": ["Alice"], "created_at": "2024-03-02T10:00:00Z"},
-            {"id": "u3", "text": "Alice likes tea and works at Acme.", "fact_type": "observation",
-             "source_unit_ids": ["u1", "u2"], "proof_count": 2},
-            {"id": "u4", "text": "Alice prefers tea."},      # same text as u2
-            {"id": "u5", "text": "  "},                      # bad
-            {"text": "no id"},                               # bad
-            {"id": "u7", "text": "Odd date.", "created_at": "yesterday-ish"},
-        ],
-        "links": [
-            {"from_unit_id": "u1", "to_unit_id": "u2", "link_type": "entity", "weight": 1.0},
-            {"from_unit_id": "u1", "to_unit_id": "gone", "link_type": "semantic"},
-            {"from_unit_id": "u4", "to_unit_id": "u1", "link_type": "semantic"},
-        ],
-    }
+SEVENTEEN = {"banks", "documents", "chunks", "memory_units", "entities", "unit_entities",
+             "entity_cooccurrences", "memory_links", "observation_history",
+             "mental_model_history", "mental_models", "knowledge_pages",
+             "invalidated_memory_units", "directives", "file_storage", "audit_log",
+             "llm_requests"}
+INFRA = {"alembic_version", "async_operations", "bank_stats_cache",
+         "graph_maintenance_queue", "webhooks"}
 
 
-def test_import_report_and_idempotency(memory_with_bank):
-    m = memory_with_bank
-    r = import_hindsight(m, _dump())
-    assert (r.units.total, r.units.imported, r.units.skipped, r.units.failed) == (7, 4, 1, 2)
-    assert (r.links.total, r.links.imported, r.links.skipped, r.links.failed) == (3, 1, 1, 1)
-    assert r.links.total == r.links.imported + r.links.skipped + r.links.failed
-    assert (r.entities.total, r.entities.imported, r.entities.skipped, r.entities.failed) == (4, 2, 1, 1)
-    assert r.units.total == r.units.imported + r.units.skipped + r.units.failed
-    assert len(r.warnings) == 1
-    docs = m.bank_stats().documents
-    assert docs == 4
+def embed384(texts):
+    calls.append(len(texts))
+    return [[0.1] * synth.DIM for _ in texts]
 
-    r2 = import_hindsight(m, _dump())
-    assert r2.units.imported == 0
-    assert m.bank_stats().documents == docs
-    assert (r2.links.imported, r2.links.skipped, r2.links.failed) == (0, 2, 1)
-    assert r2.units.skipped == 5  # 4 already imported + u4 duplicate text... still accounted
-    assert r2.units.total == r2.units.imported + r2.units.skipped + r2.units.failed
 
+calls: list[int] = []
+
+
+@pytest.fixture
+def hs_url(pg_url):
+    name = f"hs_{int(time.time() * 1_000_000)}"
+    with psycopg.connect(pg_url, autocommit=True) as c:
+        c.execute(f'CREATE DATABASE "{name}"')
+    url = urlunparse(urlparse(pg_url)._replace(path=f"/{name}"))
+    synth.build(url)
+    calls.clear()
+    yield url
+    with psycopg.connect(pg_url, autocommit=True) as c:
+        c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=%s", (name,))
+        c.execute(f'DROP DATABASE "{name}"')
+
+
+def _n(m, sql, *a):
+    with m._pool.cursor() as cur:
+        cur.execute(sql, a)
+        return cur.fetchone()[0]
+
+
+def test_every_hindsight_table_is_carried_or_explained():
+    assert set(ih.CARRIED) | set(ih.EDGES) | {"memory_units"} == SEVENTEEN
+    assert set(ih.NOT_CARRIED) == INFRA
+
+
+def test_import_carries_embeddings_and_is_idempotent(fresh_db, hs_url):
+    m = Memory(database_url=fresh_db, bank_id="alpha", embed=embed384, llm=None)
+    r = ih.import_bank(m, hs_url, "alpha", batch=100)
+    n_units, n_links = synth.BANKS["alpha"]
+    assert r.ok, r.failures
+    t = r.tables
+    assert (t["memory_units"].total, t["memory_units"].imported) == (n_units, n_units)
+    assert (t["memory_links"].total, t["memory_links"].imported) == (n_links, n_links)
+    assert t["unit_entities"].imported == t["unit_entities"].total > 0
+    assert t["entity_cooccurrences"].imported == 29
+    assert t["documents"].imported == 6 and t["file_storage"].imported == 6
+    # embeddings: 6 units (i % 25 == 0) had none -> re-embedded; the rest carried verbatim
+    assert r.embeddings == {"carried": n_units - 6, "re_embedded": 6}
+    assert sum(calls) == 6
+    for tbl in SEVENTEEN | INFRA:
+        c = t[tbl]
+        assert c.total == c.imported + c.skipped_duplicate + c.failed + c.not_carried, tbl
+    assert all(t[x].not_carried == t[x].total for x in INFRA)
+    assert t["webhooks"].total == 1 and _n(m, "SELECT count(*) FROM imported_records WHERE data::text LIKE '%%s3cret%%'") == 0
+
+    # duplicate text did not lose a unit; provenance + timestamps + entities preserved
+    assert _n(m, "SELECT count(*) FROM memory_items WHERE bank_id='alpha'") == n_units
     with m._pool.cursor() as cur:
         cur.execute("SELECT tags, document_metadata, created_at FROM documents "
-                    "WHERE source='hindsight:u1'")
+                    "WHERE source = %s", (f"hindsight:{synth._u('unit-alpha-5')}",))
         tags, meta, created = cur.fetchone()
-    assert "entity:alice" in tags and "fact_type:world" in tags and "work" in tags
-    assert meta["hindsight_links"][0]["to"] == "u2"
-    assert meta["hindsight_entities"][0]["aliases"] == ["Al"]
-    assert created.year == 2024 and created.month == 3
+    assert "hindsight" in tags and "fact_type:observation" in tags
+    assert any(x.startswith("entity:entity-") for x in tags)
+    assert meta["hindsight"]["document_id"] == "doc-alpha-5" and created.day == 6
+    assert meta["hindsight_entities"] == ["Entity 5 alpha"]
+
+    before = (_n(m, "SELECT count(*) FROM documents"), _n(m, "SELECT count(*) FROM imported_edges"),
+              _n(m, "SELECT count(*) FROM imported_records"))
+    r2 = ih.import_bank(m, hs_url, "alpha", batch=100)
+    after = (_n(m, "SELECT count(*) FROM documents"), _n(m, "SELECT count(*) FROM imported_edges"),
+             _n(m, "SELECT count(*) FROM imported_records"))
+    assert before == after
+    assert r2.tables["memory_units"].skipped_duplicate == n_units
+    assert r2.tables["memory_links"].skipped_duplicate == n_links
+    assert sum(calls) == 6 and r2.ok
 
 
-def test_load_jsonl(tmp_path):
-    p = tmp_path / "d.jsonl"
-    p.write_text("\n".join(json.dumps(x) for x in [
-        {"kind": "memory_unit", "id": "a", "text": "x"},
-        {"kind": "entity", "id": "e", "name": "N"}]))
-    d = load_dump(p)
-    assert len(d["memory_units"]) == 1 and len(d["entities"]) == 1
+def test_reembeds_when_bank_dim_differs(fresh_db, hs_url):
+    m = Memory(database_url=fresh_db, bank_id="beta32", embed=stub_embed, llm=None)
+    m.create_bank("beta32", embedding_dim=EMBED_DIM)
+    r = ih.import_bank(m, hs_url, "beta", batch=16)
+    n = synth.BANKS["beta"][0]
+    assert r.ok and r.embeddings == {"carried": 0, "re_embedded": n}
+    assert m.bank_stats("beta32").memory_items == n
 
 
-def test_cli_import(memory_with_bank, tmp_path, monkeypatch, capsys):
+def test_failures_are_reported_not_dropped(fresh_db, hs_url):
+    def boom(texts):
+        raise RuntimeError("embedder down")
+    m = Memory(database_url=fresh_db, bank_id="beta", embed=boom, llm=None)
+    r = ih.import_bank(m, hs_url, "beta", batch=16)
+    u = r.tables["memory_units"]
+    n = synth.BANKS["beta"][0]
+    assert u.failed == 2 and u.imported == n - 2 and not r.ok  # i%25==0 -> 2 units
+    assert len(r.failures) == 2 and "embedder down" in r.failures[0]["reason"]
+    assert u.total == u.imported + u.skipped_duplicate + u.failed
+
+
+def test_cli(fresh_db, hs_url, monkeypatch, capsys):
     from prospecta.cli import _common
     from prospecta.cli.__main__ import main
-    monkeypatch.setattr(_common, "make_memory", lambda args: memory_with_bank)
-    p = tmp_path / "dump.json"
-    p.write_text(json.dumps(_dump()))
-    assert main(["import", "hindsight", str(p), "--json"]) == 3  # has failures, reported
+    monkeypatch.setattr(_common, "make_memory", lambda a: Memory(
+        database_url=fresh_db, bank_id=a.bank, embed=embed384, llm=None))
+    assert main(["import", "hindsight", hs_url]) == 1  # two banks, none chosen
+    assert main(["--bank", "alpha", "import", "hindsight", hs_url, "--hindsight-bank", "alpha",
+                 "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["units"]["imported"] == 4
-    assert main(["import", "hindsight", str(p)]) == 3
-
-
-def test_load_rejects_non_object_json(tmp_path):
-    import pytest
-    f = tmp_path / "d.json"
-    f.write_text("[]")
-    with pytest.raises(ValueError):
-        load_dump(f)
+    assert out[0]["tables"]["memory_units"]["imported"] == synth.BANKS["alpha"][0]
+    assert main(["import", "hindsight", hs_url, "--all-banks"]) == 0
