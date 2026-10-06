@@ -10,7 +10,7 @@ import pytest
 
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
-from prospecta.stages import JevScore, LLMResult, validate_recall_config
+from prospecta.stages import JEV_CRITERIA, JEV_TASK, JevScore, LLMResult, validate_recall_config
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
 NOTES = {
@@ -139,16 +139,25 @@ def test_failure_falls_back_to_fused_order_and_says_why(mem, llm):
     assert n == 1
 
 
-def jev_transport(scores, calls=None, fail=False):
+def fake_jev(scores, calls=None, fail=False, key="test-key"):
+    """Offline System One, strict like the real door: POST body keys exactly
+    {model, state, questions}; answers keyed by question id."""
     def transport(req, timeout):
+        assert set(req) == {"model", "state", "questions"}
+        assert req["model"] == "typesafe/jev-1.13"
         if calls is not None:
             calls.append(req)
         if fail:
             raise TimeoutError("jev timed out")
-        return {"answers": [{"id": q["id"], "score": scores(i)} for i, q in
-                            enumerate(req["questions"])],
-                "usage": {"input_tokens": 670, "output_tokens": 5, "cost": 0.00003}}
+        return {"answers": {qid: {"type": "score", "score": scores(i)}
+                            for i, qid in enumerate(req["questions"])},
+                "id": "gen-dec-1", "model": "typesafe/jev-1.13-20260917",
+                "provider": "TypeSafe",
+                "usage": {"cost": 2.5e-05, "input_tokens": 596, "output_tokens": 75}}
     return transport
+
+
+jev_transport = fake_jev
 
 
 def test_jev_score_as_reranker_in_spire_call_shape(mem):
@@ -161,11 +170,14 @@ def test_jev_score_as_reranker_in_spire_call_shape(mem):
     assert sources(res) == base[::-1]
     req = seen[0]
     assert req["state"] == {"query": QUERY}
-    assert all(q["kind"] == "score" and len(q["criteria"]) == 4 and q["material"]["title"]
-               for q in req["questions"])
+    assert list(req["questions"]) == [f"p{i}" for i in range(len(req["questions"]))]
+    assert all(q["type"] == "score" and q["criteria"] == JEV_CRITERIA
+               and q["instructions"]["task"] == JEV_TASK
+               and q["instructions"]["kind"] == "note" and q["instructions"]["title"]
+               and q["instructions"]["text"] for q in req["questions"].values())
     assert res[0].scores["jev"] == max(r.scores["jev"] for r in res)
     n, cost = last_event(mem, "n_llm_calls, cost_usd")
-    assert n == 1 and float(cost) == pytest.approx(0.00003)
+    assert n == 1 and float(cost) == pytest.approx(2.5e-05)
 
 
 def test_jev_failure_standalone_keeps_fused_order(mem):
@@ -179,12 +191,34 @@ def test_jev_failure_standalone_keeps_fused_order(mem):
 
 def test_jev_partial_answer_is_a_failure(mem):
     def transport(req, timeout):
-        return {"answers": [{"id": req["questions"][0]["id"], "score": 3}]}
+        return {"answers": {"p0": {"type": "score", "score": 3}}}
     mem._jev = JevScore(transport)
     mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
     mem.recall([QUERY], limit=5)
     rerank, = last_event(mem, "rerank")
-    assert "does not score every candidate" in rerank["per_query"][0]["fallback_reason"]
+    assert "answers are not exactly the asked ids" in rerank["per_query"][0]["fallback_reason"]
+
+
+@pytest.mark.parametrize("answers", [
+    {"p0": {"score": 1}, "p1": {"score": 1}, "p2": {"score": 1}, "p3": {"score": 1},
+     "p4": {"score": 1}, "p99": {"score": 1}},                       # extra id
+    {f"p{i}": {"score": 3.5} for i in range(5)},                     # out of range
+    {f"p{i}": {"score": float("nan")} for i in range(5)},            # not finite
+    {f"p{i}": {"score": "2"} for i in range(5)},                     # not a number
+])
+def test_jev_invalid_answers_mean_no_ranking(mem, answers):
+    mem._jev = JevScore(lambda req, timeout: {"answers": answers})
+    base = sources(mem.search(QUERY, limit=5))
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
+    assert sources(mem.recall([QUERY], limit=5)) == base
+    assert last_event(mem, "rerank")[0]["per_query"][0]["fallback_reason"]
+
+
+def test_jev_response_without_answers_is_no_ranking(mem):
+    mem._jev = JevScore(lambda req, timeout: {"error": {"message": "overloaded"}})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
+    mem.recall([QUERY], limit=5)
+    assert "no answers" in last_event(mem, "rerank")[0]["per_query"][0]["fallback_reason"]
 
 
 def test_jev_gate_decides_jev_or_sonnet(mem):

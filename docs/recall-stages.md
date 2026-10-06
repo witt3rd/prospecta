@@ -22,10 +22,16 @@ mem.set_recall_config({
   requests for 30), 60 KB per request, 10 s timeout, Jev only reorders. With
   `gate.enabled`, Jev scores first; if its top score >= `threshold` the Jev order
   stands, else (or if Jev fails) Sonnet reranks. Jev is built dark: pass
-  `Memory(jev=JevScore(openrouter_jev_transport()))`. The request/response wire
-  shape in `prospecta/stages.py` is written from the design's description of
-  Spire's `library-rank.ts`, not verified against the live endpoint; the transport
-  is one injectable function so it is easy to correct.
+  `Memory(jev=JevScore(openrouter_jev_transport()))` (key from `OPENROUTER_API_KEY`).
+  Wire shape (verified against Spire's `library-rank.ts`, rung's `jev.rs` and
+  Jev-Mem's recorded live exchanges): `POST https://openrouter.ai/api/v1/systemone`,
+  model `typesafe/jev-1.13`, body exactly `{model, state:{query}, questions:{p0..:
+  {type:"score", instructions:{task, kind, title, text}, criteria}}}` with the
+  four-string 0..3 legend and the record `task` copied from `library-rank.ts`;
+  the reply's `answers` must hold exactly the asked ids, each a finite score in
+  0..3, else there is no ranking and the fused order stands. Cost and tokens come
+  from `usage.cost`, `usage.input_tokens`, `usage.output_tokens`. Tests use an
+  offline transport of the same shape.
 - **Reader and hop**: the reader sees the top 8 excerpts and answers sufficient or
   <= 2 follow-up queries; these run only the cheap channels (`dense_chunk`,
   `bm25`, `question`, whichever the bank enables); <= 10 new notes join the top 15
