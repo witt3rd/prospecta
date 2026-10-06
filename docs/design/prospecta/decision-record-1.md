@@ -250,3 +250,4 @@ The bundled markdown parser handles `.md` files (with `index_text:` frontmatter 
 
 ⚒️ Addendum locked 2026-05-19. T5 port-decision sheet writes against this.
 
+> **Note (2026-05):** the implemented lexical side is full-text rank (`ts_rank_cd` over a `tsvector`, `websearch_to_tsquery`, all terms must match), not BM25. Wording below is historical.

@@ -566,15 +566,19 @@ def delete_documents_by_source(
 # ---------------------------------------------------------------------------
 
 # A6: COALESCE on scores → never NULL in returned rows. Three-channel RRF
-# fusion: semantic (cosine over embedding) + lexical_content (ts_rank over
-# content_tsv = index_text / questions) + lexical_body (ts_rank over
+# fusion: semantic (cosine over embedding) + lexical_content (ts_rank_cd over
+# content_tsv = index_text / questions) + lexical_body (ts_rank_cd over
 # body_tsv = original_chunk / source body). Three CTEs FULL OUTER JOIN'd;
 # RRF score = sum of three COALESCE'd reciprocals. All score components
 # always-numeric per A6 invariant.
 #
 # The lexical_body channel implements the P14 body-fallback safety net:
 # when LLM-generated index_text drifts hard from query language, body
-# content still rescues the doc via BM25 fusion.
+# content still rescues the doc via RRF fusion of its ts_rank_cd rank.
+# Lexical channels use websearch_to_tsquery, which requires EVERY query
+# term to match (AND semantics) and ts_rank_cd is cover-density rank, not
+# BM25 (no IDF, no length normalisation). The safety net therefore fires
+# on short queries only; long natural-language questions rarely match.
 HYBRID_SQL = """
 WITH
   semantic AS (

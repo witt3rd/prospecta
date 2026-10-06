@@ -54,10 +54,10 @@ class RecalledMemory:
     """Four-key scores dict, always-populated, all numeric (A6 invariant):
       - "semantic": cosine similarity from HNSW channel (1 - distance).
         0.0 when result didn't surface via semantic channel.
-      - "lexical": ts_rank over content_tsv (LLM-generated index_text /
+      - "lexical": ts_rank_cd over content_tsv (LLM-generated index_text /
         questions channel). Preserved name for backward compat per v0.1
         option γ; semantically equivalent to `lexical_content`.
-      - "lexical_body": ts_rank over body_tsv (original_chunk / source
+      - "lexical_body": ts_rank_cd over body_tsv (original_chunk / source
         body channel). The P14 body-fallback safety net — rescues docs
         whose LLM-generated index_text drifted from query language.
         0.0 unless surfaced via mode='hybrid' three-channel fusion.

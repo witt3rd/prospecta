@@ -6,7 +6,7 @@ When a document is **stored**, an LLM writes the `index_text` that says *"this i
 
 When a message **arrives**, a second LLM call writes the questions this exchange's memory should service. The query vector also encodes a question, not the user's verbatim text.
 
-Two anticipations, written in the same register, by similar prompts, aimed at meeting each other. The embedding similarity is the matching mechanism. The body of the source document is preserved verbatim and indexed via a third channel (Postgres BM25 over the original text) so that when the LLM-synthesized index_text drifts from the query, the body still rescues the document. The hybrid retrieval is the safety net under a spine that lives in question-space.
+Two anticipations, written in the same register, by similar prompts, aimed at meeting each other. The embedding similarity is the matching mechanism. The body of the source document is preserved verbatim and indexed via a third channel (Postgres full-text rank over the original text) so that when the LLM-synthesized index_text drifts from the query, the body still rescues the document. The hybrid retrieval is the safety net under a spine that lives in question-space.
 
 This is **not** classical RAG over chunks. Classical RAG embeds content and hopes the user's question lives nearby in embedding space. Prospecta makes both ends LLM-synthesized in anticipation language, then matches question-to-question — closer to how human memory actually works: you don't remember a transcript, you remember "what was this about."
 
@@ -199,8 +199,8 @@ Prospecta is the spine + the safety net. Not the universal answer; a specific be
 | Channel | What it embeds | What it rescues |
 |---|---|---|
 | Semantic (HNSW over `embedding`) | The anticipated question — LLM-authored at retain time | The default match path. Question-on-question similarity in vector space. |
-| Lexical content (BM25 over `content_tsv`) | The same anticipated question, stemmed via Postgres `to_tsvector('english', ...)` | Phrasing drift the embedder misses — plurals vs singulars, derivational variants. |
-| Lexical body (BM25 over `body_tsv`) | The full source body verbatim, stemmed | The hard case: when the LLM-synthesized `index_text` drifts semantically AND lexically from the query, the body channel still surfaces the document. |
+| Lexical content (`ts_rank_cd` over `content_tsv`; all query terms must match) | The same anticipated question, stemmed via Postgres `to_tsvector('english', ...)` | Phrasing drift the embedder misses — plurals vs singulars, derivational variants. |
+| Lexical body (`ts_rank_cd` over `body_tsv`; all query terms must match) | The full source body verbatim, stemmed | The hard case: when the LLM-synthesized `index_text` drifts semantically AND lexically from the query, the body channel still surfaces the document. |
 
 Three channels, fused via Reciprocal Rank Fusion (k=60 default, configurable per call). The spine carries when it works; the safety net carries when it doesn't.
 
