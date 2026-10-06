@@ -205,7 +205,7 @@ def test_resolve_embedder_default_is_litellm(monkeypatch):
 
     import prospecta.defaults as defaults
     monkeypatch.setattr(
-        defaults, "make_default_embedder", lambda: sentinel, raising=False
+        defaults, "make_default_embedder", lambda **kw: sentinel, raising=False
     )
     assert _common._resolve_embedder() is sentinel
 
@@ -217,7 +217,7 @@ def test_resolve_embedder_litellm_explicit(monkeypatch):
     sentinel = object()
     import prospecta.defaults as defaults
     monkeypatch.setattr(
-        defaults, "make_default_embedder", lambda: sentinel, raising=False
+        defaults, "make_default_embedder", lambda **kw: sentinel, raising=False
     )
     assert _common._resolve_embedder() is sentinel
 

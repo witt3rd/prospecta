@@ -616,6 +616,7 @@ def _search_channels(
     `recall_cfg` overrides the bank's stage config ({} = no stages); None reads it."""
     meta_cfg = next((e for e in config if e.get("name") == "meta" and e.get("enabled", True)), None)
     plan = QueryPlan(text=text)
+    extract_calls: list[dict] = []
     with memory._pool.connection() as conn:
         if meta_cfg is not None:
             with conn.cursor() as cur:
@@ -629,6 +630,7 @@ def _search_channels(
             plan = QueryPlan(text=text, filters=extract_filters(
                 text, llm=memory._llm, people_vocab=vocab, now=plan.now,
                 model=(meta_cfg.get("params") or {}).get("extract_model") or DEFAULT_EXTRACT_MODEL,
+                calls=extract_calls,
             ))
         state = RecallState(
             conn=conn, bank_id=bank_id, embed=memory._embed,
@@ -650,6 +652,11 @@ def _search_channels(
                       fallback_reason=st.get("fallback_reason"),
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
+        if extract_calls:
+            # The general llm's filter extraction counts in the recall's cost.
+            from prospecta.stages import totals
+            tr["calls"] = extract_calls + list(tr.get("calls") or [])
+            tr["accounting"] = totals(tr["calls"])
     n_out = limit
     if meta_cfg is not None:
         # Scope promotion (design 8.5): hard filter with a small complete set

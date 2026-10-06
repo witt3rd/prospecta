@@ -6,7 +6,8 @@ channel scores a bank's `kind='chunk'` items (`original_chunk`) with Okapi BM25
 OR semantics, entirely in process: no extension and no change to the database.
 
 Per-bank index: built from the bank's chunk items, persisted as gzip JSON under
-`$PROSPECTA_BM25_DIR` (default `~/.cache/prospecta/bm25`), kept in memory, and
+`$PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25` (the bank's own scratch/
+data dir); with neither set nothing is written to disk (never `~/.cache`). Kept in memory, and
 rebuilt whenever the bank's chunk fingerprint (count, newest created_at, id
 hash) differs from the one stored. The index holds postings and item ids only;
 the evidence text is fetched from the database for the top hits.
@@ -136,9 +137,14 @@ FROM memory_items WHERE bank_id = %s AND kind = 'chunk'
 _ITEMS_SQL = "SELECT id, original_chunk FROM memory_items WHERE bank_id = %s AND kind = 'chunk' ORDER BY id"
 
 
-def index_dir() -> Path:
-    return Path(os.environ.get("PROSPECTA_BM25_DIR")
-                or Path.home() / ".cache" / "prospecta" / "bm25")
+def index_dir() -> Path | None:
+    """Where the index is persisted: PROSPECTA_BM25_DIR, else
+    PROSPECTA_DATA_DIR/bm25, else None (in-memory only, no files)."""
+    explicit = os.environ.get("PROSPECTA_BM25_DIR")
+    if explicit:
+        return Path(explicit)
+    data = os.environ.get("PROSPECTA_DATA_DIR")
+    return Path(data) / "bm25" if data else None
 
 
 class InProcessBm25:
@@ -151,7 +157,8 @@ class InProcessBm25:
 
     def _path(self, bank_id: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", bank_id)
-        return (self.directory or index_dir()) / f"{safe}.bm25.json.gz"
+        base = self.directory or index_dir()
+        return base / f"{safe}.bm25.json.gz" if base else None
 
     def _fingerprint(self, conn, bank_id: str) -> list[str]:
         with conn.cursor() as cur:
@@ -160,6 +167,8 @@ class InProcessBm25:
 
     def _load(self, bank_id: str, fp: list[str]) -> Bm25Index | None:
         path = self._path(bank_id)
+        if path is None:
+            return None
         try:
             with gzip.open(path, "rt", encoding="utf-8") as f:
                 blob = json.load(f)
@@ -171,6 +180,8 @@ class InProcessBm25:
 
     def _save(self, bank_id: str, fp: list[str], idx: Bm25Index) -> None:
         path = self._path(bank_id)
+        if path is None:
+            return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")

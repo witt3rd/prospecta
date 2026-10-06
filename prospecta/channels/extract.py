@@ -75,15 +75,18 @@ def _accepts_model(llm) -> bool:
 
 
 def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm,
-                 model: str) -> Filters:
+                 model: str, calls: list | None = None) -> Filters:
     prompt = _PROMPT.format(
         today=now.date().isoformat(), question=text,
         people=", ".join(people_vocab) if people_vocab else "(none)",
     )
     kwargs = {"model": model} if _accepts_model(llm) else {}
     raw = llm(messages=[{"role": "user", "content": prompt}], json_mode=True, **kwargs)
+    from prospecta._llmutil import llm_call_record, llm_text
     from prospecta.stages import parse_json_object  # lazy: stages imports channels
-    data = parse_json_object(raw)  # tolerant: prose or a fence around the JSON
+    if calls is not None:
+        calls.append(llm_call_record(raw, purpose="extract_filters", model=model))
+    data = parse_json_object(llm_text(raw))  # tolerant: prose or a fence around the JSON
     canon = {p.lower(): p for p in people_vocab}
     people: list[str] = []
     for p in data.get("people") or []:
@@ -104,10 +107,11 @@ def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm,
 
 
 def extract_filters(text: str, *, llm, people_vocab: list[str], now: datetime,
-                    model: str = DEFAULT_EXTRACT_MODEL) -> Filters:
+                    model: str = DEFAULT_EXTRACT_MODEL,
+                    calls: list | None = None) -> Filters:
     if llm is not None:
         try:
-            return _llm_filters(text, people_vocab, now, llm, model)
+            return _llm_filters(text, people_vocab, now, llm, model, calls)
         except Exception as exc:  # fall back, never fail the recall
             logger.warning("filter extraction fell back to regex: %s: %s",
                            type(exc).__name__, exc)

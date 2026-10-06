@@ -65,7 +65,11 @@ prospecta retain "Kelly was born March 4th 1990" \
     --index-text "When was Kelly born?"
 ```
 
-`PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (default `all-MiniLM-L6-v2`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
+`PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (sentence-transformers default `all-MiniLM-L6-v2`).
+
+**One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. With `OPENROUTER_API_KEY` set the CLI also builds the Sonnet-5.5 reranker/synth LLMs, Jev and the linker (`PROSPECTA_JEV=off`, `PROSPECTA_LINKER=off` opt out).
+
+**BM25 index files:** persisted only under `PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25`; with neither set the index stays in memory (nothing is written under `~/.cache`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
 ### Health check
 

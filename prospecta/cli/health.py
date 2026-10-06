@@ -21,13 +21,18 @@ def _embedder_kind() -> str:
     return "litellm" if kind in ("", "default", "litellm") else kind
 
 
-def _check_embedder() -> tuple[str, int]:
+def _bank_dim(args) -> int | None:
+    from prospecta.cli import _common
+    return _common.bank_embedding_dim(args.database_url, args.bank)
+
+
+def _check_embedder(dimensions: int | None = None) -> tuple[str, int]:
     from prospecta.cli import _common
 
     kind = _embedder_kind()
     if kind == "sentence-transformers":
         import sentence_transformers  # noqa: F401
-    embed = _common._resolve_embedder()
+    embed = _common._resolve_embedder(dimensions)
     vecs = embed(["prospecta health probe"])
     return kind, len(vecs[0])
 
@@ -39,8 +44,13 @@ def cmd_health(args) -> int:
     except (Exception, SystemExit) as e:
         problems.append(f"database unavailable ({type(e).__name__}: {e})")
     probed = None
+    bank_dim = _bank_dim(args)
     try:
-        probed = _check_embedder()
+        probed = _check_embedder(bank_dim)
+        if bank_dim is not None and probed[1] != bank_dim:
+            problems.append(
+                f"embedder {probed[0]} dim={probed[1]} does not match bank "
+                f"{args.bank!r} embedding_dim={bank_dim}")
     except (Exception, SystemExit) as e:
         problems.append(f"embedder unavailable ({type(e).__name__}: {e})")
     if problems:
