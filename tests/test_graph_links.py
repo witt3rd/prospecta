@@ -404,3 +404,29 @@ def test_reader_type_config_and_hop_with_jev(mem):
     hops = traces[0]["hops"]
     assert hops["reader"] == "jev_reader" and hops["verdict"] == "follow_up"
     assert hops["follow_ups"] and not hops["error"]
+
+
+def test_hub_entity_reached_by_entity_join_not_capped_links(mem):
+    """A hub entity (more holders than ENTITY_HUB) gets no per-anchor links, and
+    GraphExpand still enumerates every holder through memory_item_entities."""
+    n = 14
+    for i in range(n):
+        mem.retain(f"Kelly note {i}", source=f"h{i}", index_text=f"qh{i}")
+    link_all(mem, Linker(llm=EntityLLM(("Kelly",)), entity_hub=5))
+    with conn_of(mem) as c:
+        # once the entity passed the threshold (6th holder) no anchor writes links any more
+        assert c.execute(
+            "SELECT count(*) FROM memory_links l JOIN memory_items a ON a.id = l.src "
+            "JOIN documents d ON d.id = a.document_id WHERE l.link_type='ENTITY' "
+            "AND d.source NOT IN ('h0','h1','h2','h3','h4')").fetchone()[0] == 0
+    ids = docs(mem)
+    out = expand(mem, ids, ["h0"], max_hops=1, hub=5, node_cap=100)
+    assert {c.source for c in out} == {f"h{i}" for i in range(1, n)}      # all 13, not 10
+    # below the hub threshold the entity is linked directly and lossless
+    with conn_of(mem) as c:
+        c.execute("DELETE FROM memory_link_state")
+        c.commit()
+    link_all(mem, Linker(llm=EntityLLM(("Kelly",)), entity_hub=50))
+    with conn_of(mem) as c:
+        assert c.execute("SELECT count(*) FROM memory_links WHERE link_type='ENTITY'"
+                         ).fetchone()[0] == n * (n - 1)

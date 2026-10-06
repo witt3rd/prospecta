@@ -8,7 +8,8 @@ with Memory.link_document / link_pending). For one document it
    the note's date and person, no model call;
 2. extracts entities with the injected `llm` (Sonnet), fills
    memory_entities / memory_item_entities and writes SHARED_ENTITY links to the
-   other items that mention them (a join, capped per entity);
+   other items that mention them (a join; entities held by more than ENTITY_HUB items are hubs and get no
+   per-anchor links: GraphExpand reaches their holders through the entity table);
 3. links semantically related items: the top neighbours of each anchor item by
    pgvector, in SQL. With a `judge` (JevRelationJudge) Jev answers the typed
    relation questions (semantic, causes, caused_by; threshold 0.6) and the rows
@@ -32,6 +33,7 @@ from typing import Any, Protocol
 import psycopg.errors
 
 from prospecta._template import render_prompt
+from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
     JEV_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_PASSAGE_CHARS, JEV_TIMEOUT_S,
     JevTransport, call_llm, parse_json_object, totals,
@@ -45,7 +47,6 @@ VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 VECTOR_TOP = 5
 TEMPORAL_DAYS = 3
 TEMPORAL_CLOSE_CAP = 5
-ENTITY_CAP = 10            # items linked per shared entity
 DEADLOCK_RETRIES = 6       # attempts per step on deadlock / serialization failure
 DEADLOCK_BACKOFF_S = 0.05  # first backoff; doubles with jitter
 ETYPES = {"person", "org", "place", "project", "product", "event", "other"}
@@ -121,6 +122,10 @@ FROM (
     FROM memory_item_entities a
     JOIN memory_items ai ON ai.id = a.item_id
     JOIN memory_entities e ON e.id = a.entity_id
+    CROSS JOIN LATERAL (   -- a hub entity gets no per-anchor links (a cap would drop holders)
+        SELECT count(*) AS n FROM (SELECT 1 FROM memory_item_entities x
+                                   WHERE x.entity_id = a.entity_id LIMIT %(cap)s + 1) q
+    ) hc
     CROSS JOIN LATERAL (
         SELECT ie.item_id FROM memory_item_entities ie
         JOIN memory_items bi ON bi.id = ie.item_id
@@ -128,7 +133,7 @@ FROM (
           AND bi.kind = ai.kind
         ORDER BY bi.created_at DESC, bi.id LIMIT %(cap)s
     ) b
-    WHERE ai.document_id = %(doc)s
+    WHERE ai.document_id = %(doc)s AND hc.n <= %(cap)s
 ) x
 GROUP BY x.a_item, x.b_item
 ORDER BY x.a_item, x.b_item
@@ -264,7 +269,7 @@ class Linker:
     model: str | None = None
     neighbours: int = NEIGHBOURS
     temporal_days: int = TEMPORAL_DAYS
-    entity_cap: int = ENTITY_CAP
+    entity_hub: int = ENTITY_HUB
     vector_floor: float = VECTOR_FLOOR
     asynchronous: bool = True      # Memory runs it on a worker thread after retain
 
@@ -378,7 +383,7 @@ class Linker:
                             "VALUES (%s, %s, 1) ON CONFLICT DO NOTHING", (anchors[0]["id"], eid))
                     stats["entities"] += 1
         with conn.cursor() as cur:
-            cur.execute(_SHARED_ENTITY, {"bank": bank_id, "doc": doc, "cap": self.entity_cap})
+            cur.execute(_SHARED_ENTITY, {"bank": bank_id, "doc": doc, "cap": self.entity_hub})
             stats["entity_links"] = cur.rowcount
 
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
