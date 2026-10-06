@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -323,34 +323,34 @@ wheels = [
 
 [package.optional-dependencies]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -1458,6 +1458,7 @@ version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
+    { name = "litellm" },
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyyaml" },
@@ -1482,23 +1483,28 @@ embed-openai-compatible = [
 embed-sentence-transformers = [
     { name = "sentence-transformers" },
 ]
+embedder = [
+    { name = "sentence-transformers" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "litellm", specifier = ">=1.0" },
     { name = "litellm", marker = "extra == 'defaults'", specifier = ">=1.0" },
     { name = "litellm", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'embed-openai'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'embed-openai-compatible'", specifier = ">=1.0" },
     { name = "pgvector", specifier = ">=0.4" },
+    { name = "prospecta", extras = ["embedder"], marker = "extra == 'embed-sentence-transformers'" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "sentence-transformers", marker = "extra == 'embed-sentence-transformers'", specifier = ">=2.5" },
+    { name = "sentence-transformers", marker = "extra == 'embedder'", specifier = ">=2.5" },
     { name = "testcontainers", extras = ["postgres"], marker = "extra == 'dev'", specifier = ">=4" },
 ]
-provides-extras = ["dev", "defaults", "embed-sentence-transformers", "embed-openai", "embed-openai-compatible"]
+provides-extras = ["dev", "defaults", "embedder", "embed-sentence-transformers", "embed-openai", "embed-openai-compatible"]
 
 [[package]]
 name = "psycopg"

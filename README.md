@@ -30,7 +30,8 @@ pip install prospecta
 pip install 'prospecta[defaults]'
 
 # Or single-provider minimal-deps paths
-pip install 'prospecta[embed-sentence-transformers]'   # local, no API key
+pip install 'prospecta[embedder]'                      # local sentence-transformers, no API key
+                                                       # (embed-sentence-transformers is a backward-compatible alias)
 pip install 'prospecta[embed-openai]'                  # direct OpenAI HTTP
 pip install 'prospecta[embed-openai-compatible]'       # infinity-emb, vLLM, etc.
 ```
@@ -55,7 +56,7 @@ prospecta search "Kelly birthday"
 The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. To run the write path with **no API key** — local sentence-transformers embeddings — pair it with `--index-text` (which skips the LLM `index_text` generation, per P4):
 
 ```bash
-pip install 'prospecta[embed-sentence-transformers]'
+pip install 'prospecta[embedder]'
 prospecta create-bank --id local --embedding-dim 384   # all-MiniLM-L6-v2 is 384-dim
 PROSPECTA_EMBEDDER=sentence-transformers \
 PROSPECTA_BANK=local \
@@ -65,6 +66,10 @@ prospecta retain "Kelly was born March 4th 1990" \
 ```
 
 `PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (default `all-MiniLM-L6-v2`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
+
+### Health check
+
+`prospecta health` probes the database (`DATABASE_URL`) and the configured embedder (including that `sentence_transformers` imports when selected). It prints one line and exits 0 with `PROSPECTA OK: ...` (naming the embedder probed), or exits 1 with `PROSPECTA DOWN: ...`.
 
 ---
 
