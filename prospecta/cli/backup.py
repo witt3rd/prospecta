@@ -4,7 +4,7 @@ Plain-SQL pg_dump of the whole database (all banks, pgvector data included),
 replayed with psql. Connection comes from --database-url / DATABASE_URL.
 
 A newer pg_dump client emits `SET transaction_timeout`, which older servers
-reject; restore drops that line so client/server version skew is harmless.
+reject; restore drops that line from the dump header (never COPY data) so client/server version skew is harmless.
 """
 from __future__ import annotations
 
@@ -39,9 +39,15 @@ def cmd_restore(args) -> int:
     if not url:
         return 1
     with open(args.path, encoding="utf-8") as f:
-        sql = "".join(
-            line for line in f if not line.startswith("SET transaction_timeout")
-        )
+        lines = []
+        in_header = True
+        for line in f:
+            if in_header and line.startswith("COPY "):
+                in_header = False
+            if in_header and line.startswith("SET transaction_timeout"):
+                continue
+            lines.append(line)
+        sql = "".join(lines)
     r = subprocess.run(
         ["psql", "--dbname", url, "-v", "ON_ERROR_STOP=1", "--single-transaction",
          "--quiet", "--file", "-"],

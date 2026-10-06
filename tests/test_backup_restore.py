@@ -12,6 +12,8 @@ from tests._stub_embedder import stub_embed, stub_llm
 
 
 def test_backup_restore_roundtrip(populated_corpus, fresh_db, pg_url, tmp_path):
+    tricky = "intro\nSET transaction_timeout = 0;\noutro marker-zebra"
+    populated_corpus.retain(tricky, index_text=["zebra marker"], source="tricky")
     dump = tmp_path / "bank.sql"
     assert main(["--database-url", fresh_db, "backup", str(dump)]) == 0
     assert dump.stat().st_size > 0
@@ -26,6 +28,8 @@ def test_backup_restore_roundtrip(populated_corpus, fresh_db, pg_url, tmp_path):
         try:
             hits = mem.recall(["When is Kelly's birthday?"])
             assert any("Kelly" in h.content for h in hits)
+            hits = mem.recall(["zebra marker"])
+            assert any(h.content == tricky for h in hits)
         finally:
             mem.close()
     finally:
