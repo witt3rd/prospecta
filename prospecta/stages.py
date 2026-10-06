@@ -455,10 +455,21 @@ def run_stages(
     """Rerank, then (optionally) read and hop. Returns the final document
     order (all pool docs, best first) and {rerank, hops, calls, **totals}."""
     calls: list[dict] = []
-    trace: dict = {"rerank": None, "hops": None, "calls": calls}
+    trace: dict = {"rerank": None, "hops": None, "calls": calls, **totals(calls)}
+    try:
+        return _run_stages(state, query, fused, channel_config, recall_cfg, deps, k,
+                           calls, trace)
+    except Exception as exc:
+        trace.update(rerank=None, hops=None, **totals(calls),
+                     fallback_reason=f"{type(exc).__name__}: {exc}")
+        return fused, trace
+
+
+def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls, trace):
     reranker = build_reranker(recall_cfg, llm=deps.llm, jev=deps.jev, model=deps.model)
     reader_cfg = recall_cfg.get("reader") or {}
     if reranker is None and not reader_cfg.get("enabled"):
+        trace.update(totals(calls))
         return fused, trace
 
     pool_n = int((recall_cfg.get("rerank") or {}).get("pool", RERANK_POOL))

@@ -278,3 +278,13 @@ def test_validate_recall_config():
                 {"rerank": {"pool": 0}}, []):
         with pytest.raises(ValueError):
             validate_recall_config(bad)
+
+
+def test_run_stages_misconfiguration_falls_back_to_fused_order():
+    from prospecta.stages import StageDeps, run_stages
+
+    fused = ["a", "b"]
+    out, trace = run_stages(None, "q", fused, [], {"rerank": {"enabled": True}}, StageDeps())
+    assert out == fused
+    assert trace["fallback_reason"]
+    assert trace["n_llm_calls"] == 0
