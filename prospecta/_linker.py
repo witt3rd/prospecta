@@ -71,12 +71,6 @@ WITH me AS (
            d.document_metadata->>'person' AS person
     FROM documents d WHERE d.id = %(doc)s
 ),
-rep AS (   -- one representative item per note: the first anchor
-    SELECT DISTINCT ON (d.id) d.id AS doc, m.id AS item
-    FROM documents d JOIN memory_items m ON m.document_id = d.id
-    WHERE d.bank_id = %(bank)s
-    ORDER BY d.id, (m.kind = 'chunk') DESC, m.ordinal NULLS LAST, m.id
-),
 others AS (
     SELECT d.id, d.created_at, prospecta_doc_date(d.document_metadata, d.created_at) AS dt
     FROM documents d, me
@@ -89,6 +83,14 @@ nxt AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) > (me.dt,
         ORDER BY o.dt, o.created_at, o.id LIMIT 1),
 near AS (SELECT o.id, abs(o.dt - me.dt) AS days FROM others o, me
           WHERE abs(o.dt - me.dt) <= %(days)s ORDER BY abs(o.dt - me.dt), o.id LIMIT %(cap)s),
+rep AS (   -- one representative item per note: the first anchor
+    SELECT DISTINCT ON (d.id) d.id AS doc, m.id AS item
+    FROM documents d JOIN memory_items m ON m.document_id = d.id
+    WHERE d.bank_id = %(bank)s
+      AND d.id IN (SELECT id FROM me UNION SELECT id FROM prev
+                   UNION SELECT id FROM nxt UNION SELECT id FROM near)
+    ORDER BY d.id, (m.kind = 'chunk') DESC, m.ordinal NULLS LAST, m.id
+),
 edges(a, b, subtype, conf) AS (
     SELECT p.id, me.id, 'PRECEDES', 1.0::real FROM prev p, me
     UNION ALL SELECT me.id, p.id, 'SUCCEEDS', 1.0 FROM prev p, me
