@@ -15,7 +15,6 @@ import psycopg
 from typing import Literal
 
 from prospecta._types import EmbedCallable, LLMCallable, Query, RAGResult, RecalledMemory, Tracer
-from prospecta.stages import SONNET_MODEL
 from prospecta.db.pool import ConnectionPool
 from prospecta.db.queries import (
     HNSW_INDEX_TEMPLATE,
@@ -139,7 +138,7 @@ class Memory:
         shadow_embed: EmbedCallable | None = None,
         rerank_llm: LLMCallable | None = None,
         rerank_model: str | None = None,
-        synth_model: str | None = None,
+        synth_llm: LLMCallable | None = None,
         jev: "Any | None" = None,
         linker: "Any | None" = None,
     ) -> None:
@@ -152,7 +151,7 @@ class Memory:
         # back to `llm`; `jev` is a prospecta.stages.JevScore (None = no Jev).
         self._rerank_llm = rerank_llm
         self._rerank_model = rerank_model
-        self._synth_model = synth_model or SONNET_MODEL
+        self._synth_llm = synth_llm
         self._jev = jev
         # Linker (prospecta._linker.Linker): typed links + entities after retain.
         # None = no linking; with `asynchronous` it runs on one worker thread.
@@ -648,8 +647,7 @@ class Memory:
                 notes, set_mode = _synth.gather_evidence(
                     conn, bank_id, blended, top=evidence_top, scope=scope)
             grounded_res = _synth.synthesize_grounded(
-                message, notes, self._llm, set_mode=set_mode,
-                model=self._synth_model)
+                message, notes, self._synth_llm or self._llm, set_mode=set_mode)
             synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt
         else:
             synthesis, synth_prompt = _rag.synthesize(

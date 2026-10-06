@@ -282,7 +282,7 @@ def judge_answer(llm, question: str, expected: str, answer: str) -> tuple[bool, 
 def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> dict:
     """Grounded recall_synth on every question; with `judge`, answer-correct
     against `answer:` (questions without one are not judged)."""
-    rows, correct, judged = [], 0, 0
+    rows, correct, judged, models = [], 0, 0, []
     cost = {"synthesis_cost_usd": 0.0, "judge_cost_usd": 0.0}
     lat = {"recall_synth_ms": 0, "judge_ms": 0}
     for q in questions:
@@ -290,6 +290,8 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
         res = memory.recall_synth(q.text, grounded=True)
         ms = int((time.monotonic() - t0) * 1000)
         lat["recall_synth_ms"] += ms
+        if res.synth_call.get("model") and res.synth_call["model"] not in models:
+            models.append(res.synth_call["model"])
         cost["synthesis_cost_usd"] += float(res.synth_call.get("cost_usd") or 0.0)
         row = {"id": q.id, "synthesis": res.synthesis, "latency_ms": ms,
                "citations": [c["note"] for c in res.citations],
@@ -308,6 +310,8 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
     n = max(len(rows), 1)
     return {
         "n": len(rows), "judged": judged, "answer_correct": correct,
+        "synthesis_llm": "synth_llm" if memory._synth_llm else "general llm",
+        "synthesis_models": models or ["unreported"],
         "answer_correct_rate": (correct / judged) if judged else None,
         "cited_gold_rate": sum(r["cited_gold"] for r in rows) / n,
         "not_in_memory": sum(r["synthesis"].strip().lower().startswith("not in memory")
@@ -383,7 +387,8 @@ def format_report(r: dict) -> str:
         s = r["synthesis"]
         L.append(f"synthesis: {s['n']} answered, cited a gold note {s['cited_gold_rate']:.2f}, "
                  f"'not in memory' {s['not_in_memory']}, mean {s['mean_recall_synth_ms']:.0f} ms, "
-                 f"synthesis ${s['synthesis_cost_usd']:.4f}")
+                 f"synthesis ${s['synthesis_cost_usd']:.4f} "
+                 f"({s['synthesis_llm']}, model: {', '.join(s['synthesis_models'])})")
         if s["judged"]:
             L.append(f"  answer-correct {s['answer_correct']}/{s['judged']} "
                      f"({s['answer_correct_rate']:.2f}), judge ${s['judge_cost_usd']:.4f}")

@@ -152,15 +152,15 @@ def extract_citations(text: str, notes: list[NoteEvidence]) -> list[dict]:
 
 
 def synthesize_grounded(query: str, notes: list[NoteEvidence], llm, *,
-                        set_mode: bool = False, model: str | None = None) -> GroundedResult:
+                        set_mode: bool = False) -> GroundedResult:
     prompt = render_prompt("synthesize-grounded", {
         "query": query, "context": render_context(notes), "set_mode": set_mode})
     t0 = time.monotonic()
     out = llm(messages=[{"role": "user", "content": prompt}])
-    call = {"purpose": "synthesize_grounded", "model": model, "tokens_in": None,
+    call = {"purpose": "synthesize_grounded", "model": None, "tokens_in": None,
             "tokens_out": None, "cost_usd": None}
     if not isinstance(out, str):   # an LLMResult: text plus accounting
-        call.update(model=getattr(out, "model", None) or model,
+        call.update(model=getattr(out, "model", None),
                     tokens_in=getattr(out, "tokens_in", None),
                     tokens_out=getattr(out, "tokens_out", None),
                     cost_usd=getattr(out, "cost_usd", None))

@@ -125,35 +125,41 @@ def test_grounded_not_in_memory_has_no_citations(mem):
     assert res.synthesis == "not in memory" and res.citations == []
 
 
-def test_synth_call_labelled_with_synthesis_model(fresh_db):
-    class Bare(SynthLLM):
-        def __call__(self, messages, *, json_mode=False):
-            out = super().__call__(messages, json_mode=json_mode)
-            return out if json_mode else out.text
+def _bare(answer="Cats [alpha.md]"):
+    def llm(messages, *, json_mode=False):
+        return json.dumps({"queries": [{"text": "cat sat"}]}) if json_mode else answer
+    return llm
 
-    def build(llm, **kw):
-        m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed,
-                   rerank_model="rerank-x", **kw)
-        return m
 
-    m = build(Bare())
-    from prospecta._synth import synthesize_grounded
-    notes = [NoteEvidence("alpha.md", "d1", ["x"])]
-    assert synthesize_grounded("q", notes, Bare(), model=m._synth_model).call["model"] == \
-        "anthropic/claude-sonnet-5.5"
-    assert build(Bare(), synth_model="custom")._synth_model == "custom"
-    got = synthesize_grounded("q", notes, SynthLLM(), model="custom").call["model"]
-    assert got == "stub-sonnet"
+def _seeded(fresh_db, **kw):
+    m = Memory(database_url=fresh_db, bank_id="b", embed=stub_embed, **kw)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.retain("cat sat", source="alpha.md", index_text="cat sat")
+    return m
+
+
+def test_synth_llm_used_when_given_and_label_from_result(fresh_db):
+    general, synth = SynthLLM("general [alpha.md]"), SynthLLM("synth [alpha.md]")
+    m = _seeded(fresh_db, llm=general, synth_llm=synth, rerank_model="rerank-x")
+    res = m.recall_synth("cat sat", grounded=True)
+    assert res.synthesis == "synth [alpha.md]"
+    assert synth.prompts and not general.prompts
+    assert res.synth_call["model"] == "stub-sonnet"
     m.close()
 
 
-def test_recall_synth_call_never_uses_rerank_model(fresh_db):
-    m = Memory(database_url=fresh_db, bank_id="b", llm=lambda messages, json_mode=False:
-               (json.dumps({"queries": [{"text": "cat"}]}) if json_mode else "Cats [a.md]"),
-               embed=stub_embed, rerank_model="rerank-x")
-    m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
-    m.retain("cat sat", source="a.md", index_text="cat sat")
-    res = m.recall_synth("cat", grounded=True)
-    assert res.synth_call["model"] == "anthropic/claude-sonnet-5.5"
+def test_synth_falls_back_to_general_llm_label_none_when_unreported(fresh_db):
+    m = _seeded(fresh_db, llm=_bare(), rerank_model="rerank-x")
+    res = m.recall_synth("cat sat", grounded=True)
+    assert res.synthesis == "Cats [alpha.md]"
+    assert res.synth_call["model"] is None
+    m.close()
+
+
+def test_synth_falls_back_to_general_llm_label_from_result(fresh_db):
+    general = SynthLLM("g [alpha.md]")
+    m = _seeded(fresh_db, llm=general)
+    res = m.recall_synth("cat sat", grounded=True)
+    assert general.prompts and res.synth_call["model"] == "stub-sonnet"
     m.close()
