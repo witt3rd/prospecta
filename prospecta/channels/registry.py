@@ -3,14 +3,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from prospecta.channels.bm25 import Bm25Chunks
 from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks
 
 REGISTRY: dict[str, type] = {
     DenseChunks.name: DenseChunks,
     AnticipatedQuestions.name: AnticipatedQuestions,
+    Bm25Chunks.name: Bm25Chunks,
 }
 
-# The measured weights (design 8.2) for the channels built so far.
+# The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
+# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {"limit": 50}},
     {"name": "question", "enabled": True, "weight": 1, "params": {"limit": 50}},
