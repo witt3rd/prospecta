@@ -123,3 +123,37 @@ def test_grounded_not_in_memory_has_no_citations(mem):
     mem.llm.answer = "not in memory"
     res = mem.recall_synth("cat sat", grounded=True)
     assert res.synthesis == "not in memory" and res.citations == []
+
+
+def test_synth_call_labelled_with_synthesis_model(fresh_db):
+    class Bare(SynthLLM):
+        def __call__(self, messages, *, json_mode=False):
+            out = super().__call__(messages, json_mode=json_mode)
+            return out if json_mode else out.text
+
+    def build(llm, **kw):
+        m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed,
+                   rerank_model="rerank-x", **kw)
+        return m
+
+    m = build(Bare())
+    from prospecta._synth import synthesize_grounded
+    notes = [NoteEvidence("alpha.md", "d1", ["x"])]
+    assert synthesize_grounded("q", notes, Bare(), model=m._synth_model).call["model"] == \
+        "anthropic/claude-sonnet-5.5"
+    assert build(Bare(), synth_model="custom")._synth_model == "custom"
+    got = synthesize_grounded("q", notes, SynthLLM(), model="custom").call["model"]
+    assert got == "stub-sonnet"
+    m.close()
+
+
+def test_recall_synth_call_never_uses_rerank_model(fresh_db):
+    m = Memory(database_url=fresh_db, bank_id="b", llm=lambda messages, json_mode=False:
+               (json.dumps({"queries": [{"text": "cat"}]}) if json_mode else "Cats [a.md]"),
+               embed=stub_embed, rerank_model="rerank-x")
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.retain("cat sat", source="a.md", index_text="cat sat")
+    res = m.recall_synth("cat", grounded=True)
+    assert res.synth_call["model"] == "anthropic/claude-sonnet-5.5"
+    m.close()
