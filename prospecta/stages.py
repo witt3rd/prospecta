@@ -651,6 +651,7 @@ def _hop(state, query, items, channel_config, rcfg, reranker, reader, calls, k):
 
     cheap = [e for e in channel_config if e.get("name") in CHEAP_CHANNELS]
     lists: list[list[FusedDoc]] = []
+    main_lists = state.channel_lists   # run_channels overwrites it; scope promotion needs the main run's meta list
     for fq in follow_ups:   # cheap channels only; one failed follow-up skips only itself
         try:
             fused, tr = run_channels(state, QueryPlan(text=fq), cheap, k=k, pool=max_new + join_top)
@@ -660,6 +661,7 @@ def _hop(state, query, items, channel_config, rcfg, reranker, reader, calls, k):
                     hops["error"] = f"{c['name']}: {c['error']}"
         except Exception as exc:
             hops["error"] = f"{type(exc).__name__}: {exc}"
+    state.channel_lists = main_lists
     keep = {it.doc.document_id for it in items[:join_top]}
     new: list[FusedDoc] = []
     for rank in range(max((len(l) for l in lists), default=0)):   # round-robin by rank

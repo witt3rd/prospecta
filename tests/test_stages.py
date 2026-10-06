@@ -291,6 +291,29 @@ def test_reader_follow_ups_join_new_notes_and_rerank_again(mem):
     assert {"delta.md", "echo.md"} <= set(sources(res))
 
 
+def test_hop_keeps_scope_promotion(mem):
+    # a hard filter selects delta.md and echo.md (person Alice); the hop's
+    # cheap-only channel run must not drop the main run's meta list
+    with psycopg.connect(mem.database_url) as conn:
+        conn.execute("UPDATE documents SET person = 'Alice' WHERE source = ANY(%s)",
+                     (["delta.md", "echo.md"],))
+        conn.commit()
+
+    def extract_llm(messages, *, json_mode=False):
+        return json.dumps({"people": ["Alice"], "date_from": None, "date_to": None, "hard": True})
+    mem._llm = extract_llm
+    mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["cat sat mat"]})
+    mem.set_recall_config({"rerank": {"enabled": True},
+                           "reader": {"enabled": True, "join_top": 1, "top": 1, "max_new": 2}})
+    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    res = mem.recall([QUERY], limit=5)
+    h = last_event(mem, "hops")[0]["per_query"][0]
+    assert h["verdict"] == "follow_up" and h["new_candidates"]   # the hop really fired
+    fusion = last_event(mem, "fusion")[0]
+    assert len(fusion["scope_promoted"]) == 2
+    assert set(sources(res)[:2]) == {"delta.md", "echo.md"}
+
+
 def test_reader_failure_is_recorded_and_order_stands(mem):
     class Bad(StubLLM):
         def __call__(self, messages, *, json_mode=False):

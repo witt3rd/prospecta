@@ -82,9 +82,8 @@ def _llm_filters(text: str, people_vocab: list[str], now: datetime, llm,
     )
     kwargs = {"model": model} if _accepts_model(llm) else {}
     raw = llm(messages=[{"role": "user", "content": prompt}], json_mode=True, **kwargs)
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError("extraction JSON is not an object")
+    from prospecta.stages import parse_json_object  # lazy: stages imports channels
+    data = parse_json_object(raw)  # tolerant: prose or a fence around the JSON
     canon = {p.lower(): p for p in people_vocab}
     people: list[str] = []
     for p in data.get("people") or []:

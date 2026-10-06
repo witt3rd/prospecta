@@ -54,6 +54,23 @@ def test_bad_llm_output_falls_back_to_regex(bad):
     assert f.people == ["Bob Stone"] and f.date_from == "2024-03-01" and f.hard is False
 
 
+GOOD = {"people": ["Alice"], "date_from": "2024-03-01", "date_to": "2024-03-31", "hard": True}
+WANT = Filters(people=["Alice"], date_from="2024-03-01", date_to="2024-03-31", hard=True)
+
+
+@pytest.mark.parametrize("wrap", [
+    "```json\n{j}\n```",
+    "```\n{j}\n```",
+    "Here is the extraction:\n{j}",
+    "Sure! Here you go:\n```json\n{j}\n```\nLet me know if you need more.",
+    "{j}\n\nNote: hard is true because the question names a month.",
+])
+def test_llm_extraction_tolerates_prose_and_fences(wrap):
+    llm = llm_returning(wrap.format(j=json.dumps(GOOD)))
+    assert extract_filters("what did Alice do in March 2024", llm=llm,
+                           people_vocab=VOCAB, now=NOW) == WANT
+
+
 def test_llm_exception_and_no_llm_fall_back_to_regex():
     def boom(messages, *, json_mode=False):
         raise RuntimeError("down")
