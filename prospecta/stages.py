@@ -53,8 +53,12 @@ SONNET_MODEL = "anthropic/claude-sonnet-5.5"
 
 STAGES = ("sonnet_listwise", "jev_score")
 
+BLEND_DEFAULTS = {"weight_rerank": 0.7, "weight_fused": 0.3, "keep": 3, "within": 10}
+
 DEFAULT_RECALL_CONFIG: dict = {
-    "rerank": {"enabled": True, "stage": "sonnet_listwise", "pool": RERANK_POOL},
+    "rerank": {"enabled": True, "stage": "sonnet_listwise", "pool": RERANK_POOL,
+               "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3,
+                         "keep": 3, "within": 10}},
     "gate": {"enabled": False, "threshold": JEV_GATE_THRESHOLD},
     "reader": {"enabled": False, "top": 8, "join_top": 15,
                "max_follow_ups": 2, "max_new": 10},
@@ -77,6 +81,20 @@ def validate_recall_config(cfg: dict) -> None:
             raise ValueError("gate needs rerank enabled (the stage it hands over to)")
         if rr.get("stage", "sonnet_listwise") != "sonnet_listwise":
             raise ValueError("gate needs rerank.stage = sonnet_listwise")
+    bl = rr.get("blend") or {}
+    if not isinstance(bl, dict) or set(bl) - set(BLEND_DEFAULTS) - {"enabled"}:
+        raise ValueError("rerank.blend must be an object of enabled/weight_rerank/"
+                         "weight_fused/keep/within")
+    for name in ("weight_rerank", "weight_fused"):
+        v = bl.get(name)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+            raise ValueError(f"blend.{name} must be a number >= 0")
+    for name in ("keep", "within"):
+        v = bl.get(name)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+            raise ValueError(f"blend.{name} must be an integer >= 1")
+    if int(bl.get("keep", BLEND_DEFAULTS["keep"])) > int(bl.get("within", BLEND_DEFAULTS["within"])):
+        raise ValueError("blend.keep must be <= blend.within")
     for section, name, lo in (
         (rr, "pool", 1), (rd, "top", 1), (rd, "join_top", 1),
         (rd, "max_follow_ups", 1), (rd, "max_new", 1),
@@ -421,7 +439,61 @@ class JevGate:
         return res
 
 
+def blend_order(items: list[Item], order: list[int], *, weight_rerank: float,
+                weight_fused: float, keep: int, within: int) -> list[int]:
+    """Blend the reranker's order with the fused order instead of replacing it.
+    score = weight_rerank * rank_score(reranker position) + weight_fused *
+    (fused RRF score / best fused RRF score); rank_score runs 1.0 (first) to 0.0
+    (last). Floor: the fused top `keep` always stay inside the first `within`."""
+    n = len(order)
+    if n < 2:
+        return list(order)
+    top_fused = max(it.doc.score for it in items) or 1.0
+    blended = {}
+    for pos, i in enumerate(order):
+        blended[i] = (weight_rerank * (1 - pos / (n - 1))
+                      + weight_fused * items[i].doc.score / top_fused)
+    final = sorted(order, key=lambda i: (-blended[i], order.index(i)))
+    protected = sorted(range(len(items)), key=lambda i: -items[i].doc.score)[:keep]
+    head = final[:within]
+    missing = [i for i in protected if i not in head]
+    for _ in missing:
+        drop = next((i for i in reversed(head) if i not in protected), None)
+        if drop is None:
+            break
+        head.remove(drop)
+    head += missing[:within - len(head)]
+    head.sort(key=lambda i: (-blended[i], order.index(i)))
+    return head + [i for i in final if i not in head]
+
+
+class BlendedReranker:
+    """Wraps a Reranker so its order is blended with the fused order."""
+
+    def __init__(self, inner: Reranker, blend: dict):
+        self.inner = inner
+        self.params = {k: blend.get(k, d) for k, d in BLEND_DEFAULTS.items()}
+        self.name = getattr(inner, "name", "?")
+
+    def rerank(self, query: str, items: list[Item], calls: list[dict]) -> Outcome:
+        out = self.inner.rerank(query, items, calls)
+        before = out.order
+        out.order = blend_order(items, before, **self.params)
+        out.record = {**out.record, "blend": {**self.params, "moved": out.order != before}}
+        return out
+
+
 def build_reranker(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None):
+    """The configured Reranker (blended with the fused order unless
+    rerank.blend.enabled is false), or None when reranking is off."""
+    inner = _build_inner(cfg, llm=llm, jev=jev, model=model)
+    blend = (cfg.get("rerank") or {}).get("blend") or {}
+    if inner is None or not blend.get("enabled", True):
+        return inner
+    return BlendedReranker(inner, blend)
+
+
+def _build_inner(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None):
     """The configured Reranker, or None when reranking is off."""
     rr = cfg.get("rerank") or {}
     if not rr.get("enabled"):
