@@ -345,3 +345,61 @@ def test_run_stages_misconfiguration_falls_back_to_fused_order():
     assert out == fused
     assert trace["fallback_reason"]
     assert trace["n_llm_calls"] == 0
+
+
+# ------------------------------------------------------------- rerank blend
+
+def _items(n):
+    from prospecta.channels.fusion import FusedDoc
+    from prospecta.stages import Item
+    # d0 is the channel-agreed top hit (two channels at rank 1), the rest single-channel
+    return [Item(doc=FusedDoc(document_id=f"d{i}", source=f"s{i}",
+                              score=2 / 61 if i == 0 else 1 / (60 + i), best=None),
+                 header="", evidence="") for i in range(n)]
+
+
+class _DemoteTop:
+    """Stub reranker: moves the fused/dense top hit to rank 11, reverses nothing else."""
+    name = "stub"
+
+    def rerank(self, query, items, calls):
+        from prospecta.stages import Outcome
+        order = list(range(1, len(items)))
+        order.insert(10, 0)
+        return Outcome(order=order)
+
+
+def test_blend_alone_keeps_fused_top_inside_first_n():
+    from prospecta.stages import BlendedReranker
+    items = _items(30)
+    out = BlendedReranker(_DemoteTop(), {"enabled": True}).rerank("q", items, [])
+    assert out.order.index(0) < 10 and out.record["blend"]["floor"] is False
+    assert sorted(out.order) == list(range(30))
+
+
+def test_optional_floor_guarantees_top_k_even_with_rerank_only_weights():
+    from prospecta.stages import BlendedReranker
+    items = _items(30)
+    rerank_only = {"weight_rerank": 1.0, "weight_fused": 0.0}
+    out = BlendedReranker(_DemoteTop(), rerank_only).rerank("q", items, [])
+    assert out.order.index(0) == 10                       # no floor: the demotion stands
+    out = BlendedReranker(_DemoteTop(), {**rerank_only, "floor": True}).rerank("q", items, [])
+    assert out.order.index(0) < 10 and sorted(out.order) == list(range(30))
+
+
+def test_blend_off_is_old_behaviour():
+    from prospecta.stages import build_reranker
+    rr = build_reranker({"rerank": {"enabled": True, "blend": {"enabled": False}}},
+                        llm=lambda *a, **k: "", jev=None)
+    assert type(rr).__name__ == "SonnetListwise"
+    on = build_reranker({"rerank": {"enabled": True}}, llm=lambda *a, **k: "", jev=None)
+    assert type(on).__name__ == "BlendedReranker"
+    assert _DemoteTop().rerank("q", _items(30), []).order.index(0) == 10
+
+
+def test_blend_config_validation():
+    from prospecta.stages import validate_recall_config
+    validate_recall_config({"rerank": {"blend": {"floor": True, "keep": 3, "within": 10}}})
+    for bad in ({"keep": 11}, {"floor": "yes"}, {"weight_fused": -1}, {"bogus": 1}):
+        with pytest.raises(ValueError):
+            validate_recall_config({"rerank": {"blend": bad}})
