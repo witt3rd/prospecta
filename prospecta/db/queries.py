@@ -340,6 +340,10 @@ def append_recall_event(
     rerank: dict | None = None,
     hops: dict | None = None,
     candidates: list[dict] | None = None,
+    cost_usd: float | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    n_llm_calls: int | None = None,
 ) -> int:
     """INSERT a row into recall_events (and its recall_event_candidates).
 
@@ -362,13 +366,15 @@ def append_recall_event(
             """
             INSERT INTO recall_events
                 (bank_id, queries, mode, n_results, duration_ms, trace,
-                 results, synthesis, plan, channels, fusion, rerank, hops)
+                 results, synthesis, plan, channels, fusion, rerank, hops,
+                 cost_usd, tokens_in, tokens_out, n_llm_calls)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
                  %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
                  %(results)s::jsonb, %(synthesis)s, %(plan)s::jsonb,
                  %(channels)s::jsonb, %(fusion)s::jsonb, %(rerank)s::jsonb,
-                 %(hops)s::jsonb)
+                 %(hops)s::jsonb, %(cost_usd)s, %(tokens_in)s,
+                 %(tokens_out)s, %(n_llm_calls)s)
             RETURNING id
             """,
             {
@@ -385,6 +391,10 @@ def append_recall_event(
                 "fusion": _dumps(fusion),
                 "rerank": _dumps(rerank),
                 "hops": _dumps(hops),
+                "cost_usd": cost_usd,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "n_llm_calls": n_llm_calls,
             },
         )
         event_id = cur.fetchone()[0]
@@ -571,6 +581,10 @@ def append_llm_call(
     error: str | None = None,
     prompt_text: str | None = None,
     response_text: str | None = None,
+    model: str | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    cost_usd: float | None = None,
 ) -> None:
     """Append a row to llm_calls (schema.md §1; migration 0003).
 
@@ -584,11 +598,13 @@ def append_llm_call(
             """
             INSERT INTO llm_calls
                 (bank_id, prompt_name, messages_count, json_mode,
-                 duration_ms, error, prompt_text, response_text)
+                 duration_ms, error, prompt_text, response_text,
+                 model, tokens_in, tokens_out, cost_usd)
             VALUES
                 (%(bank_id)s, %(prompt_name)s, %(messages_count)s,
                  %(json_mode)s, %(duration_ms)s, %(error)s,
-                 %(prompt_text)s, %(response_text)s)
+                 %(prompt_text)s, %(response_text)s,
+                 %(model)s, %(tokens_in)s, %(tokens_out)s, %(cost_usd)s)
             """,
             {
                 "bank_id": bank_id,
@@ -599,6 +615,10 @@ def append_llm_call(
                 "error": error,
                 "prompt_text": prompt_text,
                 "response_text": response_text,
+                "model": model,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cost_usd": cost_usd,
             },
         )
 

@@ -70,12 +70,23 @@ def _channel_trace_payload(traces: "list[dict]") -> dict:
     for qi, t in enumerate(traces):
         channels.extend({**c, "query_index": qi} for c in t["channels"])
         candidates.extend({**c, "query_index": qi} for c in t["candidates"])
-    return {
+    out = {
         "plan": {"queries": [t["plan"] for t in traces]},
         "channels": channels,
         "fusion": {**traces[0]["fusion"], "per_query": [t["fusion"] for t in traces]},
         "candidates": candidates,
     }
+    for key in ("rerank", "hops"):
+        per = [{**t[key], "query_index": qi} for qi, t in enumerate(traces) if t.get(key)]
+        if per:
+            out[key] = {"per_query": per}
+    accs = [t["accounting"] for t in traces if t.get("accounting")]
+    if accs:
+        def _sum(k):
+            v = [a[k] for a in accs if a.get(k) is not None]
+            return sum(v) if v else None
+        out.update({k: _sum(k) for k in ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
+    return out
 
 
 class BankConfigConflict(Exception):
@@ -111,12 +122,20 @@ class Memory:
         tracer: Tracer | None = None,
         shadow_bank_id: str | None = None,
         shadow_embed: EmbedCallable | None = None,
+        rerank_llm: LLMCallable | None = None,
+        rerank_model: str | None = None,
+        jev: "Any | None" = None,
     ) -> None:
         if not database_url:
             raise ValueError("database_url is required")
         self._database_url = database_url
         self._llm = llm
         self._embed = embed
+        # Recall stages (banks.recall_config): the reranker / reader LLM falls
+        # back to `llm`; `jev` is a prospecta.stages.JevScore (None = no Jev).
+        self._rerank_llm = rerank_llm
+        self._rerank_model = rerank_model
+        self._jev = jev
         self._default_bank_id = bank_id
         # Shadow reads (embedding migration): recall() also queries this bank
         # with shadow_embed and stores both runs in recall_events.
@@ -219,6 +238,31 @@ class Memory:
             )
             if cur.rowcount == 0:
                 raise ValueError(f"No such bank: {bank_id!r}")
+
+    def _emit_stage_calls(self, traces: "list[dict]") -> None:
+        """One llm_call event per model call a recall stage made."""
+        for t in traces:
+            for c in t.get("calls") or []:
+                try:
+                    self._tracer("llm_call", {"bank_id": self._default_bank_id, **c})
+                except Exception:  # pragma: no cover
+                    logger.exception("tracer raised on llm_call; ignoring")
+
+    def set_recall_config(self, config: dict, bank_id: str | None = None) -> None:
+        """Set a bank's recall stages (banks.recall_config): rerank, Jev gate,
+        reader/hop. `{}` turns every stage off. Needs a channel-configured bank.
+        See prospecta.stages.DEFAULT_RECALL_CONFIG."""
+        import json as _json
+
+        from prospecta.stages import validate_recall_config
+        validate_recall_config(config)
+        bank_id = bank_id or self._default_bank_id
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE banks SET recall_config = %s::jsonb, updated_at = now() "
+                    "WHERE bank_id = %s", (_json.dumps(config), bank_id))
+            conn.commit()
 
     def _create_hnsw_index(self, bank_id: str, embedding_dim: int) -> None:
         """Create the per-bank HNSW partial index for embeddings.
@@ -354,6 +398,7 @@ class Memory:
             )
             flat.extend(results)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
+        self._emit_stage_calls(traces)
 
         if self._shadow_bank_id is None:
             try:
@@ -499,6 +544,8 @@ class Memory:
             )
             queries_to_results[q.text] = results
             flat_results.extend(results)
+
+        self._emit_stage_calls(traces)
 
         # 3. Synthesize — full content (P5), no truncation.
         synth_t0 = _time.monotonic()

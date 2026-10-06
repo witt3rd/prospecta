@@ -74,6 +74,31 @@ def make_default_llm(model: str | None = None) -> LLMCallable:
     return llm
 
 
+def make_accounted_llm(model: str = "openrouter/anthropic/claude-sonnet-5.5") -> LLMCallable:
+    """Like make_default_llm, but returns a prospecta.stages.LLMResult carrying
+    model, tokens and cost, so recall stages can account for every call.
+    No max_tokens cap is set."""
+    from prospecta.stages import LLMResult
+
+    def llm(messages: list[dict], *, json_mode: bool = False):
+        kwargs: dict = {"model": model, "messages": messages}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = litellm.completion(**kwargs)
+        usage = getattr(response, "usage", None)
+        try:
+            cost = float(litellm.completion_cost(completion_response=response))
+        except Exception:
+            cost = None
+        return LLMResult(
+            text=response.choices[0].message.content, model=model,
+            tokens_in=getattr(usage, "prompt_tokens", None),
+            tokens_out=getattr(usage, "completion_tokens", None), cost_usd=cost,
+        )
+
+    return llm
+
+
 def _extract_embedding(item: object) -> list[float]:
     """Extract embedding vector from a LiteLLM response.data entry.
 

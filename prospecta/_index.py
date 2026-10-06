@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_text
 from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_channels
+from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.recall import POOL
 from prospecta._ignore import should_ignore
 from prospecta._parser import parse_frontmatter
@@ -583,6 +584,17 @@ def _search_channels(
         fused, tr = run_channels(
             state, plan, config, k=rrf_k, pool=max(POOL, limit),
         )
+        recall_cfg = read_recall_config(conn, bank_id)
+        if recall_cfg:
+            fused, st = run_stages(
+                state, text, fused, config, recall_cfg,
+                StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
+                          model=memory._rerank_model),
+                k=rrf_k,
+            )
+            tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
+                      accounting={k: st[k] for k in
+                                  ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
     if trace is not None:
         trace.append(tr)
     channel_names = [c["name"] for c in tr["channels"]]
@@ -591,6 +603,8 @@ def _search_channels(
         b = f.best
         scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
         scores.update({n: 0.0 for n in channel_names})
+        if recall_cfg:
+            scores.update(rerank=0.0, jev=0.0)
         scores.update({n: float(v) for n, v in f.scores.items()})
         scores["semantic"] = max(
             (float(v) for n, v in f.scores.items() if n in ("dense_chunk", "question")),
