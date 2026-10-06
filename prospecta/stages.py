@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
+from prospecta._filters import coerce_date
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
@@ -183,6 +184,26 @@ class Reranker(Protocol):
     # Raises on failure; run_reranker turns that into the fused-order fallback.
 
 
+_FILENAME_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+
+
+def _note_date(created_on, source, dmeta, created_at):
+    """The note's own date: created_on, then metadata/filename date; the
+    import time (created_at) only as the last fallback."""
+    if created_on is not None:
+        return created_on
+    for k in ("created_on", "created", "date"):
+        d = coerce_date(dmeta.get(k))
+        if d is not None:
+            return d
+    m = _FILENAME_DATE.search(source or "")
+    if m:
+        d = coerce_date(m.group(1))
+        if d is not None:
+            return d
+    return created_at.date() if created_at is not None else None
+
+
 def build_items(conn, docs: list[FusedDoc]) -> list[Item]:
     """Header = note name, date, person; evidence = the best chunk (<= 1,000 chars)."""
     ids = [d.document_id for d in docs]
@@ -190,15 +211,19 @@ def build_items(conn, docs: list[FusedDoc]) -> list[Item]:
     if ids:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id::text, created_at, document_metadata->>'person' "
+                "SELECT id::text, created_on, created_at, source, document_metadata, person "
                 "FROM documents WHERE id = ANY(%s::uuid[])", (ids,))
-            meta = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            meta = {r[0]: r[1:] for r in cur.fetchall()}
     items = []
     for d in docs:
-        created, person = meta.get(d.document_id, (None, None))
+        created_on, created_at, source, dmeta, person = meta.get(
+            d.document_id, (None, None, None, None, None))
+        dmeta = dmeta or {}
+        person = person or dmeta.get("person")
+        note_date = _note_date(created_on, source or d.source, dmeta, created_at)
         parts = [d.source or d.document_id]
-        if created is not None:
-            parts.append(f"date: {created.date().isoformat()}")
+        if note_date is not None:
+            parts.append(f"date: {note_date.isoformat()}")
         if person:
             parts.append(f"person: {person}")
         ev = (d.best.evidence if d.best else None) or ""

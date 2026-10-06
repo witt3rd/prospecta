@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -216,13 +217,15 @@ def retain(
                 f"{len(index_text_list)} inputs"
             )
 
+        body, body_off = _body_and_offset(content)
+        chunks = chunk_paragraphs(body, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
         items = []
         for text, vec in zip(index_text_list, vectors):
             items.append({
                 "content": text,
-                # P5: full body preserved in original_chunk for spine
-                # write-side (mirrors T10 frontmatter override path).
-                "original_chunk": content,
+                # The full note stays in documents.original_text; a question
+                # item carries only its matching chunk (frontmatter-free).
+                "original_chunk": _matching_chunk(text, chunks, body),
                 "embedding": list(vec),
                 "metadata": {
                     **extra_metadata,
@@ -233,7 +236,6 @@ def retain(
                 "llm_generated": not caller_supplied,
             })
         if child_chunks:
-            chunks = chunk_paragraphs(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
             chunk_vectors = memory._embed([c.content for c in chunks]) if chunks else []
             if len(chunk_vectors) != len(chunks):
                 raise RuntimeError(
@@ -251,8 +253,8 @@ def retain(
                     "llm_generated": False,
                     "kind": "chunk",
                     "ordinal": c.ordinal,
-                    "char_start": c.char_start,
-                    "char_end": c.char_end,
+                    "char_start": c.char_start + body_off,
+                    "char_end": c.char_end + body_off,
                 })
         upsert_memory_items(
             conn,
@@ -294,6 +296,39 @@ def _frontmatter(text: str) -> dict:
     return parse_frontmatter(text).frontmatter or {}
 
 
+def _doc_metadata(metadata: dict, original_text: str) -> dict:
+    """document_metadata: the caller's metadata over the frontmatter-derived
+    filter fields (created, created_on, person), so temporal links and
+    headers follow the note's own date. Caller keys always win."""
+    fields = filter_fields(metadata, _frontmatter(original_text))
+    derived: dict = {}
+    if fields["created_on"] is not None:
+        derived["created"] = fields["created_on"].isoformat()
+        derived["created_on"] = fields["created_on"].isoformat()
+    if fields["person"] is not None:
+        derived["person"] = fields["person"]
+    return {**derived, **(metadata or {})}
+
+
+def _body_and_offset(content: str) -> tuple[str, int]:
+    """The note without its YAML frontmatter, and the body's offset in content."""
+    from prospecta._parser import parse_frontmatter
+    body = parse_frontmatter(content).body
+    if not body.strip():
+        return content, 0
+    off = content.find(body)
+    return body, max(off, 0)
+
+
+def _matching_chunk(query: str, chunks: list, fallback: str) -> str:
+    """The chunk sharing the most words with the question text."""
+    if not chunks:
+        return fallback[:CHUNK_MAX_CHARS]
+    words = set(re.findall(r"\w{3,}", query.lower()))
+    best = max(chunks, key=lambda c: len(words & set(re.findall(r"\w{3,}", c.content.lower()))))
+    return best.content
+
+
 def _insert_document(
     conn,
     *,
@@ -322,7 +357,7 @@ def _insert_document(
                 "original_text": original_text,
                 "content_hash": content_hash,
                 "tags": list(tags),
-                "metadata": _json.dumps(metadata or {}),
+                "metadata": _json.dumps(_doc_metadata(metadata, original_text)),
                 **filter_fields(metadata, _frontmatter(original_text)),
             },
         )
@@ -354,7 +389,7 @@ def _refresh_document(
                 "id": document_id,
                 "original_text": original_text,
                 "tags": list(tags),
-                "metadata": _json.dumps(metadata or {}),
+                "metadata": _json.dumps(_doc_metadata(metadata, original_text)),
                 **filter_fields(metadata, _frontmatter(original_text)),
             },
         )

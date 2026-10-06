@@ -52,8 +52,9 @@ def test_frontmatter_single_index_text(memory_with_bank, tmp_path):
     memory_with_bank.index_directory(tmp_path)
 
     src = str(f)
-    assert _count_items_for_source(memory_with_bank.database_url, src) == 1
-    rows = _rows_for_source(memory_with_bank.database_url, src)
+    assert _count_items_for_source(memory_with_bank.database_url, src) == 2  # 1 question + 1 body chunk
+    rows = [r for r in _rows_for_source(memory_with_bank.database_url, src)
+            if r["metadata"].get("index_text_caller_supplied")]
     assert rows[0]["content"] == "What is Kelly's birthday?"
     assert rows[0]["metadata"].get("index_text_caller_supplied") is True
     # Body preserved in documents.original_text
@@ -70,8 +71,9 @@ def test_frontmatter_list_index_text(memory_with_bank, tmp_path):
     memory_with_bank.index_directory(tmp_path)
 
     src = str(f)
-    assert _count_items_for_source(memory_with_bank.database_url, src) == 3
-    rows = _rows_for_source(memory_with_bank.database_url, src)
+    assert _count_items_for_source(memory_with_bank.database_url, src) == 4  # 3 questions + 1 body chunk
+    rows = [r for r in _rows_for_source(memory_with_bank.database_url, src)
+            if r["metadata"].get("index_text_caller_supplied")]
     contents = sorted(r["content"] for r in rows)
     assert contents == sorted(questions)
     for r in rows:

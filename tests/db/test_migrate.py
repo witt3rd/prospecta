@@ -50,8 +50,8 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 3 in result["applied"]
     assert 4 in result["applied"]
     assert 10 in result["applied"]
-    # Highest applied is now 12 (0012_pg_search_bm25, a no-op without the extension).
-    assert get_schema_version(fresh_db) == 12
+    # Highest applied is now 13 (0013_doc_date_created_on).
+    assert get_schema_version(fresh_db) == 13
 
 
 def test_run_migrations_idempotent(fresh_db):
@@ -63,7 +63,7 @@ def test_run_migrations_idempotent(fresh_db):
     assert 3 in result["skipped"]
     assert 4 in result["skipped"]
     assert 10 in result["skipped"]
-    assert get_schema_version(fresh_db) == 12
+    assert get_schema_version(fresh_db) == 13
 
 
 def test_all_required_tables_exist(fresh_db):

@@ -101,7 +101,8 @@ def test_retain_child_chunks_writes_chunks_with_parent(memory_with_bank, fresh_d
     for i, r in enumerate(chunks):
         assert r[1] == i and str(r[4]) == doc
         assert len(r[5]) <= 1000 and body[r[2]:r[3]] == r[5]
-    assert all(str(r[4]) == doc and r[5] == body for r in qs)
+    # question items carry a bounded matching chunk, not the whole note
+    assert all(str(r[4]) == doc and len(r[5]) <= 1000 and r[5] in body for r in qs)
 
 
 def test_retain_child_chunks_replace_regenerates(memory_with_bank, fresh_db):
@@ -180,7 +181,7 @@ def _kinds(url):
 def test_migration_on_populated_table(populated_v3):
     url = populated_v3
     res = migrate.run_migrations(url)
-    assert res["applied"] == [4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert res["applied"] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     assert _kinds(url) == [("chunk", 7, 0, 69), ("question", 3, None, None)]
     with psycopg.connect(url) as c:
         # column defaults are constants; existing row data untouched
@@ -218,7 +219,7 @@ def test_finish_0004_runs_after_crash_post_commit(populated_v3):
     _apply_upto(url, 4, start=4)
     assert _kinds(url) == [("question", 10, None, None)]
     res = migrate.run_migrations(url)
-    assert res["applied"] == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert res["applied"] == [5, 6, 7, 8, 9, 10, 11, 12, 13]
     assert _kinds(url) == [("chunk", 7, 0, 69), ("question", 3, None, None)]
     with psycopg.connect(url) as c:
         names = {r[0] for r in c.execute(
@@ -291,3 +292,67 @@ def test_chunk_search_uses_partial_index_without_starvation(memory_with_bank, fr
         plan = "\n".join(r[0] for r in c.execute("EXPLAIN " + sql, (q,)).fetchall())
     assert rows == [("chunk",)]
     assert hnsw_kind_index_name("test", "chunk") in plan
+
+
+# ---- F7 / F8 / F11: note dates, document_metadata, frontmatter-free chunks
+
+FM_NOTE = (
+    "---\ncreated: 2024-03-05\nperson: Greg\n---\n"
+    "# Standup\n\nGreg shipped the importer.\n\nSecond paragraph about nicknames."
+)
+
+
+def test_retain_fills_document_metadata_and_strips_frontmatter(memory_with_bank, fresh_db):
+    doc = memory_with_bank.retain(FM_NOTE, index_text=["What did Greg ship?"],
+                                  source="2024-03-05-standup.md", child_chunks=True)
+    with psycopg.connect(fresh_db) as conn:
+        meta, created_on, person = conn.execute(
+            "SELECT document_metadata, created_on, person FROM documents WHERE id=%s", (doc,)
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT kind, original_chunk, char_start, char_end FROM memory_items "
+            "WHERE document_id=%s", (doc,)).fetchall()
+        dt = conn.execute(
+            "SELECT prospecta_doc_date(document_metadata, created_at) FROM documents "
+            "WHERE id=%s", (doc,)).fetchone()[0]
+    assert str(created_on) == "2024-03-05" and person == "Greg"
+    assert meta["created"] == "2024-03-05" and meta["person"] == "Greg"
+    assert str(dt) == "2024-03-05"
+    assert all("created:" not in r[1] and "---" not in r[1] for r in rows)
+    for kind, chunk, a, b in rows:
+        if kind == "chunk":
+            assert FM_NOTE[a:b] == chunk
+
+
+def test_prospecta_doc_date_prefers_created_on(fresh_db):
+    with psycopg.connect(fresh_db) as conn:
+        d = conn.execute(
+            "SELECT prospecta_doc_date('{}'::jsonb, '2030-01-02T12:00:00Z', '2020-05-06'::date)"
+        ).fetchone()[0]
+        d2 = conn.execute(
+            "SELECT prospecta_doc_date('{}'::jsonb, '2030-01-02T12:00:00Z', NULL)").fetchone()[0]
+    assert str(d) == "2020-05-06" and str(d2) == "2030-01-02"
+
+
+def test_build_items_header_uses_note_date_and_person(memory_with_bank, fresh_db):
+    from prospecta.channels.fusion import FusedDoc
+    from prospecta.stages import build_items
+    doc = memory_with_bank.retain(FM_NOTE, index_text=["q"], source="n.md")
+    undated = memory_with_bank.retain("plain note", index_text=["q2"], source="2022-01-09-x.md")
+    with psycopg.connect(fresh_db) as conn:
+        items = build_items(conn, [FusedDoc(document_id=doc, source="n.md", score=1.0, best=None),
+                                   FusedDoc(document_id=undated, source="2022-01-09-x.md", score=1.0, best=None)])
+    assert "date: 2024-03-05" in items[0].header and "person: Greg" in items[0].header
+    assert "date: 2022-01-09" in items[1].header
+
+
+def test_index_text_note_also_writes_body_chunks(memory_with_bank, tmp_path, fresh_db):
+    f = tmp_path / "n.md"
+    f.write_text('---\nindex_text: "What did Greg ship?"\ncreated: 2024-03-05\n---\n'
+                 "# Body\n\nGreg shipped the importer.")
+    memory_with_bank.index_directory(tmp_path)
+    with psycopg.connect(fresh_db) as conn:
+        rows = conn.execute("SELECT kind, original_chunk FROM memory_items ORDER BY kind").fetchall()
+    kinds = [r[0] for r in rows]
+    assert kinds == ["chunk", "question"]
+    assert "index_text" not in rows[0][1] and "importer" in rows[0][1]

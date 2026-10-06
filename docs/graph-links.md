@@ -12,7 +12,7 @@ are the on-demand and safety-net paths). Per document:
 
 - `NEXT` between consecutive chunks, and `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE`
   (within 3 days, at most 5) to the chronological neighbours of the same `person`, in SQL
-  from `prospecta_doc_date(document_metadata, created_at)`; no model call.
+  from `prospecta_doc_date(document_metadata, created_at, created_on)` (created_on first); no model call.
 - Entities by the injected `llm` (Sonnet; prompt `extract-entities`), then
   `ENTITY/SHARED_ENTITY` links by a join, capped at 10 items per entity.
 - Semantic links: the top 10 pgvector neighbours per anchor item. With a
