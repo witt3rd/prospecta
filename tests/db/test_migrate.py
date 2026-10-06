@@ -48,8 +48,9 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 1 in result["applied"]
     assert 2 in result["applied"]
     assert 3 in result["applied"]
-    # Highest applied is now 3 (0003_observability_completeness).
-    assert get_schema_version(fresh_db) == 3
+    assert 10 in result["applied"]
+    # Highest applied is now 10 (0010_comments).
+    assert get_schema_version(fresh_db) == 10
 
 
 def test_run_migrations_idempotent(fresh_db):
@@ -59,7 +60,8 @@ def test_run_migrations_idempotent(fresh_db):
     assert 1 in result["skipped"]
     assert 2 in result["skipped"]
     assert 3 in result["skipped"]
-    assert get_schema_version(fresh_db) == 3
+    assert 10 in result["skipped"]
+    assert get_schema_version(fresh_db) == 10
 
 
 def test_all_required_tables_exist(fresh_db):
