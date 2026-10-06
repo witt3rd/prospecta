@@ -73,5 +73,6 @@ def synthesize(
     else:
         rendered = render_prompt("rag-synthesize", variables)
 
-    synthesis = llm(messages=[{"role": "user", "content": rendered}])
+    from prospecta._llmutil import llm_text
+    synthesis = llm_text(llm(messages=[{"role": "user", "content": rendered}]))
     return synthesis, rendered

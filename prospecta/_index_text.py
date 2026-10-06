@@ -58,9 +58,8 @@ def generate_index_text(
         rendered = render_prompt(_DEFAULT_PROMPT_NAME, variables)
 
     raw = llm(messages=[{"role": "user", "content": rendered}])
-    if not isinstance(raw, str):
-        # LLMCallable Protocol says -> str; defend anyway.
-        raw = str(raw)
+    from prospecta._llmutil import llm_text
+    raw = llm_text(raw)  # str or an accounted LLMResult
 
     lines: list[str] = []
     seen: set[str] = set()

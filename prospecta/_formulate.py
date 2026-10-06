@@ -77,10 +77,8 @@ def formulate_queries(
         rendered = render_prompt("formulate-queries", variables)
 
     raw = llm(messages=[{"role": "user", "content": rendered}], json_mode=True)
-    if not isinstance(raw, str):
-        # Defensive: LLMCallable contract says str; if a stub returns
-        # something else, treat it as malformed.
-        raw = str(raw)
+    from prospecta._llmutil import llm_text
+    raw = llm_text(raw)  # str or an accounted LLMResult
 
     queries, error_kind = _parse(raw)
     if error_kind is not None:

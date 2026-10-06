@@ -14,7 +14,9 @@ import litellm
 if TYPE_CHECKING:
     from prospecta._types import EmbedCallable, LLMCallable
 
-DEFAULT_EMBED_MODEL = "openai/text-embedding-3-small"
+# One default embedder: text-embedding-3-large cut to 1,536 dims (new banks).
+DEFAULT_EMBED_MODEL = "openai/text-embedding-3-large"
+DEFAULT_EMBED_DIMENSIONS = 1536
 DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 
 
@@ -26,7 +28,11 @@ def make_default_embedder(
     Resolution order for the model id:
       1. explicit ``model`` argument (highest precedence)
       2. ``PROSPECTA_EMBED_MODEL`` env var
-      3. ``openai/text-embedding-3-small`` (default, dim 1536)
+      3. ``openai/text-embedding-3-large`` (default), cut to 1536 dims.
+
+    ``dimensions`` (else ``PROSPECTA_EMBED_DIM``, else 1536 for the default
+    model only) is sent to the provider; a bank's embedding_dim is the value
+    to pass so queries match the bank.
 
     Returns a callable conforming to the ``EmbedCallable`` Protocol:
     ``(texts: list[str]) -> list[list[float]]``.
@@ -36,6 +42,10 @@ def make_default_embedder(
     does not read provider keys directly.
     """
     resolved_model = model or os.environ.get("PROSPECTA_EMBED_MODEL", DEFAULT_EMBED_MODEL)
+    if dimensions is None and os.environ.get("PROSPECTA_EMBED_DIM"):
+        dimensions = int(os.environ["PROSPECTA_EMBED_DIM"])
+    if dimensions is None and resolved_model == DEFAULT_EMBED_MODEL:
+        dimensions = DEFAULT_EMBED_DIMENSIONS
 
     def embed(texts: list[str]) -> list[list[float]]:
         kwargs: dict = {"model": resolved_model, "input": texts}

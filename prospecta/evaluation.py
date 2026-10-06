@@ -407,6 +407,9 @@ def format_report(r: dict) -> str:
     L = [f"bank {r['bank']}: {r['n_questions']} questions"]
     if r["legacy_bank_scored_with_defaults"]:
         L.append("(bank has no channel_config: scored with the default channels)")
+    for name, s in r["full"]["stages"].items():
+        if name.startswith("channel:") and s.get("errors"):
+            L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
     L.append(f"full: {_fmt(r['full']['summary'])}")
     for c, s in r["full"]["summary"]["by_class"].items():
         L.append(f"  {c} (n={s['n']}): hit@1 {s['hit1']:.2f}  hit@10 {s['hit10']:.2f}  "

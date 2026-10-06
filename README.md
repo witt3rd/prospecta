@@ -65,7 +65,11 @@ prospecta retain "Kelly was born March 4th 1990" \
     --index-text "When was Kelly born?"
 ```
 
-`PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (default `all-MiniLM-L6-v2`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
+`PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (sentence-transformers default `all-MiniLM-L6-v2`).
+
+**One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. With `OPENROUTER_API_KEY` set the CLI also builds the Sonnet-5.5 reranker/synth LLMs, Jev and the linker (`PROSPECTA_JEV=off`, `PROSPECTA_LINKER=off` opt out).
+
+**BM25 index files:** persisted only under `PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25`; with neither set the index stays in memory (nothing is written under `~/.cache`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
 ### Health check
 
@@ -215,7 +219,7 @@ Three channels, fused via Reciprocal Rank Fusion (k=60 default, configurable per
 
 The `graph` channel (links and entities, `Linker`, `JevReader`; migration 0006) ships enabled in the default config: see `docs/graph-links.md`.
 
-**`bm25` channel (opt-in: add `{"name": "bm25", "weight": 1}` to the config).** Real Okapi BM25 (k1=1.5, b=0.75, stemmed, stop words removed, OR semantics, so a natural-language question still matches) over the bank's `kind='chunk'` items, in process: no extension, no database change. The per-bank index is persisted as gzip JSON under `$PROSPECTA_BM25_DIR` (default `~/.cache/prospecta/bm25`) and rebuilt automatically whenever the bank's chunk fingerprint (count, newest `created_at`, id hash) changes; it holds postings only, and evidence text is read from the database for the top hits. Memory grows with the corpus (not yet measured on a Forge-sized bank). *Seam, not built:* `prospecta.channels.Bm25Backend` (`search(conn, bank_id, query, n)`); a `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text` ordered by `pdb.score(id)`; hit@10 0.71 against 0.76 for the in-process one in the design measurements) would implement it, but needs the extension on the live Postgres, which is main's decision (design 8.6, migration `0009_bm25_optional`).
+**`bm25` channel (opt-in: add `{"name": "bm25", "weight": 1}` to the config).** Real Okapi BM25 (k1=1.5, b=0.75, stemmed, stop words removed, OR semantics, so a natural-language question still matches) over the bank's `kind='chunk'` items, in process: no extension, no database change. The per-bank index is persisted as gzip JSON under `$PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25` (in memory when neither is set) and rebuilt automatically whenever the bank's chunk fingerprint (count, newest `created_at`, id hash) changes; it holds postings only, and evidence text is read from the database for the top hits. Memory grows with the corpus (not yet measured on a Forge-sized bank). *Seam, not built:* `prospecta.channels.Bm25Backend` (`search(conn, bank_id, query, n)`); a `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text` ordered by `pdb.score(id)`; hit@10 0.71 against 0.76 for the in-process one in the design measurements) would implement it, but needs the extension on the live Postgres, which is main's decision (design 8.6, migration `0009_bm25_optional`).
 
 ## What's load-bearing
 

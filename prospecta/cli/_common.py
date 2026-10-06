@@ -46,7 +46,7 @@ def make_memory(args) -> "Memory":
     # LLM index_text generation), this gives a fully offline retain path.
     embed = None
     try:
-        embed = _resolve_embedder()
+        embed = _resolve_embedder(bank_embedding_dim(args.database_url, args.bank))
     except ImportError:
         # Only the default/litellm path reaches here — _resolve_embedder
         # converts an EXPLICIT offline selection's import failure into a
@@ -69,10 +69,54 @@ def make_memory(args) -> "Memory":
         bank_id=args.bank,
         llm=llm,
         embed=embed,
+        **_stage_kwargs(),
     )
 
 
-def _resolve_embedder():
+def _truthy_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("0", "off", "false", "no")
+
+
+def _stage_kwargs() -> dict:
+    """rerank_llm, synth_llm, jev and linker for Memory, built when configured:
+    an OPENROUTER_API_KEY configures them (Sonnet 5.5 through the accounted
+    LLM; Jev through OpenRouter's System One door). PROSPECTA_JEV=off and
+    PROSPECTA_LINKER=off opt out. Without a key none is built."""
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        return {}
+    try:
+        from prospecta import defaults
+        accounted = defaults.make_accounted_llm()
+    except (ImportError, AttributeError):
+        return {}
+    from prospecta.stages import JevScore, openrouter_jev_transport
+    transport = openrouter_jev_transport()
+    kw: dict = {"rerank_llm": accounted, "synth_llm": accounted}
+    if not _truthy_off("PROSPECTA_JEV"):
+        kw["jev"] = JevScore(transport)
+    if not _truthy_off("PROSPECTA_LINKER"):
+        from prospecta._linker import JevRelationJudge, Linker
+        judge = None if _truthy_off("PROSPECTA_JEV") else JevRelationJudge(transport)
+        kw["linker"] = Linker(llm=accounted, judge=judge)
+    return kw
+
+
+def bank_embedding_dim(database_url: str | None, bank_id: str) -> int | None:
+    """The bank's embedding_dim, or None if the bank or database cannot be read."""
+    if not database_url:
+        return None
+    try:
+        import psycopg
+        with psycopg.connect(database_url, connect_timeout=10) as conn:
+            row = conn.execute(
+                "SELECT embedding_dim FROM banks WHERE bank_id = %s", (bank_id,)
+            ).fetchone()
+        return int(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _resolve_embedder(dimensions: int | None = None):
     """Resolve an EmbedCallable from PROSPECTA_EMBEDDER (offline-selectable).
 
     Selection (case-insensitive):
@@ -98,7 +142,9 @@ def _resolve_embedder():
 
     if kind in ("", "default", "litellm"):
         from prospecta import defaults  # type: ignore[import-not-found]
-        return defaults.make_default_embedder()  # type: ignore[attr-defined]
+        # `dimensions`: the bank's embedding_dim, so queries are embedded at
+        # the bank's width (a migrate-bank bank is 1536-d).
+        return defaults.make_default_embedder(dimensions=dimensions)  # type: ignore[attr-defined]
 
     if kind in ("sentence-transformers", "sentence_transformers", "st"):
         from prospecta.embed import sentence_transformers
