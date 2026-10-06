@@ -163,3 +163,42 @@ def test_synth_falls_back_to_general_llm_label_from_result(fresh_db):
     res = m.recall_synth("cat sat", grounded=True)
     assert general.prompts and res.synth_call["model"] == "stub-sonnet"
     m.close()
+
+
+def test_grounded_runs_one_recall_and_no_formulation(mem, monkeypatch):
+    """F13: one search per question, no formulate call; scope from the filter."""
+    calls = []
+    real = mem.search
+
+    def counting(text, **kw):
+        calls.append(text)
+        return real(text, **kw)
+
+    monkeypatch.setattr(mem, "search", counting)
+    monkeypatch.setattr(mem, "formulate_queries",
+                        lambda *a, **k: pytest.fail("grounded must not formulate"))
+    res = mem.recall_synth("cat sat", grounded=True)
+    assert calls == ["cat sat"] and [q.text for q in res.queries] == ["cat sat"]
+
+
+def test_grounded_scope_filled_from_promoted_filter(mem, monkeypatch):
+    real = mem.search
+
+    def promoting(text, **kw):
+        out = real(text, **kw)
+        kw["_trace"][-1].setdefault("fusion", {})["scope_promoted"] = [
+            str(r.document_id) for r in out if r.source in ("delta.md", "charlie.md")]
+        return out
+
+    monkeypatch.setattr(mem, "search", promoting)
+    res = mem.recall_synth("cat sat", grounded=True)   # default top, no scope=
+    assert sorted(e["note"] for e in res.evidence) == ["charlie.md", "delta.md"]
+    assert res.evidence and "whole set of notes in scope" in mem.llm.prompts[-1]
+
+
+def test_latency_model_before_after():
+    """Stubbed latency model: 5 full recalls (before) vs 1 (after)."""
+    recall_s, recall_usd, formulate_s = 13.0, 0.04, 3.0
+    before = (formulate_s + 5 * recall_s, 5 * recall_usd)
+    after = (1 * recall_s, 1 * recall_usd)
+    assert before == (68.0, 0.2) and after == (13.0, 0.04)

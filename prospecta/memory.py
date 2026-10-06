@@ -585,7 +585,7 @@ class Memory:
         rrf_k: int = 60,
         grounded: bool = False,
         scope: "list[str] | None" = None,
-        evidence_top: int = 6,
+        evidence_top: int | None = None,
     ) -> RAGResult:
         """Chain: formulate_queries → recall → synthesize. Returns RAGResult.
 
@@ -598,6 +598,12 @@ class Memory:
         set, all of those notes. The answer cites [note name] per claim, may
         say "not in memory", and RAGResult.citations is stored on the recall
         event (recall_events.citations). `synth_prompt_override` is ignored.
+
+        Grounded mode runs ONE recall: the question is the single query (no
+        formulation call), so meta extraction, rerank, reader and hop happen
+        once. `scope` defaults to the notes the extracted hard filter promoted
+        (the filter set); `evidence_top` None means 6, and a set question uses
+        the whole scope set (at most 12) whatever the top.
         """
         import time as _time
 
@@ -612,12 +618,15 @@ class Memory:
         t_start = _time.monotonic()
         bank_id = self._default_bank_id
 
-        # 1. Formulate
-        formulated = self.formulate_queries(
-            message,
-            context=context,
-            prompt_override=formulate_prompt_override,
-        )
+        # 1. Formulate (grounded: the question is the single query, one recall)
+        if grounded:
+            formulated = [Query(text=message)]
+        else:
+            formulated = self.formulate_queries(
+                message,
+                context=context,
+                prompt_override=formulate_prompt_override,
+            )
 
         # 2. Recall per-query → queries_to_results + flat list (preserves order)
         queries_to_results: dict[str, list[RecalledMemory]] = {}
@@ -643,9 +652,12 @@ class Memory:
         if grounded:
             from prospecta import _synth
             blended = _interleave(queries_to_results)
+            if not scope:   # the extracted filter's promoted set (design 8.5)
+                scope = [d for t in traces
+                         for d in t.get("fusion", {}).get("scope_promoted", [])] or None
             with self._pool.connection() as conn:
                 notes, set_mode = _synth.gather_evidence(
-                    conn, bank_id, blended, top=evidence_top, scope=scope)
+                    conn, bank_id, blended, top=evidence_top or _synth.TOP_NOTES, scope=scope)
             grounded_res = _synth.synthesize_grounded(
                 message, notes, self._synth_llm or self._llm, set_mode=set_mode)
             synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt
