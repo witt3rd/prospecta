@@ -56,6 +56,19 @@ class ConnectionPool:
             conn.rollback()
             raise
 
+    @contextmanager
+    def dedicated(self) -> Iterator[Connection]:
+        """Yield a private connection (not the shared one) and close it after.
+
+        For work on another thread (the Linker worker): it never shares a
+        transaction with the caller's connection. Caller commits/rolls back.
+        """
+        conn = psycopg.connect(self.database_url, autocommit=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
             self._conn.close()
