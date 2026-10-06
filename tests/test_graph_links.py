@@ -443,6 +443,7 @@ def test_hub_entity_reached_at_hop_two_through_a_link(mem):
     with conn_of(mem) as c:
         s_item, x_item = (c.execute("SELECT id FROM memory_items WHERE document_id=%s",
                                     (ids[k],)).fetchone()[0] for k in ("S", "h0"))
+        c.execute("DELETE FROM memory_links WHERE src=%s OR dst=%s", (s_item, s_item))
         c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype) "
                   "VALUES ('b', %s, %s, 'SEMANTIC', 'RELATED_TO')", (s_item, x_item))
         c.commit()
