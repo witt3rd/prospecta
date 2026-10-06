@@ -265,7 +265,7 @@ Honest about the boundaries:
 
 - **Cosine distance / HNSW probe details.** Individual vector arithmetic isn't logged; you see the surfaced result + RRF score, not the per-channel internal scoring within the HNSW probe. To inspect at that level, query `memory_items` directly or use `Memory.search(mode='semantic')` / `mode='lexical'` to compare channels in isolation.
 - **Chunker decisions.** Markdown chunking happens before retain; the chunked text lands as `memory_items.original_chunk`, but the chunker's reasoning (split here vs. there) isn't recorded.
-- **Per-channel scores for items that did NOT surface in the top-K.** Only the returned chunks land in `recall_events.results`. Items that scored below the cutoff are not retained in the event row.
+- **Per-channel scores for items that did NOT surface in the top-K.** Only the returned chunks land in `recall_events.results`. Items that scored below the cutoff are not retained in the event row. (Exception: banks with a non-empty `channel_config` also persist every channel candidate in `recall_event_candidates`, migration 0007.)
 
 ## Performance impact
 
