@@ -140,6 +140,10 @@ class PostgresSink:
                 rerank=p.get("rerank"),
                 hops=p.get("hops"),
                 candidates=p.get("candidates"),
+                cost_usd=p.get("cost_usd"),
+                tokens_in=p.get("tokens_in"),
+                tokens_out=p.get("tokens_out"),
+                n_llm_calls=p.get("n_llm_calls"),
             )
             conn.commit()
 
@@ -222,6 +226,10 @@ class PostgresSink:
                 error=p.get("error"),
                 prompt_text=prompt_text,
                 response_text=response_text,
+                model=p.get("model"),
+                tokens_in=p.get("tokens_in"),
+                tokens_out=p.get("tokens_out"),
+                cost_usd=p.get("cost_usd"),
             )
             conn.commit()
 
