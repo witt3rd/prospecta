@@ -7,6 +7,7 @@ Serializes concurrent migration attempts via pg_advisory_xact_lock.
 from __future__ import annotations
 
 import logging
+import time
 import re
 from pathlib import Path
 
@@ -115,7 +116,13 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
 
     backfilled = 0
     with psycopg.connect(database_url, autocommit=True) as conn:
-        conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATE_LOCK_KEY,))
+        # Poll with try-lock rather than block: CREATE INDEX CONCURRENTLY waits on
+        # every running statement/transaction, so a peer blocked inside
+        # pg_advisory_lock (or queued on MIGRATE_LOCK_KEY) would deadlock it.
+        while not conn.execute(
+            "SELECT pg_try_advisory_lock(%s)", (MIGRATE_LOCK_KEY + 1,)
+        ).fetchone()[0]:
+            time.sleep(0.05)
         while True:
             with conn.cursor() as cur:
                 cur.execute(

@@ -118,11 +118,11 @@ def _vec(i):
     return "[" + ",".join(str(float((i + k) % 7)) for k in range(EMBED_DIM)) + "]"
 
 
-def _apply_upto(url, upto):
+def _apply_upto(url, upto, start=1):
     with psycopg.connect(url) as conn:
         migrate._ensure_version_table(conn)
         for v, path in migrate._list_migrations():
-            if v <= upto:
+            if start <= v <= upto:
                 conn.execute(path.read_text())
                 conn.execute(
                     "INSERT INTO prospecta_schema_version (version, description) "
@@ -215,7 +215,7 @@ def test_backfill_is_batched_and_resumable(populated_v3):
 
 def test_finish_0004_runs_after_crash_post_commit(populated_v3):
     url = populated_v3
-    _apply_upto(url, 4)
+    _apply_upto(url, 4, start=4)
     assert _kinds(url) == [("question", 10, None, None)]
     res = migrate.run_migrations(url)
     assert res["applied"] == []
