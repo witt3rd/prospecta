@@ -220,3 +220,35 @@ def test_latency_model_before_after():
     before = (formulate_s + 5 * recall_s, 5 * recall_usd)
     after = (1 * recall_s, 1 * recall_usd)
     assert before == (68.0, 0.2) and after == (13.0, 0.04)
+
+
+class _Rec:
+    def __init__(self, document_id, source, score):
+        self.document_id, self.source, self.score = document_id, source, score
+        self.original_chunk = NOTES[source][0]
+
+
+def _gather(mem, scores, **kw):
+    from prospecta._synth import gather_evidence
+    with psycopg.connect(mem.database_url) as conn:
+        ids = dict(conn.execute("SELECT source, id::text FROM documents WHERE bank_id='b'").fetchall())
+        names = list(NOTES)[:len(scores)]
+        recalled = [_Rec(ids[n], n, s) for n, s in zip(names, scores)]
+        notes, _ = gather_evidence(conn, "b", recalled, **kw)
+    return names, [n.name for n in notes]
+
+
+def test_default_selection_stops_before_first_note_below_cutoff(mem):
+    names, got = _gather(mem, [1.0, 0.9, 0.3, 0.2])
+    assert got == names[:2]
+
+
+@pytest.mark.parametrize("scores", [[-0.1, -0.5, -0.6], [-0.5, -0.6, -0.7]])
+def test_default_selection_non_positive_top_score(mem, scores):
+    names, got = _gather(mem, scores)
+    assert got == names[:1]
+
+
+def test_explicit_top_still_caps(mem):
+    names, got = _gather(mem, [1.0, 0.9, 0.8, 0.7], top=3)
+    assert got == names[:3]
