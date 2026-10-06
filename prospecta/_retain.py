@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prospecta._chunker import chunk_paragraphs
+from prospecta._filters import filter_fields
 from prospecta._index_text import generate_index_text
 from prospecta._types import DocumentSourceConflictError
 from prospecta.db.queries import (
@@ -287,6 +288,11 @@ def retain(
 # helpers (kept local to retain to avoid mutating _index.py — T9 frozen)
 # ---------------------------------------------------------------------------
 
+def _frontmatter(text: str) -> dict:
+    from prospecta._parser import parse_frontmatter
+    return parse_frontmatter(text).frontmatter or {}
+
+
 def _insert_document(
     conn,
     *,
@@ -303,9 +309,10 @@ def _insert_document(
             """
             INSERT INTO documents
                 (bank_id, source, original_text, content_hash,
-                 tags, document_metadata)
+                 tags, document_metadata, created_on, person, source_kind)
             VALUES (%(bank_id)s, %(source)s, %(original_text)s, %(content_hash)s,
-                    %(tags)s, %(metadata)s::jsonb)
+                    %(tags)s, %(metadata)s::jsonb,
+                    %(created_on)s, %(person)s, %(source_kind)s)
             RETURNING id
             """,
             {
@@ -315,6 +322,7 @@ def _insert_document(
                 "content_hash": content_hash,
                 "tags": list(tags),
                 "metadata": _json.dumps(metadata or {}),
+                **filter_fields(metadata, _frontmatter(original_text)),
             },
         )
         return str(cur.fetchone()[0])
@@ -336,6 +344,8 @@ def _refresh_document(
             SET original_text = %(original_text)s,
                 tags = %(tags)s,
                 document_metadata = %(metadata)s::jsonb,
+                created_on = %(created_on)s, person = %(person)s,
+                source_kind = %(source_kind)s,
                 updated_at = now()
             WHERE id = %(id)s
             """,
@@ -344,6 +354,7 @@ def _refresh_document(
                 "original_text": original_text,
                 "tags": list(tags),
                 "metadata": _json.dumps(metadata or {}),
+                **filter_fields(metadata, _frontmatter(original_text)),
             },
         )
 
