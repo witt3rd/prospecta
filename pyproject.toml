@@ -30,9 +30,6 @@ dev = [
 defaults = [
     "litellm>=1.0",
 ]
-embedder = [
-    "sentence-transformers>=2.5",
-]
 embed-sentence-transformers = [
     "sentence-transformers>=2.5",
 ]

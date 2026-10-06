@@ -26,12 +26,12 @@ def cmd_health(args) -> int:
     problems = []
     try:
         _check_db(args.database_url)
-    except BaseException as e:  # SystemExit from resolver too
+    except (Exception, SystemExit) as e:
         problems.append(f"database unavailable ({type(e).__name__}: {e})")
     dim = None
     try:
         dim = _check_embedder()
-    except BaseException as e:
+    except (Exception, SystemExit) as e:
         problems.append(f"embedder unavailable ({type(e).__name__}: {e})")
     if problems:
         msg = "; ".join(problems).replace("\n", " ")
