@@ -134,6 +134,12 @@ class PostgresSink:
                 trace=p.get("trace"),
                 results=p.get("results"),
                 synthesis=p.get("synthesis"),
+                plan=p.get("plan"),
+                channels=p.get("channels"),
+                fusion=p.get("fusion"),
+                rerank=p.get("rerank"),
+                hops=p.get("hops"),
+                candidates=p.get("candidates"),
             )
             conn.commit()
 

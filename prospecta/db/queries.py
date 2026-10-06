@@ -334,8 +334,18 @@ def append_recall_event(
     trace: dict | None = None,
     results: list[dict] | None = None,
     synthesis: str | None = None,
-) -> None:
-    """INSERT a row into recall_events.
+    plan: dict | None = None,
+    channels: list[dict] | None = None,
+    fusion: dict | None = None,
+    rerank: dict | None = None,
+    hops: dict | None = None,
+    candidates: list[dict] | None = None,
+) -> int:
+    """INSERT a row into recall_events (and its recall_event_candidates).
+
+    plan/channels/fusion/rerank/hops and candidates (migration 0007) are
+    written by channel-pipeline recalls; legacy recalls leave them NULL.
+    Returns the new recall_events.id.
 
     Schema invariants (schema.md §1, migration 0003):
       - bank_id, queries (JSONB), mode, n_results, duration_ms are NOT NULL.
@@ -352,11 +362,14 @@ def append_recall_event(
             """
             INSERT INTO recall_events
                 (bank_id, queries, mode, n_results, duration_ms, trace,
-                 results, synthesis)
+                 results, synthesis, plan, channels, fusion, rerank, hops)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
                  %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
-                 %(results)s::jsonb, %(synthesis)s)
+                 %(results)s::jsonb, %(synthesis)s, %(plan)s::jsonb,
+                 %(channels)s::jsonb, %(fusion)s::jsonb, %(rerank)s::jsonb,
+                 %(hops)s::jsonb)
+            RETURNING id
             """,
             {
                 "bank_id": bank_id,
@@ -367,8 +380,31 @@ def append_recall_event(
                 "trace": _json.dumps(trace) if trace is not None else None,
                 "results": _json.dumps(results) if results is not None else None,
                 "synthesis": synthesis,
+                "plan": _dumps(plan),
+                "channels": _dumps(channels),
+                "fusion": _dumps(fusion),
+                "rerank": _dumps(rerank),
+                "hops": _dumps(hops),
             },
         )
+        event_id = cur.fetchone()[0]
+        for c in candidates or []:
+            cur.execute(
+                """
+                INSERT INTO recall_event_candidates
+                    (recall_event_id, query_index, document_id, item_id,
+                     channel, rank, score)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (event_id, int(c.get("query_index", 0)), c.get("document_id"),
+                 c.get("item_id"), c["channel"], int(c["rank"]), float(c["score"])),
+            )
+    return event_id
+
+
+def _dumps(obj):
+    import json as _json
+    return _json.dumps(obj) if obj is not None else None
 
 
 def append_formulate_event(

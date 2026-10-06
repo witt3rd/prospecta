@@ -59,6 +59,25 @@ def _serialize_recall_results(results: "list[RecalledMemory]") -> list[dict]:
     return out
 
 
+def _channel_trace_payload(traces: "list[dict]") -> dict:
+    """Merge per-query channel traces into the recall tracer payload
+    (recall_events.plan/channels/fusion + recall_event_candidates). Empty for
+    banks on the legacy recall path, so their events are unchanged."""
+    if not traces:
+        return {}
+    channels: list[dict] = []
+    candidates: list[dict] = []
+    for qi, t in enumerate(traces):
+        channels.extend({**c, "query_index": qi} for c in t["channels"])
+        candidates.extend({**c, "query_index": qi} for c in t["candidates"])
+    return {
+        "plan": {"queries": [t["plan"] for t in traces]},
+        "channels": channels,
+        "fusion": {**traces[0]["fusion"], "per_query": [t["fusion"] for t in traces]},
+        "candidates": candidates,
+    }
+
+
 class BankConfigConflict(Exception):
     """Raised when create_bank is called with a different embedding_dim
     than an existing bank with the same bank_id."""
@@ -178,6 +197,28 @@ class Memory:
 
         # CREATE INDEX CONCURRENTLY cannot run inside a transaction.
         self._create_hnsw_index(bank_id, embedding_dim)
+
+    def set_channel_config(self, config: "list[dict]", bank_id: str | None = None) -> None:
+        """Set a bank's recall channel registry (banks.channel_config).
+
+        `[]` restores the legacy three-channel hybrid recall. See
+        prospecta.channels.DEFAULT_CHANNEL_CONFIG for the measured defaults.
+        """
+        import json as _json
+
+        from prospecta.channels import validate_channel_config
+
+        bank_id = bank_id or self._default_bank_id
+        validate_bank_id(bank_id)
+        validate_channel_config(config)
+        with self._pool.cursor() as cur:
+            cur.execute(
+                "UPDATE banks SET channel_config = %s::jsonb, updated_at = now() "
+                "WHERE bank_id = %s",
+                (_json.dumps(config), bank_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"No such bank: {bank_id!r}")
 
     def _create_hnsw_index(self, bank_id: str, embedding_dim: int) -> None:
         """Create the per-bank HNSW partial index for embeddings.
@@ -301,6 +342,7 @@ class Memory:
 
         t_start = _time.monotonic()
         flat: list[RecalledMemory] = []
+        traces: list[dict] = []
         for q in coerced:
             results = self.search(
                 q.text,
@@ -308,6 +350,7 @@ class Memory:
                 limit=limit,
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
+                _trace=traces,
             )
             flat.extend(results)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
@@ -323,6 +366,7 @@ class Memory:
                     "trace": None,
                     "results": _serialize_recall_results(flat),
                     "synthesis": None,
+                    **_channel_trace_payload(traces),
                 })
             except Exception:  # pragma: no cover
                 logger.exception("tracer raised on recall; ignoring")
@@ -443,6 +487,7 @@ class Memory:
         # 2. Recall per-query → queries_to_results + flat list (preserves order)
         queries_to_results: dict[str, list[RecalledMemory]] = {}
         flat_results: list[RecalledMemory] = []
+        traces: list[dict] = []
         for q in formulated:
             results = self.search(
                 q.text,
@@ -450,6 +495,7 @@ class Memory:
                 limit=limit,
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
+                _trace=traces,
             )
             queries_to_results[q.text] = results
             flat_results.extend(results)
@@ -493,6 +539,7 @@ class Memory:
                 "trace": None,
                 "results": _serialize_recall_results(flat_results),
                 "synthesis": synthesis,
+                **_channel_trace_payload(traces),
             })
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on recall; ignoring")

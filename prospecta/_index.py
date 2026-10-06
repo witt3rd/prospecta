@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_text
+from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_channels
+from prospecta.channels.recall import POOL
 from prospecta._ignore import should_ignore
 from prospecta._parser import parse_frontmatter
 from prospecta._types import IndexStats, RecalledMemory
@@ -499,6 +501,7 @@ def search(
     limit: int = 10,
     metadata_filter: dict | None = None,
     rrf_k: int = 60,
+    _trace: list | None = None,
 ) -> list[RecalledMemory]:
     if mode not in ("hybrid", "semantic", "lexical"):
         raise ValueError(f"Invalid mode: {mode!r}")
@@ -510,6 +513,13 @@ def search(
     bank_id = memory._default_bank_id
 
     if mode == "hybrid":
+        with memory._pool.connection() as conn:
+            channel_config = read_channel_config(conn, bank_id)
+        if channel_config:
+            return _search_channels(
+                memory, text, bank_id, channel_config, limit=limit,
+                metadata_filter=metadata_filter, rrf_k=rrf_k, trace=_trace,
+            )
         qvec = memory._embed([text])[0]
         with memory._pool.connection() as conn:
             rows = hybrid_search(
@@ -555,6 +565,47 @@ def search(
         lex = float(r.get("lex_score") or 0.0)
         out.append(_make_recalled(
             r, bank_id, sem_score=0.0, lex_score=lex, rrf=lex,
+        ))
+    return out
+
+
+def _search_channels(
+    memory: "Memory", text: str, bank_id: str, config: list[dict],
+    *, limit: int, metadata_filter: dict | None, rrf_k: int, trace: list | None,
+) -> list[RecalledMemory]:
+    """Hybrid recall through the bank's configured channels (banks.channel_config)."""
+    plan = QueryPlan(text=text)
+    with memory._pool.connection() as conn:
+        state = RecallState(
+            conn=conn, bank_id=bank_id, embed=memory._embed,
+            metadata_filter=metadata_filter,
+        )
+        fused, tr = run_channels(
+            state, plan, config, k=rrf_k, pool=max(POOL, limit),
+        )
+    if trace is not None:
+        trace.append(tr)
+    channel_names = [c["name"] for c in tr["channels"]]
+    out = []
+    for f in fused[:limit]:
+        b = f.best
+        scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
+        scores.update({n: 0.0 for n in channel_names})
+        scores.update({n: float(v) for n, v in f.scores.items()})
+        scores["semantic"] = max(
+            (float(v) for n, v in f.scores.items() if n in ("dense_chunk", "question")),
+            default=0.0,
+        )
+        scores["rrf"] = float(f.score)
+        out.append(RecalledMemory(
+            content=b.detail.get("content") or b.evidence or "",
+            original_chunk=b.evidence or "",
+            source=f.source,
+            score=float(f.score),
+            scores=scores,
+            metadata=b.detail.get("metadata") or {},
+            bank_id=bank_id,
+            document_id=f.document_id,
         ))
     return out
 
