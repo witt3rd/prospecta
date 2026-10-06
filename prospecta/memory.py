@@ -594,7 +594,7 @@ class Memory:
         grounded=True (opt-in) swaps the final step for the cited synthesis of
         design 8.8: the evidence is the best chunk plus neighbours (at most 3
         per note) of the top `evidence_top` notes of the blended recall, or,
-        when `scope` (note sources or document ids, at most 12 found) names a
+        when `scope` (note sources or document ids, any number found) names a
         set, all of those notes. The answer cites [note name] per claim, may
         say "not in memory", and RAGResult.citations is stored on the recall
         event (recall_events.citations). `synth_prompt_override` is ignored.
