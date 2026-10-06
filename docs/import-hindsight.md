@@ -43,4 +43,6 @@ A unit whose `hindsight:<id>` source already exists in the bank is skipped, so r
 
 ## No-loss report
 
+Links are carried in their source unit, so a link counts as imported only if its source unit was imported; if the source unit was skipped or failed, the link is reported skipped or failed with that reason.
+
 For units, entities and links: `in = imported + skipped_duplicate + failed`. Every skipped/failed record is listed with its reason, e.g. already imported; identical text already stored under another source; empty text or missing id; link endpoint not in the dump; entity with no id/name; entity no imported unit references.

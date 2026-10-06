@@ -32,6 +32,7 @@ def _dump():
         "links": [
             {"from_unit_id": "u1", "to_unit_id": "u2", "link_type": "entity", "weight": 1.0},
             {"from_unit_id": "u1", "to_unit_id": "gone", "link_type": "semantic"},
+            {"from_unit_id": "u4", "to_unit_id": "u1", "link_type": "semantic"},
         ],
     }
 
@@ -40,7 +41,8 @@ def test_import_report_and_idempotency(memory_with_bank):
     m = memory_with_bank
     r = import_hindsight(m, _dump())
     assert (r.units.total, r.units.imported, r.units.skipped, r.units.failed) == (7, 4, 1, 2)
-    assert (r.links.total, r.links.imported, r.links.failed) == (2, 1, 1)
+    assert (r.links.total, r.links.imported, r.links.skipped, r.links.failed) == (3, 1, 1, 1)
+    assert r.links.total == r.links.imported + r.links.skipped + r.links.failed
     assert (r.entities.total, r.entities.imported, r.entities.skipped, r.entities.failed) == (4, 2, 1, 1)
     assert r.units.total == r.units.imported + r.units.skipped + r.units.failed
     assert len(r.warnings) == 1
@@ -50,6 +52,7 @@ def test_import_report_and_idempotency(memory_with_bank):
     r2 = import_hindsight(m, _dump())
     assert r2.units.imported == 0
     assert m.bank_stats().documents == docs
+    assert (r2.links.imported, r2.links.skipped, r2.links.failed) == (0, 2, 1)
     assert r2.units.skipped == 5  # 4 already imported + u4 duplicate text... still accounted
     assert r2.units.total == r2.units.imported + r2.units.skipped + r2.units.failed
 
@@ -82,3 +85,11 @@ def test_cli_import(memory_with_bank, tmp_path, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["units"]["imported"] == 4
     assert main(["import", "hindsight", str(p)]) == 3
+
+
+def test_load_rejects_non_object_json(tmp_path):
+    import pytest
+    f = tmp_path / "d.json"
+    f.write_text("[]")
+    with pytest.raises(ValueError):
+        load_dump(f)

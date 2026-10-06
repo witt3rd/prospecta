@@ -78,10 +78,12 @@ def load_dump(path: Path) -> dict:
     text = Path(path).read_text(encoding="utf-8")
     try:
         data = json.loads(text)
-        if isinstance(data, dict):
-            return data
     except json.JSONDecodeError:
-        pass
+        data = None
+    if isinstance(data, dict):
+        return data
+    if data is not None:
+        raise ValueError("dump must be a JSON object or JSONL records")
     data = {"memory_units": [], "entities": [], "links": []}
     plural = {"memory_unit": "memory_units", "unit": "memory_units",
               "entity": "entities", "link": "links"}
@@ -89,6 +91,8 @@ def load_dump(path: Path) -> dict:
         if not line.strip():
             continue
         rec = json.loads(line)
+        if not isinstance(rec, dict):
+            raise ValueError(f"line {n}: record is not an object")
         key = plural.get(rec.get("kind"))
         if key is None:
             raise ValueError(f"line {n}: unknown or missing kind {rec.get('kind')!r}")
@@ -117,6 +121,8 @@ def import_hindsight(
 
     unit_ids = {str(u["id"]) for u in units if isinstance(u, dict) and u.get("id")}
     out_links: dict[str, list[dict]] = {}
+    link_labels: dict[str, list[str]] = {}
+    outcome: dict[str, tuple[str, str]] = {}
     for l in links:
         rep.links.total += 1
         lid = f"{l.get('from_unit_id')}->{l.get('to_unit_id')}" if isinstance(l, dict) else "?"
@@ -129,7 +135,7 @@ def import_hindsight(
         out_links.setdefault(src, []).append(
             {"to": dst, "type": l.get("link_type"), "weight": l.get("weight"),
              "entity_id": l.get("entity_id")})
-        rep.links.imported += 1  # carried in source unit's metadata
+        link_labels.setdefault(src, []).append(lid)
 
     referenced_entities: set[str] = set()
     for u in units:
@@ -163,11 +169,13 @@ def import_hindsight(
                           "source already imported with different text; kept existing")
                 rep.units.skipped += 1
                 rep.skipped.append({"kind": "unit", "id": uid, "reason": reason})
+                outcome[uid] = ("skipped", reason)
                 continue
             if dup is not None:
                 rep.units.skipped += 1
-                rep.skipped.append({"kind": "unit", "id": uid,
-                                    "reason": f"identical text already stored as {dup[0]}"})
+                reason = f"identical text already stored as {dup[0]}"
+                rep.skipped.append({"kind": "unit", "id": uid, "reason": reason})
+                outcome[uid] = ("skipped", reason)
                 continue
 
             ents = []
@@ -226,10 +234,27 @@ def import_hindsight(
                     cur.execute("UPDATE memory_items SET created_at=%s "
                                 "WHERE document_id=%s", (created, doc_id))
             rep.units.imported += 1
+            outcome[uid] = ("imported", "")
         except Exception as e:  # reported, never dropped
             rep.units.failed += 1
             rep.failed.append({"kind": "unit", "id": label,
                                "reason": f"{type(e).__name__}: {e}"})
+            if uid is not None:
+                outcome[uid] = ("failed", f"{type(e).__name__}: {e}")
+
+    for src, labels in link_labels.items():
+        status, why = outcome.get(src, ("failed", "source unit not processed"))
+        for lid in labels:
+            if status == "imported":
+                rep.links.imported += 1
+            elif status == "skipped":
+                rep.links.skipped += 1
+                rep.skipped.append({"kind": "link", "id": lid,
+                                    "reason": f"source unit skipped: {why}"})
+            else:
+                rep.links.failed += 1
+                rep.failed.append({"kind": "link", "id": lid,
+                                   "reason": f"source unit failed: {why}"})
 
     # Entities are carried inside the units that mention them; ones nothing
     # references have nowhere to live, so report them rather than drop quietly.
