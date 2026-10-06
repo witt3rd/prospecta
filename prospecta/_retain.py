@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from prospecta._chunker import chunk_paragraphs
 from prospecta._index_text import generate_index_text
 from prospecta._types import DocumentSourceConflictError
 from prospecta.db.queries import (
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CHUNK_MAX_CHARS = 1000
+CHUNK_OVERLAP_CHARS = 100
+
 
 def retain(
     memory: "Memory",
@@ -49,10 +53,16 @@ def retain(
     tags: list[str] | None = None,
     metadata: dict | None = None,
     update_mode: str = "append",
+    child_chunks: bool = False,
 ) -> str:
     """Write-side bilateral spine. Returns document_id (str UUID).
 
     See plan-v2.md §3.4 for the canonical signature & semantics.
+
+    child_chunks (default False = unchanged behaviour): additionally write
+    the note as kind='chunk' items of at most 1,000 chars at paragraph
+    boundaries (small overlap), each carrying the parent document_id and its
+    ordinal / char offsets. The question items are written either way.
     """
     if memory._embed is None:
         raise RuntimeError(
@@ -221,6 +231,28 @@ def retain(
                 "update_mode": update_mode,
                 "llm_generated": not caller_supplied,
             })
+        if child_chunks:
+            chunks = chunk_paragraphs(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
+            chunk_vectors = memory._embed([c.content for c in chunks]) if chunks else []
+            if len(chunk_vectors) != len(chunks):
+                raise RuntimeError(
+                    f"embed() returned {len(chunk_vectors)} vectors for "
+                    f"{len(chunks)} chunks"
+                )
+            for c, vec in zip(chunks, chunk_vectors):
+                items.append({
+                    "content": c.content,
+                    "original_chunk": c.content,
+                    "embedding": list(vec),
+                    "metadata": {**extra_metadata},
+                    "tags": tags_list,
+                    "update_mode": update_mode,
+                    "llm_generated": False,
+                    "kind": "chunk",
+                    "ordinal": c.ordinal,
+                    "char_start": c.char_start,
+                    "char_end": c.char_end,
+                })
         upsert_memory_items(
             conn,
             bank_id=bank_id,
