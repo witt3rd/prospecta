@@ -219,38 +219,64 @@ def _import_units(memory, src, hbank, dim, rep, batch):
                 continue
             carried = [r[2] is not None and len(r[2]) == dim for r in todo]
             redo = [r[1] for r, ok in zip(todo, carried) if not ok]
-            vecs = []
+            vecs = {}
             if redo:
+                if memory._embed is None:
+                    err = RuntimeError("no embedder configured to re-embed units")
+                    texts = []
+                else:
+                    err = None
+                    texts = redo
                 try:
-                    if memory._embed is None:
-                        raise RuntimeError("no embedder configured to re-embed units")
-                    vecs = list(memory._embed(redo))
-                    if len(vecs) != len(redo):
+                    if err:
+                        raise err
+                    out = list(memory._embed(texts))
+                    if len(out) != len(texts):
                         raise RuntimeError("embedder returned wrong number of vectors")
+                    vecs = dict(zip(range(len(texts)), out))
                 except Exception as e:
-                    for r, ok in zip(todo, carried):
-                        if ok:
-                            _write_unit(memory, bank, hbank, r, r[2], c, rep)
-                            rep.embeddings["carried"] += 1
-                        else:
-                            _fail(rep, "memory_units", r[0], f"re-embed failed: {e}")
-                    continue
-            it = iter(vecs)
-            try:
-                with memory._pool.connection() as conn:
-                    for r, ok in zip(todo, carried):
-                        _insert_unit(conn, bank, r, r[2] if ok else next(it))
-                    conn.commit()
-                c.imported += len(todo)
-                rep.embeddings["carried"] += sum(carried)
-                rep.embeddings["re_embedded"] += len(redo)
-            except Exception:
-                # isolate the bad row(s): retry one by one
-                it = iter(vecs)
+                    # one bad text must not sink the batch: embed row by row
+                    vecs = {}
+                    if memory._embed is not None:
+                        for k, t in enumerate(texts):
+                            try:
+                                vecs[k] = list(memory._embed([t]))[0]
+                            except Exception:
+                                pass
+                    batch_err = e
+                ri = 0
+                keep = []
                 for r, ok in zip(todo, carried):
-                    v = r[2] if ok else next(it)
-                    if _write_unit(memory, bank, hbank, r, v, c, rep):
-                        rep.embeddings["carried" if ok else "re_embedded"] += 1
+                    if ok:
+                        keep.append((r, r[2], True))
+                    else:
+                        if ri in vecs:
+                            keep.append((r, vecs[ri], False))
+                        else:
+                            _fail(rep, "memory_units", r[0], f"re-embed failed: {batch_err}")
+                        ri += 1
+                todo_v = keep
+            else:
+                todo_v = [(r, r[2], True) for r in todo]
+            _write_batch(memory, bank, hbank, todo_v, c, rep)
+
+
+def _write_batch(memory, bank, hbank, items, c, rep):
+    if not items:
+        return
+    try:
+        with memory._pool.connection() as conn:
+            for r, v, _ in items:
+                _insert_unit(conn, bank, r, v)
+            conn.commit()
+        c.imported += len(items)
+        for _, _, ok in items:
+            rep.embeddings["carried" if ok else "re_embedded"] += 1
+    except Exception:
+        # isolate the bad row(s): retry one by one
+        for r, v, ok in items:
+            if _write_unit(memory, bank, hbank, r, v, c, rep):
+                rep.embeddings["carried" if ok else "re_embedded"] += 1
 
 
 def _write_unit(memory, bank, hbank, r, vec, c, rep) -> bool:

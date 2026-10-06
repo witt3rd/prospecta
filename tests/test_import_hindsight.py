@@ -118,6 +118,26 @@ def test_failures_are_reported_not_dropped(fresh_db, hs_url):
     assert u.total == u.imported + u.skipped_duplicate + u.failed
 
 
+def test_embeddingless_units_are_reembedded_not_failed(fresh_db, hs_url):
+    """One poisoned text makes the batch embed call fail; every unit still lands."""
+    seen = []
+
+    def picky(texts):
+        seen.append(len(texts))
+        if len(texts) > 1:
+            raise RuntimeError("batch rejected")
+        return [[0.2] * synth.DIM for _ in texts]
+    m = Memory(database_url=fresh_db, bank_id="alpha", embed=picky, llm=None)
+    r = ih.import_bank(m, hs_url, "alpha", batch=100)
+    n = synth.BANKS["alpha"][0]
+    assert r.ok and r.failures == []
+    assert r.tables["memory_units"].imported == n and r.tables["memory_units"].failed == 0
+    assert r.embeddings == {"carried": n - 6, "re_embedded": 6}
+    assert _n(m, "SELECT count(*) FROM memory_items WHERE bank_id='alpha'") == n
+    r2 = ih.import_bank(m, hs_url, "alpha", batch=100)
+    assert r2.tables["memory_units"].skipped_duplicate == n and r2.tables["memory_units"].imported == 0
+
+
 def test_cli(fresh_db, hs_url, monkeypatch, capsys):
     from prospecta.cli import _common
     from prospecta.cli.__main__ import main
