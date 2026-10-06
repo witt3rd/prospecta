@@ -67,6 +67,24 @@ def _build_parser() -> argparse.ArgumentParser:
     cb.add_argument("--mission", default=None)
     cb.add_argument("--retain-mission", default=None)
 
+    # ---- migrate-bank (design 8.4) -------------------------------------
+    mb = sub.add_parser(
+        "migrate-bank",
+        help="Backfill '<bank>-v2' with a new embedding dimension (resumable)",
+    )
+    mb.add_argument("--source-bank", required=True)
+    mb.add_argument("--target-bank", default=None, help="default: <source>-v2")
+    mb.add_argument("--embedding-dim", type=int, default=1536)
+    mb.add_argument(
+        "--embedding-model-id", default="openai/text-embedding-3-large@1536"
+    )
+    mb.add_argument(
+        "--embed-model", default="openai/text-embedding-3-large",
+        help="LiteLLM model used to embed (cut to --embedding-dim)",
+    )
+    mb.add_argument("--batch-size", type=int, default=128)
+    mb.add_argument("--max-documents", type=int, default=None)
+
     # ---- index (T15) ----------------------------------------------------
     ix = sub.add_parser("index", help="Index a corpus directory")
     ix.add_argument("path", type=Path)
@@ -167,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "create-bank":
         from prospecta.cli.bank import run_create_bank
         return run_create_bank(args)
+    if args.command == "migrate-bank":
+        from prospecta.cli.bank import run_migrate_bank
+        return run_migrate_bank(args)
     if args.command == "index":
         from prospecta.cli.index import cmd_index
         return cmd_index(args)

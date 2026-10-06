@@ -90,6 +90,8 @@ class Memory:
         embed: EmbedCallable | None = None,
         bank_id: str = "prospecta",
         tracer: Tracer | None = None,
+        shadow_bank_id: str | None = None,
+        shadow_embed: EmbedCallable | None = None,
     ) -> None:
         if not database_url:
             raise ValueError("database_url is required")
@@ -97,6 +99,16 @@ class Memory:
         self._llm = llm
         self._embed = embed
         self._default_bank_id = bank_id
+        # Shadow reads (embedding migration): recall() also queries this bank
+        # with shadow_embed and stores both runs in recall_events.
+        if shadow_bank_id is not None:
+            validate_bank_id(shadow_bank_id)
+            if shadow_embed is None:
+                raise ValueError("shadow_bank_id requires shadow_embed")
+            if shadow_bank_id == bank_id:
+                raise ValueError("shadow_bank_id must differ from bank_id")
+        self._shadow_bank_id = shadow_bank_id
+        self._shadow_embed = shadow_embed
         self._pool = ConnectionPool(database_url=database_url)
         # T16: tracer fan-out. Default = PostgresSink (canonical persistence
         # path for events). Caller may supply NoOpTracer, RecordingTracer,
@@ -300,19 +312,29 @@ class Memory:
             flat.extend(results)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 
-        try:
-            self._tracer("recall", {
-                "bank_id": self._default_bank_id,
-                "queries": [q.text for q in coerced],
-                "mode": mode,
-                "n_results": len(flat),
-                "duration_ms": duration_ms,
-                "trace": None,
-                "results": _serialize_recall_results(flat),
-                "synthesis": None,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on recall; ignoring")
+        if self._shadow_bank_id is None:
+            try:
+                self._tracer("recall", {
+                    "bank_id": self._default_bank_id,
+                    "queries": [q.text for q in coerced],
+                    "mode": mode,
+                    "n_results": len(flat),
+                    "duration_ms": duration_ms,
+                    "trace": None,
+                    "results": _serialize_recall_results(flat),
+                    "synthesis": None,
+                })
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised on recall; ignoring")
+        else:
+            # With a shadow bank, the old/new PAIR of events replaces the
+            # single event (the old side is stored by run_shadow_recall).
+            from prospecta._shadow import run_shadow_recall
+            run_shadow_recall(
+                self, coerced, flat, mode=mode, limit=limit,
+                metadata_filter=metadata_filter, rrf_k=rrf_k,
+                primary_duration_ms=duration_ms,
+            )
 
         return flat
 

@@ -18,7 +18,9 @@ DEFAULT_EMBED_MODEL = "openai/text-embedding-3-small"
 DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 
 
-def make_default_embedder(model: str | None = None) -> EmbedCallable:
+def make_default_embedder(
+    model: str | None = None, dimensions: int | None = None
+) -> EmbedCallable:
     """Build an EmbedCallable backed by LiteLLM.
 
     Resolution order for the model id:
@@ -36,7 +38,10 @@ def make_default_embedder(model: str | None = None) -> EmbedCallable:
     resolved_model = model or os.environ.get("PROSPECTA_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
     def embed(texts: list[str]) -> list[list[float]]:
-        response = litellm.embedding(model=resolved_model, input=texts)
+        kwargs: dict = {"model": resolved_model, "input": texts}
+        if dimensions is not None:
+            kwargs["dimensions"] = dimensions  # e.g. text-embedding-3-large cut to 1536
+        response = litellm.embedding(**kwargs)
         # LiteLLM response.data is a list of dicts (or objects) with "embedding".
         return [_extract_embedding(item) for item in response.data]
 
