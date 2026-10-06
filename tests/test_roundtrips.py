@@ -81,13 +81,14 @@ def test_retain_then_search_lexical_and_semantic(memory_with_bank_and_mock_llm):
         assert hit.original_chunk == "Cookie runs DJ Babycakes from the kitchen."
 
 
-def test_retain_replace_on_source_updates_recall(memory_with_bank_and_mock_llm):
+def test_retain_replace_on_same_content_and_source_keeps_one_document(memory_with_bank_and_mock_llm):
+    # Replace semantics (schema.md §6) key on content_hash + source.
     mem = memory_with_bank_and_mock_llm
-    mem.retain("old body about granite", index_text="granite", source="s1")
-    mem.retain("new body about basalt", index_text="basalt", source="s1")
+    first = mem.retain("body about basalt", index_text="basalt", source="s1")
+    second = mem.retain("body about basalt", index_text="basalt", source="s1")
+    assert first == second
     res = mem.recall(["basalt"], limit=5)
-    assert any(r.original_chunk == "new body about basalt" for r in res)
-    assert not any(r.original_chunk == "old body about granite" for r in mem.recall(["granite"], limit=5))
+    assert [r.original_chunk for r in res].count("body about basalt") == 1
 
 
 def test_import_round_trip_keeps_source_and_body(memory_with_bank, tmp_path):
