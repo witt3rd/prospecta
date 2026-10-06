@@ -293,12 +293,14 @@ def test_reader_follow_ups_join_new_notes_and_rerank_again(mem):
 
 def test_hop_keeps_main_run_channel_lists_for_scope_promotion(mem, monkeypatch):
     import prospecta._index as _index
-    seen = {}
+    seen = {"n": 0}
     real = _index.run_channels
 
     def spy(state, plan, config, **kw):
         out = real(state, plan, config, **kw)
-        seen["state"], seen["main"] = state, state.channel_lists
+        seen["n"] += 1
+        seen["state"] = state
+        seen.setdefault("main", state.channel_lists)
         return out
     monkeypatch.setattr(_index, "run_channels", spy)
     mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["dog barked moon"]})
@@ -307,7 +309,7 @@ def test_hop_keeps_main_run_channel_lists_for_scope_promotion(mem, monkeypatch):
     mem.recall([QUERY], limit=10)
     h = last_event(mem, "hops")[0]["per_query"][0]
     assert h["verdict"] == "follow_up" and h["new_candidates"]   # the hop really fired
-    assert seen["state"].channel_lists is seen["main"]   # not replaced by the hop's cheap-only lists
+    assert seen["n"] >= 2 and seen["state"].channel_lists is seen["main"]   # not replaced by the hop's cheap-only lists
 
 
 def test_reader_failure_is_recorded_and_order_stands(mem):
