@@ -108,6 +108,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stats for active bank only",
     )
 
+    # ---- health ---------------------------------------------------------
+    sub.add_parser("health", help="Check database + embedder; non-zero if down")
+
     # ---- config (T15) ---------------------------------------------------
     sub.add_parser("config", help="Print loaded config (redacted)")
 
@@ -155,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stats":
         from prospecta.cli.stats import cmd_stats
         return cmd_stats(args)
+    if args.command == "health":
+        from prospecta.cli.health import cmd_health
+        return cmd_health(args)
     if args.command == "config":
         from prospecta.cli.config import cmd_config
         return cmd_config(args)
