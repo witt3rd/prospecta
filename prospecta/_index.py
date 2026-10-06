@@ -585,8 +585,10 @@ def search(
 def _search_channels(
     memory: "Memory", text: str, bank_id: str, config: list[dict],
     *, limit: int, metadata_filter: dict | None, rrf_k: int, trace: list | None,
+    recall_cfg: dict | None = None,
 ) -> list[RecalledMemory]:
-    """Hybrid recall through the bank's configured channels (banks.channel_config)."""
+    """Hybrid recall through the bank's configured channels (banks.channel_config).
+    `recall_cfg` overrides the bank's stage config ({} = no stages); None reads it."""
     meta_cfg = next((e for e in config if e.get("name") == "meta" and e.get("enabled", True)), None)
     plan = QueryPlan(text=text)
     with memory._pool.connection() as conn:
@@ -610,7 +612,8 @@ def _search_channels(
         fused, tr = run_channels(
             state, plan, config, k=rrf_k, pool=max(POOL, limit),
         )
-        recall_cfg = read_recall_config(conn, bank_id)
+        if recall_cfg is None:
+            recall_cfg = read_recall_config(conn, bank_id)
         if recall_cfg:
             fused, st = run_stages(
                 state, text, fused, config, recall_cfg,
@@ -619,6 +622,7 @@ def _search_channels(
                 k=rrf_k,
             )
             tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
+                      fallback_reason=st.get("fallback_reason"),
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
     n_out = limit

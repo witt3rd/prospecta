@@ -221,3 +221,38 @@ def test_cli_eval_prints_report_and_json(mem, tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["n_questions"] == 2
     qf.write_text("## Q\nx\n")
     assert cmd_eval(args) == 2
+
+
+QMD = """# Questions
+
+### Q001
+- class: multinote
+- question: What did Kelly say
+  about the trip?
+- gold: kelly-trip.md, hotel.md
+
+### Q002
+class: single
+question: Where did we stay?
+gold: hotel.md
+gold2: a/b/hotel.md
+answer: Harbour Inn
+"""
+
+
+def test_parse_questions_md_qblocks():
+    qs = ev.parse_questions(QMD)
+    assert [q.id for q in qs] == ["Q001", "Q002"]
+    assert qs[0].text == "What did Kelly say about the trip?" and qs[0].cls == "multinote"
+    assert qs[0].gold == ["kelly-trip.md", "hotel.md"]
+    assert qs[1].gold2 == ["a/b/hotel.md"] and qs[1].answer == "Harbour Inn"
+    with pytest.raises(ValueError, match="no `gold:`"):
+        ev.parse_questions("### Q1\nquestion: x\n")
+
+
+def test_eval_runs_production_path_and_reports_channel_errors(mem):
+    _, st = ev.retrieve(mem, "what did alpha say", DEFAULT_CHANNEL_CONFIG, {})
+    assert "channel:meta" in st
+    bad = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
+    bad["full"]["stages"]["channel:dense_chunk"].update(errors=2, last_error="boom: dim")
+    assert "ERROR x2: boom: dim" in ev.format_report(bad)

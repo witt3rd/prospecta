@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from prospecta._template import render_prompt
-from prospecta.channels import DEFAULT_CHANNEL_CONFIG, QueryPlan, RecallState, run_channels
+from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.channels.registry import REGISTRY
-from prospecta.stages import StageDeps, parse_json_object, read_recall_config, run_stages
+from prospecta.stages import parse_json_object, read_recall_config
 
 MARGIN = 0.03
 TOP = 10
@@ -62,7 +62,45 @@ def _names(value: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,;]", value) if p.strip()]
 
 
+def _parse_qblocks(text: str) -> list[Question]:
+    """The project's questions.md: `### Qnnn` blocks with `class:` / `question:` /
+    `gold:` (and optional `gold2:` / `answer:`) lines; `question:` may continue
+    on the following unlabelled lines."""
+    out: list[Question] = []
+    for block in re.split(r"^###[ \t]+", text, flags=re.M)[1:]:
+        head, _, body = block.partition("\n")
+        qid = head.strip().split()[0] if head.strip() else ""
+        if not qid:
+            raise ValueError("a question block has an empty id after '###'")
+        fields: dict[str, str] = {}
+        last = None
+        for line in body.splitlines():
+            m = re.match(r"^[-*]?\s*(gold2|gold|answer|class|question):[ \t]*(.*)$", line.strip(), re.I)
+            if m:
+                last = m.group(1).lower()
+                fields[last] = m.group(2).strip()
+            elif line.strip() and last == "question":
+                fields["question"] += " " + line.strip()
+        if not fields.get("question"):
+            raise ValueError(f"question {qid}: no `question:` line")
+        gold = _names(fields.get("gold", ""))
+        if not gold:
+            raise ValueError(f"question {qid}: no `gold:` line")
+        out.append(Question(
+            id=qid, text=fields["question"], gold=gold, gold2=_names(fields.get("gold2", "")),
+            cls=fields.get("class", ""), answer=fields.get("answer") or None))
+    return out
+
+
 def parse_questions(text: str) -> list[Question]:
+    if re.search(r"^###[ \t]+Q", text, flags=re.M) and not re.search(r"^##[ \t]+[^#]", text, flags=re.M):
+        out = _parse_qblocks(text)
+        ids = [q.id for q in out]
+        dup = {i for i in ids if ids.count(i) > 1}
+        if dup:
+            raise ValueError(f"duplicate question ids: {sorted(dup)}")
+        if out:
+            return out
     out: list[Question] = []
     blocks = re.split(r"^##[ \t]+", text, flags=re.M)[1:]
     for block in blocks:
@@ -89,7 +127,7 @@ def parse_questions(text: str) -> list[Question]:
             id=qid, text=question, gold=gold, gold2=_names(fields.get("gold2", "")),
             cls=fields.get("class", cls), answer=fields.get("answer") or None))
     if not out:
-        raise ValueError("no questions found (expected '## <id>' blocks)")
+        raise ValueError("no questions found (expected '## <id>' or '### Qnnn' blocks)")
     ids = [q.id for q in out]
     dup = {i for i in ids if ids.count(i) > 1}
     if dup:
@@ -214,26 +252,24 @@ def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
              *, pool: int = 30, rrf_k: int = 60) -> tuple[list[str], dict]:
     """One recall under an explicit config (nothing is written to the bank).
     Returns (note names best first, {stage: {n, latency_ms, cost_usd, ...}})."""
+    from prospecta._index import _search_channels
     stages: dict[str, dict] = {}
     t0 = time.monotonic()
-    with memory._pool.connection() as conn:
-        state = RecallState(conn=conn, bank_id=memory.default_bank_id, embed=memory._embed)
-        fused, tr = run_channels(state, QueryPlan(text=query), channel_config,
-                                 k=rrf_k, pool=pool)
-        for c in tr["channels"]:
-            stages[f"channel:{c['name']}"] = {
-                "n": c["n"], "latency_ms": c["latency_ms"], "cost_usd": c["cost_usd"],
-                "error": c["error"]}
-        if recall_cfg:
-            fused, st = run_stages(
-                state, query, fused, channel_config, recall_cfg,
-                StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
-                          model=memory._rerank_model), k=rrf_k)
-            stages.update({f"stage:{k}": v for k, v in _calls_by_stage(st["calls"]).items()})
-            if st.get("fallback_reason"):
-                stages["stage:fallback"] = {"n": 1, "reason": st["fallback_reason"]}
+    trace: list = []
+    # the production path: filter extraction, channels, stages, hop, scope promotion
+    recalled = _search_channels(
+        memory, query, memory.default_bank_id, channel_config, limit=pool,
+        metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {})
+    tr = trace[0]
+    for c in tr["channels"]:
+        stages[f"channel:{c['name']}"] = {
+            "n": c["n"], "latency_ms": c["latency_ms"], "cost_usd": c["cost_usd"],
+            "error": c["error"]}
+    stages.update({f"stage:{k}": v for k, v in _calls_by_stage(tr.get("calls") or []).items()})
+    if tr.get("fallback_reason"):
+        stages["stage:fallback"] = {"n": 1, "reason": tr["fallback_reason"]}
     stages["total"] = {"latency_ms": int((time.monotonic() - t0) * 1000)}
-    return [f.source for f in fused], stages
+    return [r.source for r in recalled], stages
 
 
 def _add_stages(total: dict, one: dict) -> None:
@@ -245,6 +281,7 @@ def _add_stages(total: dict, one: dict) -> None:
         t["cost_usd"] += s.get("cost_usd") or 0.0
         if s.get("error") or s.get("reason"):
             t["errors"] = t.get("errors", 0) + 1
+            t.setdefault("last_error", str(s.get("error") or s.get("reason")))
 
 
 def run_variant(memory, questions: list[Question], channel_config: list[dict],
@@ -375,7 +412,8 @@ def format_report(r: dict) -> str:
                  f"cover@10 {s['cover10']:.2f}")
     L.append("stages (mean per question):")
     for name, s in r["full"]["stages"].items():
-        L.append(f"  {name:<28} {s['mean_latency_ms']:8.1f} ms  ${s['cost_usd'] / max(r['n_questions'], 1):.5f}")
+        L.append(f"  {name:<28} {s['mean_latency_ms']:8.1f} ms  ${s['cost_usd'] / max(r['n_questions'], 1):.5f}"
+                 + (f"  ERROR x{s['errors']}: {s['last_error']}" if s.get("errors") else ""))
     if r.get("ablations"):
         L.append(f"ablations (a channel earns its weight when removing it costs >= {r['margin']}):")
         for a in r["ablations"]:
