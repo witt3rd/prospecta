@@ -30,8 +30,11 @@ dev = [
 defaults = [
     "litellm>=1.0",
 ]
-embed-sentence-transformers = [
+embedder = [
     "sentence-transformers>=2.5",
+]
+embed-sentence-transformers = [
+    "prospecta[embedder]",
 ]
 embed-openai = [
     "openai>=1.0",
