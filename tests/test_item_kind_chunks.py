@@ -213,6 +213,34 @@ def test_backfill_is_batched_and_resumable(populated_v3):
     assert _kinds(url)[0][:2] == ("chunk", 7)
 
 
+def test_finish_0004_runs_after_crash_post_commit(populated_v3):
+    url = populated_v3
+    _apply_upto(url, 4)
+    assert _kinds(url) == [("question", 10, None, None)]
+    res = migrate.run_migrations(url)
+    assert res["applied"] == []
+    assert _kinds(url) == [("chunk", 7, 0, 69), ("question", 3, None, None)]
+    with psycopg.connect(url) as c:
+        names = {r[0] for r in c.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename='memory_items'")}
+    assert "memory_items_bank_kind_idx" in names
+    assert hnsw_kind_index_name("live", "chunk") in names
+    assert hnsw_kind_index_name("live", "question") in names
+
+
+def test_invalid_index_is_rebuilt(populated_v3):
+    url = populated_v3
+    migrate.run_migrations(url)
+    name = hnsw_kind_index_name("live", "chunk")
+    with psycopg.connect(url, autocommit=True) as c:
+        c.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass", (name,))
+    migrate.run_migrations(url)
+    with psycopg.connect(url) as c:
+        assert c.execute(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = %s::regclass", (name,)
+        ).fetchone()[0]
+
+
 def test_kind_index_name_fits_and_is_unique_for_long_banks():
     a = hnsw_kind_index_name("x" * 63, "chunk")
     b = hnsw_kind_index_name("x" * 62 + "y", "chunk")

@@ -88,7 +88,7 @@ def run_migrations(database_url: str) -> dict:
 
         conn.commit()
 
-    if 4 in applied:
+    if 4 in current or 4 in applied:
         finish_0004(database_url)
 
     return {"applied": applied, "skipped": skipped}
@@ -107,10 +107,15 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
     2. CREATE INDEX CONCURRENTLY on (bank_id, kind).
     3. Per bank and per kind, a partial HNSW index (embedding::vector(N)).
     """
-    from prospecta.db.queries import KIND_INDEX_KINDS, ensure_kind_hnsw_indexes
+    from prospecta.db.queries import (
+        KIND_INDEX_KINDS,
+        ensure_kind_hnsw_indexes,
+        hnsw_kind_index_name,
+    )
 
     backfilled = 0
     with psycopg.connect(database_url, autocommit=True) as conn:
+        conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATE_LOCK_KEY,))
         while True:
             with conn.cursor() as cur:
                 cur.execute(
@@ -135,12 +140,24 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
             if n == 0:
                 break
         with conn.cursor() as cur:
+            cur.execute("SELECT bank_id, embedding_dim FROM banks")
+            banks = cur.fetchall()
+        ours = ["memory_items_bank_kind_idx"] + [
+            hnsw_kind_index_name(b, k) for b, _ in banks for k in KIND_INDEX_KINDS
+        ]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = 'memory_items'::regclass AND NOT i.indisvalid "
+                "AND c.relname = ANY(%s)",
+                (ours,),
+            )
+            for (name,) in cur.fetchall():
+                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
             cur.execute(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS memory_items_bank_kind_idx "
                 "ON memory_items (bank_id, kind)"
             )
-            cur.execute("SELECT bank_id, embedding_dim FROM banks")
-            banks = cur.fetchall()
         for bank_id, dim in banks:
             ensure_kind_hnsw_indexes(conn, bank_id, dim)
     return {"backfilled": backfilled, "banks": len(banks), "kinds": list(KIND_INDEX_KINDS)}
