@@ -6,6 +6,7 @@ tasks (T9 vertical slice, T11 retain, T12 recall_synth, etc.).
 from __future__ import annotations
 
 import re as _re
+from prospecta._filters import filter_fields
 
 # ---------------------------------------------------------------------------
 # Bank lifecycle
@@ -175,9 +176,10 @@ def upsert_document(
             """
             INSERT INTO documents
                 (bank_id, source, original_text, content_hash,
-                 tags, document_metadata)
+                 tags, document_metadata, created_on, person, source_kind)
             VALUES (%(bank_id)s, %(source)s, %(original_text)s, %(content_hash)s,
-                    %(tags)s, %(metadata)s::jsonb)
+                    %(tags)s, %(metadata)s::jsonb,
+                    %(created_on)s, %(person)s, %(source_kind)s)
             RETURNING id
             """,
             {
@@ -187,6 +189,7 @@ def upsert_document(
                 "content_hash": content_hash,
                 "tags": tags_arr,
                 "metadata": metadata_json,
+                **filter_fields(metadata),
             },
         )
         doc_id = cur.fetchone()[0]
@@ -217,6 +220,8 @@ def update_document_source(conn, *, document_id: str, source: str | None,
                 original_text = %(original_text)s,
                 document_metadata = %(metadata)s::jsonb,
                 tags = %(tags)s,
+                created_on = %(created_on)s, person = %(person)s,
+                source_kind = %(source_kind)s,
                 updated_at = now()
             WHERE id = %(id)s
             """,
@@ -226,6 +231,7 @@ def update_document_source(conn, *, document_id: str, source: str | None,
                 "original_text": original_text,
                 "metadata": _json.dumps(metadata or {}),
                 "tags": list(tags or []),
+                **filter_fields(metadata),
             },
         )
 

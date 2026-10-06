@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from prospecta.channels.bm25 import Bm25Chunks
 from prospecta.channels.graph import GraphExpand
+from prospecta.channels.meta import MetadataScope
 from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks
 
 REGISTRY: dict[str, type] = {
@@ -12,6 +13,7 @@ REGISTRY: dict[str, type] = {
     AnticipatedQuestions.name: AnticipatedQuestions,
     Bm25Chunks.name: Bm25Chunks,
     GraphExpand.name: GraphExpand,
+    MetadataScope.name: MetadataScope,
 }
 
 # The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
@@ -27,6 +29,7 @@ DEFAULT_CHANNEL_CONFIG: list[dict] = [
      "params": {"limit": 50, "seeds": 10, "max_hops": 2, "decay": 0.5, "node_cap": 60,
                 "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
                                  "TEMPORAL": 0.5, "ENTITY": 0.5}}},
+    {"name": "meta", "enabled": True, "weight": 3, "params": {"limit": 50}},
 ]
 
 DEFAULT_LIMIT = 50

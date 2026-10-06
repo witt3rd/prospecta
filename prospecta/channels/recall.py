@@ -47,6 +47,7 @@ def run_channels(
             "n": len(cands), "latency_ms": int((time.monotonic() - t0) * 1000),
             "cost_usd": 0.0, "error": error,
         })
+    state.channel_lists = lists
     weights = {cc.name: cc.weight for cc in channels}
     fused = fuse(lists, weights, k=k, pool=pool)
     trace = {

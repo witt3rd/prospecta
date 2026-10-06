@@ -16,10 +16,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_text
-from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_channels
 from prospecta.stages import StageDeps, read_recall_config, run_stages
+from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
+from prospecta.channels import (
+    QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
+    run_channels, scope_members,
+)
 from prospecta.channels.recall import POOL
 from prospecta._ignore import should_ignore
+from prospecta._filters import filter_fields
 from prospecta._parser import parse_frontmatter
 from prospecta._types import IndexStats, RecalledMemory
 from prospecta.db.queries import (
@@ -87,6 +92,10 @@ class _MarkdownParser:
         if "index_text" in fm:
             # Forward-compatible: record presence; spine consumes in T10.
             metadata["has_caller_index_text"] = True
+        # Filter fields (documents.created_on / person / source_kind, 0005)
+        for k, v in filter_fields(fm).items():
+            if v is not None:
+                metadata[k] = v.isoformat() if k == "created_on" else v
         # Tags surface for documents.tags
         tags = metadata.get("frontmatter_tags", []) or []
         yield ParsedDocument(
@@ -578,8 +587,22 @@ def _search_channels(
     *, limit: int, metadata_filter: dict | None, rrf_k: int, trace: list | None,
 ) -> list[RecalledMemory]:
     """Hybrid recall through the bank's configured channels (banks.channel_config)."""
+    meta_cfg = next((e for e in config if e.get("name") == "meta" and e.get("enabled", True)), None)
     plan = QueryPlan(text=text)
     with memory._pool.connection() as conn:
+        if meta_cfg is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT person FROM documents "
+                    "WHERE bank_id = %s AND person IS NOT NULL ORDER BY person",
+                    (bank_id,),
+                )
+                vocab = [r[0] for r in cur.fetchall()]
+            conn.rollback()
+            plan = QueryPlan(text=text, filters=extract_filters(
+                text, llm=memory._llm, people_vocab=vocab, now=plan.now,
+                model=(meta_cfg.get("params") or {}).get("extract_model") or DEFAULT_EXTRACT_MODEL,
+            ))
         state = RecallState(
             conn=conn, bank_id=bank_id, embed=memory._embed,
             metadata_filter=metadata_filter,
@@ -598,11 +621,20 @@ def _search_channels(
             tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
+    n_out = limit
+    if meta_cfg is not None:
+        # Scope promotion (design 8.5): hard filter with a small complete set
+        # moves every member to the front; the filter never excludes.
+        members = scope_members(plan, state.channel_lists.get("meta", []), int((meta_cfg.get("params") or {}).get("limit", 50)))
+        if members:
+            fused = promote_scope(fused, members)
+            n_out = max(limit, len(members))
+            tr["fusion"]["scope_promoted"] = [m.document_id for m in members]
     if trace is not None:
         trace.append(tr)
     channel_names = [c["name"] for c in tr["channels"]]
     out = []
-    for f in fused[:limit]:
+    for f in fused[:n_out]:
         b = f.best
         scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
         scores.update({n: 0.0 for n in channel_names})

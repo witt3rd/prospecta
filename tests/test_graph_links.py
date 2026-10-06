@@ -167,7 +167,7 @@ def test_graph_default_config_enabled_and_configurable():
     assert names["graph"]["enabled"] and names["graph"]["weight"] > 0
     built = {c.name: c for c in build_channels(DEFAULT_CHANNEL_CONFIG)}
     assert built["graph"].channel.kind == "expand"
-    assert list(built) == ["dense_chunk", "question", "graph"]   # expand runs last
+    assert list(built) == ["dense_chunk", "question", "meta", "graph"]   # filter then expand last
     cfg = [{"name": "graph", "weight": 2.5, "params": {"node_cap": 7, "decay": 0.3}}]
     g = build_channels(cfg)[0]
     assert g.weight == 2.5 and g.channel.params["node_cap"] == 7

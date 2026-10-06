@@ -103,7 +103,7 @@ def test_verdict_ablation_and_addition_margin():
 def test_ablation_variants():
     rc = {"rerank": {"enabled": True}, "gate": {"enabled": True}, "reader": {"enabled": False}}
     vs = {v["name"]: v for v in ev.ablation_variants(DEFAULT_CHANNEL_CONFIG, rc)}
-    assert set(vs) == {"-dense_chunk", "-question", "-graph", "+bm25", "-rerank", "-gate"}
+    assert set(vs) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "-rerank", "-gate"}
     off = [e for e in vs["-question"]["channels"] if e["name"] == "question"][0]
     assert off["enabled"] is False
     assert [e["name"] for e in DEFAULT_CHANNEL_CONFIG if not e.get("enabled", True)] == []
@@ -174,7 +174,7 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     assert stages["stage:rerank_listwise"]["cost_usd"] == pytest.approx(0.002)
     assert "channel:dense_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
     abl = {a["name"]: a for a in rep["ablations"]}
-    assert set(abl) == {"-dense_chunk", "-question", "-graph", "+bm25", "-rerank"}
+    assert set(abl) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "-rerank"}
     assert abl["-rerank"]["summary"]["gold"]["hit1"] == 0.0
     assert abl["-rerank"]["earns"] and "gold.hit1" in abl["-rerank"]["because"]
     assert not abl["-question"]["earns"]

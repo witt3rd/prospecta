@@ -68,7 +68,7 @@ def test_registry_builds_enabled_in_order_and_validates():
            {"name": "dense_chunk", "enabled": False, "weight": 4}]
     built = build_channels(cfg)
     assert [c.name for c in built] == ["question"]
-    assert [c.name for c in build_channels(DEFAULT_CHANNEL_CONFIG)] == ["dense_chunk", "question", "graph"]
+    assert [c.name for c in build_channels(DEFAULT_CHANNEL_CONFIG)] == ["dense_chunk", "question", "meta", "graph"]
     with pytest.raises(ValueError):
         validate_channel_config([{"name": "nope"}])
     with pytest.raises(ValueError):
@@ -141,14 +141,14 @@ def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
             "SELECT channel, rank, score, document_id, item_id FROM recall_event_candidates "
             "WHERE recall_event_id=%s ORDER BY channel, rank", (ev_id,)).fetchall()
     assert plan["queries"][0]["text"] == "cat sat warm mat window"
-    assert [c["name"] for c in channels] == ["dense_chunk", "question", "graph"]
+    assert [c["name"] for c in channels] == ["dense_chunk", "question", "meta", "graph"]
     assert all(c["error"] is None and "latency_ms" in c for c in channels)
-    assert all(c["n"] >= 1 for c in channels if c["name"] != "graph")   # no links yet
+    assert all(c["n"] >= 1 for c in channels if c["name"] not in ("graph", "meta"))   # no links, no filter
     assert fusion["method"] == "weighted_rrf" and fusion["k"] == 60
-    assert fusion["weights"] == {"dense_chunk": 4.0, "question": 1.0, "graph": 1.0}
+    assert fusion["weights"] == {"dense_chunk": 4.0, "question": 1.0, "graph": 1.0, "meta": 3.0}
     assert len(fusion["pool"]) == 2
     by_channel = {c[0] for c in cands}
-    assert by_channel == {"dense_chunk", "question"}
+    assert by_channel == {"dense_chunk", "question"}  # meta had no filter
     dense = [c for c in cands if c[0] == "dense_chunk"]
     assert [c[1] for c in dense] == [1, 2]
     assert dense[0][2] >= dense[1][2]

@@ -63,6 +63,7 @@ class RecallState:
     embed: Callable[[list[str]], list[list[float]]] | None = None
     metadata_filter: dict | None = None
     pool: list[Candidate] = field(default_factory=list)
+    channel_lists: dict[str, list[Candidate]] = field(default_factory=dict)  # set by run_channels
     _embeddings: dict[str, list[float]] = field(default_factory=dict)
 
     def embed_query(self, text: str) -> list[float]:

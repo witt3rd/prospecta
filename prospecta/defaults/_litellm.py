@@ -57,15 +57,18 @@ def make_default_llm(model: str | None = None) -> LLMCallable:
       3. ``openai/gpt-4o-mini`` (default)
 
     Returns a callable conforming to the ``LLMCallable`` Protocol:
-    ``(messages: list[dict], *, json_mode: bool = False) -> str``.
+    ``(messages: list[dict], *, json_mode: bool = False,
+    model: str | None = None) -> str``; ``model`` overrides the bank model
+    for that call.
 
     When ``json_mode=True``, passes ``response_format={"type": "json_object"}``
     to LiteLLM. Otherwise, no ``response_format`` is set.
     """
     resolved_model = model or os.environ.get("PROSPECTA_LLM_MODEL", DEFAULT_LLM_MODEL)
 
-    def llm(messages: list[dict], *, json_mode: bool = False) -> str:
-        kwargs: dict = {"model": resolved_model, "messages": messages}
+    def llm(messages: list[dict], *, json_mode: bool = False,
+            model: str | None = None) -> str:
+        kwargs: dict = {"model": model or resolved_model, "messages": messages}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         response = litellm.completion(**kwargs)

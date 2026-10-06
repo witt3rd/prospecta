@@ -91,6 +91,8 @@ def run_migrations(database_url: str) -> dict:
 
     if 4 in current or 4 in applied:
         finish_0004(database_url)
+    if 5 in current or 5 in applied:
+        finish_0005(database_url)
 
     return {"applied": applied, "skipped": skipped}
 
@@ -173,6 +175,70 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
         for bank_id, dim in banks:
             ensure_kind_hnsw_indexes(conn, bank_id, dim)
     return {"backfilled": backfilled, "banks": len(banks), "kinds": list(KIND_INDEX_KINDS)}
+
+
+def finish_0005(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
+    """Post-commit half of migration 0005; idempotent, safe to re-run.
+
+    1. Keyset-batched backfill (one short transaction per batch, by document
+       id) of created_on / person / source_kind from document_metadata where
+       those keys exist and the column is still NULL. Never overwrites.
+    2. CREATE INDEX CONCURRENTLY on (bank_id, created_on) and (bank_id, person).
+    """
+    from prospecta._filters import filter_fields
+
+    backfilled = 0
+    after = None
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        while not conn.execute(
+            "SELECT pg_try_advisory_lock(%s)", (MIGRATE_LOCK_KEY + 2,)
+        ).fetchone()[0]:
+            time.sleep(0.05)
+        while True:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, document_metadata FROM documents "
+                    "WHERE (%(after)s::uuid IS NULL OR id > %(after)s::uuid) "
+                    "AND created_on IS NULL AND person IS NULL AND source_kind IS NULL "
+                    "AND document_metadata ?| ARRAY['created_on','created','date',"
+                    "'person','source_kind','type'] "
+                    "ORDER BY id LIMIT %(n)s",
+                    {"after": after, "n": batch_size},
+                )
+                rows = cur.fetchall()
+                for doc_id, meta in rows:
+                    f = filter_fields(meta)
+                    if any(v is not None for v in f.values()):
+                        cur.execute(
+                            "UPDATE documents SET created_on = %(created_on)s, "
+                            "person = %(person)s, source_kind = %(source_kind)s "
+                            "WHERE id = %(id)s AND created_on IS NULL AND person IS NULL "
+                            "AND source_kind IS NULL",
+                            {**f, "id": doc_id},
+                        )
+                        backfilled += cur.rowcount
+            if len(rows) < batch_size:
+                break
+            after = str(rows[-1][0])
+        ours = ["documents_bank_created_on_idx", "documents_bank_person_idx"]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = 'documents'::regclass AND NOT i.indisvalid "
+                "AND c.relname = ANY(%s)",
+                (ours,),
+            )
+            for (name,) in cur.fetchall():
+                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+            cur.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS documents_bank_created_on_idx "
+                "ON documents (bank_id, created_on)"
+            )
+            cur.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS documents_bank_person_idx "
+                "ON documents (bank_id, person)"
+            )
+    return {"backfilled": backfilled}
 
 
 def get_schema_version(database_url: str) -> int | None:

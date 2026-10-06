@@ -233,7 +233,8 @@ _PENDING_COUNT = "SELECT count(*) " + _PENDING
 def _fetch_pending(memory, source_bank, target_bank, after_id, limit):
     sql = (
         "SELECT s.id::text, s.source, s.original_text, s.content_hash, s.tags, "
-        "s.document_metadata, s.retain_params, s.created_at "
+        "s.document_metadata, s.retain_params, s.created_at, "
+        "s.created_on, s.person, s.source_kind "
         + _PENDING
         + (" AND s.id > %(after)s::uuid" if after_id else "")
         + " ORDER BY s.id LIMIT %(limit)s"
@@ -242,7 +243,8 @@ def _fetch_pending(memory, source_bank, target_bank, after_id, limit):
         cur.execute(sql, {"src": source_bank, "dst": target_bank,
                           "after": after_id, "limit": limit})
         cols = ["id", "source", "original_text", "content_hash", "tags",
-                "document_metadata", "retain_params", "created_at"]
+                "document_metadata", "retain_params", "created_at",
+                "created_on", "person", "source_kind"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
@@ -270,14 +272,15 @@ def _write_document(memory, target_bank, d, chunk_vecs, q_vecs, report) -> None:
                 """
                 INSERT INTO documents (bank_id, source, original_text, content_hash,
                                        tags, document_metadata, retain_params,
-                                       created_at)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                                       created_at, created_on, person, source_kind)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
                 ON CONFLICT (bank_id, content_hash) DO NOTHING
                 RETURNING id
                 """,
                 (target_bank, d["source"], d["original_text"], d["content_hash"],
                  list(d["tags"] or []), json.dumps(meta),
-                 json.dumps(d["retain_params"] or {}), d["created_at"]),
+                 json.dumps(d["retain_params"] or {}), d["created_at"],
+                 d["created_on"], d["person"], d["source_kind"]),
             )
             row = cur.fetchone()
             if row is None:
