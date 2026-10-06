@@ -83,6 +83,8 @@ def validate_recall_config(cfg: dict) -> None:
         v = section.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < lo):
             raise ValueError(f"{name} must be an integer >= {lo}")
+    if rd.get("type", "sonnet") not in ("sonnet", "jev"):
+        raise ValueError("reader.type must be 'sonnet' or 'jev'")
     t = gate.get("threshold")
     if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float))):
         raise ValueError("gate.threshold must be a number")
@@ -465,6 +467,78 @@ class SonnetReader:
         return sufficient, fu
 
 
+_STOP_QUESTIONS = {
+    "evidence_sufficient": "Do the excerpts together hold what is needed to answer state.query?",
+    "continue_useful": "Would searching for more notes help answer state.query, beyond these excerpts?",
+    "missing_evidence": "Is a fact that state.query needs absent from these excerpts?",
+}
+JEV_SUFFICIENT = 2.5
+JEV_CONTINUE = 1.5
+
+
+class JevReader:
+    """Optional reader in place of the Sonnet reader (design 8.7): Jev's
+    stopping questions on the top excerpts, as System One `score` questions
+    (0..3) in one request: evidence_sufficient, continue_useful,
+    missing_evidence. Sufficient when evidence_sufficient >= 2.5; otherwise a
+    follow-up runs when continue_useful or missing_evidence >= 1.5. Jev writes
+    no text, so the follow-up probe is the best excerpt itself: the cheap
+    channels then find the notes nearest to the evidence found so far (a
+    bridge to the second fact). On any failure the hop is skipped (the caller
+    records the error)."""
+    name = "jev_reader"
+
+    def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
+                 timeout: float = JEV_TIMEOUT_S):
+        self.transport, self.model, self.timeout = transport, model, timeout
+
+    def read(self, query: str, items: list[Item], max_follow_ups: int,
+             calls: list[dict]) -> tuple[bool, list[str]]:
+        text = "\n\n".join(f"[{i}] {it.header}\n{it.evidence}"
+                           for i, it in enumerate(items, start=1))
+        ids = list(_STOP_QUESTIONS)
+        req = {"model": self.model, "state": {"query": query},
+               "questions": {f"p{n}": {
+                   "type": "score",
+                   "instructions": {"task": _STOP_QUESTIONS[k], "kind": "note",
+                                    "title": k, "text": text},
+                   "criteria": ["No", "Barely", "Mostly", "Yes"]}
+                   for n, k in enumerate(ids)}}
+        t0 = time.monotonic()
+        rec: dict = {"purpose": "jev_reader", "model": self.model, "tokens_in": None,
+                     "tokens_out": None, "cost_usd": None, "json_mode": False,
+                     "messages_count": len(ids), "prompt_text": json.dumps(req),
+                     "response_text": None, "error": None}
+        try:
+            resp = self.transport(req, self.timeout)
+            rec["response_text"] = json.dumps(resp)
+            u = resp.get("usage") or {}
+            rec.update(model=resp.get("model") or self.model, tokens_in=u.get("input_tokens"),
+                       tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
+            answers = resp.get("answers")
+            if not isinstance(answers, dict) or set(answers) != {f"p{n}" for n in range(len(ids))}:
+                raise ValueError("answers are not exactly the asked ids")
+            val: dict[str, float] = {}
+            for n, k in enumerate(ids):
+                a = answers[f"p{n}"]
+                v = a.get("score") if isinstance(a, dict) else None
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(v) or not 0 <= v <= 3:
+                    raise ValueError("answer does not score every question in 0..3")
+                val[k] = float(v)
+        except Exception as exc:
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            calls.append(rec)
+        if val["evidence_sufficient"] >= JEV_SUFFICIENT or not items:
+            return True, []
+        if max(val["continue_useful"], val["missing_evidence"]) >= JEV_CONTINUE:
+            return False, [items[0].evidence][:max_follow_ups]
+        return True, []
+
+
 @dataclass
 class StageDeps:
     llm: Any = None
@@ -507,10 +581,16 @@ def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls,
         trace["rerank"] = rerank_rec
 
     if reader_cfg.get("enabled"):
-        if deps.llm is None:
+        if deps.llm is None and reader_cfg.get("type", "sonnet") != "jev":
             raise RuntimeError("reader needs an llm callable")
+        if reader_cfg.get("type", "sonnet") == "jev":
+            if deps.jev is None:
+                raise RuntimeError("reader.type = jev needs a Jev transport")
+            reader = JevReader(deps.jev.transport, deps.jev.model, deps.jev.timeout)
+        else:
+            reader = SonnetReader(deps.llm, deps.model or SONNET_MODEL)
         items, hops = _hop(state, query, items, channel_config, reader_cfg, reranker,
-                           SonnetReader(deps.llm, deps.model or SONNET_MODEL), calls, k)
+                           reader, calls, k)
         trace["hops"] = hops
 
     trace.update(totals(calls))

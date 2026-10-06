@@ -280,6 +280,7 @@ def retain(
     except Exception:  # pragma: no cover — tracer must not break retain
         logger.exception("tracer raised; ignoring")
 
+    memory._enqueue_link(document_id)
     return document_id
 
 

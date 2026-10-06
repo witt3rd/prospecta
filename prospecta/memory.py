@@ -125,6 +125,7 @@ class Memory:
         rerank_llm: LLMCallable | None = None,
         rerank_model: str | None = None,
         jev: "Any | None" = None,
+        linker: "Any | None" = None,
     ) -> None:
         if not database_url:
             raise ValueError("database_url is required")
@@ -136,6 +137,11 @@ class Memory:
         self._rerank_llm = rerank_llm
         self._rerank_model = rerank_model
         self._jev = jev
+        # Linker (prospecta._linker.Linker): typed links + entities after retain.
+        # None = no linking; with `asynchronous` it runs on one worker thread.
+        self._linker = linker
+        self._link_executor = None
+        self._link_futures: list = []
         self._default_bank_id = bank_id
         # Shadow reads (embedding migration): recall() also queries this bank
         # with shadow_embed and stores both runs in recall_events.
@@ -301,8 +307,65 @@ class Memory:
             )
 
     def close(self) -> None:
-        """Close the connection pool."""
+        """Close the connection pool (after the link worker drains)."""
+        self.wait_for_links()
+        if self._link_executor is not None:
+            self._link_executor.shutdown(wait=True)
         self._pool.close()
+
+    # ------------------------------------------------------------------
+    # Linker (migration 0006): typed links and entities, after retain
+    # ------------------------------------------------------------------
+
+    def link_document(self, document_id: str, bank_id: str | None = None) -> dict:
+        """Link one document now (needs Memory(linker=...)). Returns its stats."""
+        if self._linker is None:
+            raise RuntimeError("link_document needs Memory(linker=...)")
+        calls: list[dict] = []
+        with self._pool.connection() as conn:
+            stats = self._linker.link_document(
+                conn, bank_id or self._default_bank_id, document_id, calls)
+        for c in calls:
+            try:
+                self._tracer("llm_call", {"bank_id": bank_id or self._default_bank_id, **c})
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised on llm_call; ignoring")
+        return stats
+
+    def link_pending(self, limit: int = 100, bank_id: str | None = None) -> int:
+        """Link up to `limit` documents that have no link state yet (the safety
+        net for documents written by the sweeper or before a Linker was set)."""
+        from prospecta._linker import pending_documents
+        bank = bank_id or self._default_bank_id
+        with self._pool.connection() as conn:
+            docs = pending_documents(conn, bank, limit)
+        for d in docs:
+            self.link_document(d, bank)
+        return len(docs)
+
+    def _enqueue_link(self, document_id: str) -> None:
+        if self._linker is None:
+            return
+        if not self._linker.asynchronous:
+            self.link_document(document_id)
+            return
+        if self._link_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._link_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="linker")
+        bank = self._default_bank_id
+
+        def run():
+            try:
+                self.link_document(document_id, bank)
+            except Exception:
+                logger.exception("linker failed for document %s", document_id)
+        self._link_futures.append(self._link_executor.submit(run))
+
+    def wait_for_links(self) -> None:
+        """Block until the link worker has drained its queue."""
+        futs, self._link_futures = self._link_futures, []
+        for f in futs:
+            f.result()
 
     # ------------------------------------------------------------------
     # T9 — index/search/remove (delegate to _index)

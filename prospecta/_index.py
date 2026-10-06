@@ -382,6 +382,9 @@ def _write_parsed_docs(
         agg = "unchanged"
     else:
         agg = "skipped"
+    if agg in ("new", "replaced"):
+        for d in document_ids:   # idempotent; a no-op without Memory(linker=...)
+            memory._enqueue_link(str(d))
     return SingleFileIndexResult(
         status=agg,
         document_ids=tuple(document_ids),
