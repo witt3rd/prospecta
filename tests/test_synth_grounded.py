@@ -113,6 +113,24 @@ def test_grounded_scope_set_gives_whole_set(mem):
     assert "whole set of notes in scope" in mem.llm.prompts[-1]
 
 
+def test_grounded_scope_of_twenty_notes_uses_all(mem):
+    srcs = [f"many{i:02d}.md" for i in range(20)]
+    for src in srcs:
+        mem.retain(f"{src} cat sat", source=src, index_text=f"{src} cat sat")
+    with psycopg.connect(mem.database_url) as conn:
+        for src in srcs:
+            text = f"{src} cat sat"
+            conn.execute(
+                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
+                " embedding, kind, ordinal, char_start, char_end) "
+                "SELECT 'b', d.id, %s, %s, %s::vector, 'chunk', 0, 0, %s FROM documents d "
+                "WHERE d.source = %s", (text, text, vec(text), len(text), src))
+        conn.commit()
+    res = mem.recall_synth("cat sat", grounded=True, scope=srcs)
+    assert sorted(e["note"] for e in res.evidence) == srcs
+    assert "whole set of notes in scope" in mem.llm.prompts[-1]
+
+
 def test_grounded_scope_too_large_falls_back_to_top(mem):
     res = mem.recall_synth("cat sat", grounded=True, evidence_top=2, scope=["nope.md"])
     assert len(res.evidence) == 2   # empty scope match: top notes

@@ -602,8 +602,9 @@ class Memory:
         Grounded mode runs ONE recall: the question is the single query (no
         formulation call), so meta extraction, rerank, reader and hop happen
         once. `scope` defaults to the notes the extracted hard filter promoted
-        (the filter set); `evidence_top` None means 6, and a set question uses
-        the whole scope set (at most 12) whatever the top.
+        (the filter set); `evidence_top` None keeps the notes scoring at least
+        half the top score, and a set question uses the whole scope set of any
+        size whatever the top.
         """
         import time as _time
 
@@ -657,7 +658,7 @@ class Memory:
                          for d in t.get("fusion", {}).get("scope_promoted", [])] or None
             with self._pool.connection() as conn:
                 notes, set_mode = _synth.gather_evidence(
-                    conn, bank_id, blended, top=evidence_top or _synth.TOP_NOTES, scope=scope)
+                    conn, bank_id, blended, top=evidence_top, scope=scope)
             grounded_res = _synth.synthesize_grounded(
                 message, notes, self._synth_llm or self._llm, set_mode=set_mode)
             synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt
