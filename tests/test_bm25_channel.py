@@ -154,3 +154,46 @@ def test_pg_search_backend_is_only_a_seam():
     ch = Bm25Chunks()
     ch.backend = Fake()  # any object with search() plugs in
     assert ch.retrieve(QueryPlan(text="x"), RecallState(conn=None, bank_id="b"), 5) == []
+
+
+# ------------------------------------------------------- pg_search seam
+
+class _Stub:
+    def __init__(self, tag, avail=True):
+        self.tag, self.avail, self.calls = tag, avail, 0
+
+    def available(self, conn):
+        return self.avail
+
+    def search(self, conn, bank_id, query, n):
+        self.calls += 1
+        return [(self.tag, 1.0)]
+
+
+def test_auto_backend_selection_with_stub():
+    from prospecta.channels import AutoBm25
+    pg, fb = _Stub("pg"), _Stub("fb")
+    assert AutoBm25(pg, fb).search(None, "b", "q", 5) == [("pg", 1.0)]
+    pg.avail = False
+    assert AutoBm25(pg, fb).search(None, "b", "q", 5) == [("fb", 1.0)]
+
+    class Boom(_Stub):
+        def available(self, conn):
+            raise RuntimeError("x")
+    assert AutoBm25(Boom("pg"), fb).search(None, "b", "q", 5) == [("fb", 1.0)]
+
+
+def test_migration_0012_is_noop_without_extension(mem):
+    from prospecta.channels import PgSearchBm25
+    from prospecta.channels.bm25 import PG_SEARCH_INDEX
+    with psycopg.connect(mem.database_url) as conn:
+        assert conn.execute("SELECT 1 FROM pg_available_extensions WHERE name='pg_search'"
+                            ).fetchone() is None
+        assert conn.execute("SELECT 1 FROM pg_indexes WHERE indexname=%s",
+                            (PG_SEARCH_INDEX,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM prospecta_schema_version WHERE version=12"
+                            ).fetchone()
+        assert PgSearchBm25().available(conn) is False
+        out = Bm25Chunks().retrieve(QueryPlan(text="revenue europe"),
+                                    RecallState(conn=conn, bank_id="b"), 5)
+    assert out and out[0].source == "rev.md"  # default AutoBm25 fell back to bm25s

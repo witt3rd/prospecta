@@ -14,8 +14,9 @@ the evidence text is fetched from the database for the top hits.
 Backend seam: `Bm25Backend` is the interface (`search(conn, bank_id, query, n)`
 -> ranked `(item_id, score)`). `InProcessBm25` is the implementation below. A
 `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text`
-ordered by `pdb.score(id)`) would implement the same method; it is NOT built:
-it needs an extension on the live Postgres, which is main's decision.
+ordered by `pdb.score(id)`) is `PgSearchBm25`; migration 0012 creates its index
+only where the extension is installable. `AutoBm25` (the default) uses it when
+that index exists and otherwise stays on `InProcessBm25`.
 """
 from __future__ import annotations
 
@@ -200,7 +201,49 @@ class InProcessBm25:
         return self.index_for(conn, bank_id).search(query, n)
 
 
-_DEFAULT_BACKEND = InProcessBm25()
+PG_SEARCH_INDEX = "memory_items_original_chunk_bm25"
+
+_PG_SEARCH_SQL = """
+SELECT id, pdb.score(id) FROM memory_items
+WHERE bank_id = %s AND kind = 'chunk' AND original_chunk ||| %s
+ORDER BY pdb.score(id) DESC, id LIMIT %s
+"""
+
+
+class PgSearchBm25:
+    """BM25 via the pg_search extension's index (migration 0012)."""
+
+    def available(self, conn) -> bool:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (PG_SEARCH_INDEX,))
+            return cur.fetchone() is not None
+
+    def search(self, conn, bank_id: str, query: str, n: int) -> list[tuple[str, float]]:
+        with conn.cursor() as cur:
+            cur.execute(_PG_SEARCH_SQL, (bank_id, query, int(n)))
+            return [(str(i), float(s)) for i, s in cur.fetchall()]
+
+
+class AutoBm25:
+    """pg_search when its index exists, else the in-process bm25s backend."""
+
+    def __init__(self, pg=None, fallback=None) -> None:
+        self.pg = pg or PgSearchBm25()
+        self.fallback = fallback or InProcessBm25()
+
+    def choose(self, conn) -> Bm25Backend:
+        try:
+            return self.pg if self.pg.available(conn) else self.fallback
+        except Exception:
+            if hasattr(conn, "rollback"):
+                conn.rollback()
+            return self.fallback
+
+    def search(self, conn, bank_id: str, query: str, n: int) -> list[tuple[str, float]]:
+        return self.choose(conn).search(conn, bank_id, query, n)
+
+
+_DEFAULT_BACKEND = AutoBm25()
 
 _HITS_SQL = """
 SELECT m.id, m.document_id, m.content, m.original_chunk, d.source, m.metadata
