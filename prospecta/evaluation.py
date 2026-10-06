@@ -3,7 +3,8 @@ channels and stages, and report cost and latency per stage, so a channel
 earns its weight (hybrid retrieval design 8.7 / 8.10).
 
 questions.md format (one block per question; text before the first `##` is
-ignored):
+ignored). The project's `### Qnnn` blocks with `class:` / `question:` / `gold:`
+lines are also accepted (see docs/eval.md):
 
     ## Q001 | multinote
     What did Kelly say about the trip, and where did we stay?
