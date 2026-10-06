@@ -1,268 +1,401 @@
-"""Import a Hindsight bank dump into a prospecta bank.
+"""Import a Hindsight bank into a prospecta bank.
 
-Idempotent: every memory unit becomes one document with the stable source
-``hindsight:<unit id>``; a unit whose source already exists is skipped, so
-re-running the same dump adds nothing. Nothing is dropped silently — every
-input record lands in exactly one of imported / skipped / failed in the
-ImportReport. See docs/import-hindsight.md for the assumed dump schema.
+Source: a Postgres database holding a Hindsight schema (restore a Hindsight
+pg_dump / cold copy into a scratch Postgres first). Read-only on the source.
+Idempotent: nothing is overwritten and re-runs add nothing. Every source row
+of every Hindsight table lands in exactly one of imported / skipped_duplicate /
+failed / not_carried (with a reason) in the ImportReport.
+See docs/import-hindsight.md for the table-by-table mapping.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+import psycopg
 
 if TYPE_CHECKING:
     from prospecta.memory import Memory
 
-SOURCE_PREFIX = "hindsight:"
+SYSTEM = "hindsight"
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS imported_records (
+    bank_id    TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    system     TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    data       JSONB NOT NULL,
+    PRIMARY KEY (bank_id, system, kind, source_key)
+);
+CREATE TABLE IF NOT EXISTS imported_edges (
+    bank_id TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    system  TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    src     TEXT NOT NULL,
+    dst     TEXT NOT NULL,
+    subtype TEXT NOT NULL DEFAULT '',
+    ref     TEXT NOT NULL DEFAULT '',
+    weight  DOUBLE PRECISION,
+    count   INTEGER,
+    ts      TIMESTAMPTZ,
+    PRIMARY KEY (bank_id, system, kind, src, dst, subtype, ref)
+);
+CREATE INDEX IF NOT EXISTS imported_edges_dst_idx ON imported_edges(bank_id, kind, dst);
+"""
+
+# table -> (kind, key columns, WHERE clause with one %s = hindsight bank id)
+CARRIED = {
+    "banks": ("bank", ["bank_id"], "bank_id = %s"),
+    "documents": ("document", ["id"], "bank_id = %s"),
+    "chunks": ("chunk", ["chunk_id"], "bank_id = %s"),
+    "entities": ("entity", ["id"], "bank_id = %s"),
+    "directives": ("directive", ["id"], "bank_id = %s"),
+    "mental_models": ("mental_model", ["id"], "bank_id = %s"),
+    "mental_model_history": ("mental_model_history", ["id"], "bank_id = %s"),
+    "knowledge_pages": ("knowledge_page", ["id"], "bank_id = %s"),
+    "observation_history": ("observation_history", ["id"], "bank_id = %s"),
+    "invalidated_memory_units": ("invalidated_unit", ["id"], "bank_id = %s"),
+    "file_storage": ("file_storage", ["storage_key"],
+                     "storage_key IN (SELECT file_storage_key FROM documents WHERE bank_id = %s)"),
+    "audit_log": ("audit_log", ["id"], "bank_id = %s"),
+    "llm_requests": ("llm_request", ["id"], "bank_id = %s"),
+}
+
+# table -> (edge kind, SELECT of src,dst,subtype,ref,weight,count,ts, FROM/WHERE using %s = bank)
+EDGES = {
+    "memory_links": (
+        "memory_link",
+        "SELECT from_unit_id::text, to_unit_id::text, link_type, coalesce(entity_id::text,''),"
+        " weight, 1, created_at FROM memory_links WHERE bank_id = %s"),
+    "unit_entities": (
+        "unit_entity",
+        "SELECT ue.unit_id::text, ue.entity_id::text, '', '', 1.0, 1, NULL::timestamptz"
+        " FROM unit_entities ue JOIN memory_units mu ON mu.id = ue.unit_id WHERE mu.bank_id = %s"),
+    "entity_cooccurrences": (
+        "cooccurrence",
+        "SELECT c.entity_id_1::text, c.entity_id_2::text, '', '', 1.0, c.cooccurrence_count,"
+        " c.last_cooccurred FROM entity_cooccurrences c"
+        " JOIN entities e ON e.id = c.entity_id_1 WHERE e.bank_id = %s"),
+}
+
+# table -> (count SQL with %s = bank or None for whole table, reason)
+NOT_CARRIED = {
+    "alembic_version": (None, "Hindsight's own migration marker; meaningless in prospecta"),
+    "async_operations": ("SELECT count(*) FROM async_operations WHERE bank_id = %s",
+                         "transient Hindsight job queue; its work products (units, entities) are imported"),
+    "bank_stats_cache": ("SELECT count(*) FROM bank_stats_cache WHERE bank_id = %s",
+                         "derived cache; prospecta computes its own stats"),
+    "graph_maintenance_queue": ("SELECT count(*) FROM graph_maintenance_queue WHERE bank_id = %s",
+                                "transient Hindsight maintenance queue"),
+    "webhooks": ("SELECT count(*) FROM webhooks WHERE bank_id = %s",
+                 "outbound webhook config holding signing secrets; deliberately not copied"),
+}
 
 
 @dataclass
-class KindCounts:
+class Counts:
     total: int = 0
     imported: int = 0
-    skipped: int = 0
+    skipped_duplicate: int = 0
     failed: int = 0
+    not_carried: int = 0
 
 
 @dataclass
 class ImportReport:
-    units: KindCounts = field(default_factory=KindCounts)
-    entities: KindCounts = field(default_factory=KindCounts)
-    links: KindCounts = field(default_factory=KindCounts)
-    skipped: list[dict] = field(default_factory=list)
-    failed: list[dict] = field(default_factory=list)
-    warnings: list[dict] = field(default_factory=list)
+    hindsight_bank: str = ""
+    prospecta_bank: str = ""
+    tables: dict = field(default_factory=dict)
+    embeddings: dict = field(default_factory=lambda: {"carried": 0, "re_embedded": 0})
+    failures: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+    def counts(self, table: str) -> Counts:
+        return self.tables.setdefault(table, Counts())
+
+    @property
+    def ok(self) -> bool:
+        return not any(c.failed for c in self.tables.values())
 
     def to_dict(self) -> dict:
         return {
-            "units": vars(self.units),
-            "entities": vars(self.entities),
-            "links": vars(self.links),
-            "skipped": self.skipped,
-            "failed": self.failed,
-            "warnings": self.warnings,
+            "hindsight_bank": self.hindsight_bank,
+            "prospecta_bank": self.prospecta_bank,
+            "tables": {t: vars(c) for t, c in self.tables.items()},
+            "embeddings": self.embeddings,
+            "failures": self.failures,
+            "notes": self.notes,
         }
 
     def render(self) -> str:
-        lines = []
-        for name in ("units", "entities", "links"):
-            c = getattr(self, name)
-            lines.append(
-                f"{name:9} in={c.total} imported={c.imported} "
-                f"skipped_duplicate={c.skipped} failed={c.failed}"
-            )
-        for label, items in (("skipped", self.skipped), ("failed", self.failed),
-                             ("warning", self.warnings)):
-            for it in items:
-                lines.append(f"  {label}: {it['kind']} {it['id']}: {it['reason']}")
+        lines = [f"hindsight bank {self.hindsight_bank!r} -> prospecta bank {self.prospecta_bank!r}"]
+        for t, c in self.tables.items():
+            if c.not_carried:
+                lines.append(f"{t:26} in={c.total} NOT CARRIED")
+            else:
+                lines.append(f"{t:26} in={c.total} imported={c.imported} "
+                             f"skipped_duplicate={c.skipped_duplicate} failed={c.failed}")
+        lines.append(f"embeddings: carried={self.embeddings['carried']} "
+                     f"re_embedded={self.embeddings['re_embedded']}")
+        lines += [f"  note: {n}" for n in self.notes]
+        lines += [f"  FAILED {f['table']} {f['key']}: {f['reason']}" for f in self.failures]
         return "\n".join(lines)
 
 
-def _parse_ts(value) -> datetime | None:
-    if value in (None, ""):
-        return None
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-
-
 def _slug(s: str) -> str:
-    return "-".join(s.lower().split())
+    return "-".join(str(s).lower().split())
 
 
-def load_dump(path: Path) -> dict:
-    """Load a dump: one JSON object, or JSONL with a "kind" field per line."""
-    text = Path(path).read_text(encoding="utf-8")
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        return data
-    if data is not None:
-        raise ValueError("dump must be a JSON object or JSONL records")
-    data = {"memory_units": [], "entities": [], "links": []}
-    plural = {"memory_unit": "memory_units", "unit": "memory_units",
-              "entity": "entities", "link": "links"}
-    for n, line in enumerate(text.splitlines(), 1):
-        if not line.strip():
-            continue
-        rec = json.loads(line)
-        if not isinstance(rec, dict):
-            raise ValueError(f"line {n}: record is not an object")
-        key = plural.get(rec.get("kind"))
-        if key is None:
-            raise ValueError(f"line {n}: unknown or missing kind {rec.get('kind')!r}")
-        data[key].append(rec)
-    return data
+def _batches(cur, size):
+    while True:
+        rows = cur.fetchmany(size)
+        if not rows:
+            return
+        yield rows
 
 
-def import_hindsight(
-    memory: "Memory", dump: dict, *, synthesize: bool = False
-) -> ImportReport:
-    rep = ImportReport()
-    units = dump.get("memory_units") or []
-    entities = dump.get("entities") or []
-    links = dump.get("links") or []
+def _table_exists(src, table) -> bool:
+    with src.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",))
+        return cur.fetchone()[0]
 
-    ent_by_id: dict[str, dict] = {}
-    for e in entities:
-        rep.entities.total += 1
-        eid = e.get("id") if isinstance(e, dict) else None
-        if eid is None or not (e.get("name") or e.get("canonical_name")):
-            rep.entities.failed += 1
-            rep.failed.append({"kind": "entity", "id": str(eid),
-                               "reason": "entity needs id and name"})
-            continue
-        ent_by_id[str(eid)] = e
 
-    unit_ids = {str(u["id"]) for u in units if isinstance(u, dict) and u.get("id")}
-    out_links: dict[str, list[dict]] = {}
-    link_labels: dict[str, list[str]] = {}
-    outcome: dict[str, tuple[str, str]] = {}
-    for l in links:
-        rep.links.total += 1
-        lid = f"{l.get('from_unit_id')}->{l.get('to_unit_id')}" if isinstance(l, dict) else "?"
-        src, dst = (str(l.get("from_unit_id")), str(l.get("to_unit_id"))) if isinstance(l, dict) else (None, None)
-        if src not in unit_ids or dst not in unit_ids:
-            rep.links.failed += 1
-            rep.failed.append({"kind": "link", "id": lid,
-                               "reason": "endpoint not in dump's memory_units"})
-            continue
-        out_links.setdefault(src, []).append(
-            {"to": dst, "type": l.get("link_type"), "weight": l.get("weight"),
-             "entity_id": l.get("entity_id")})
-        link_labels.setdefault(src, []).append(lid)
+def _ensure_bank(memory: "Memory", src, hbank: str, rep: ImportReport) -> int:
+    """Create the target bank if missing (dim from Hindsight's embeddings)."""
+    with memory._pool.cursor() as cur:
+        cur.execute("SELECT embedding_dim FROM banks WHERE bank_id = %s",
+                    (memory._default_bank_id,))
+        row = cur.fetchone()
+    if row:
+        return row[0]
+    with src.cursor() as cur:
+        cur.execute("SELECT vector_dims(embedding), mission FROM memory_units m "
+                    "LEFT JOIN banks b ON b.bank_id = m.bank_id "
+                    "WHERE m.bank_id = %s AND embedding IS NOT NULL LIMIT 1", (hbank,))
+        r = cur.fetchone()
+    if not r:
+        raise ValueError(f"bank {memory._default_bank_id!r} does not exist and the source has "
+                         "no embeddings to size it; run `prospecta create-bank` first")
+    memory.create_bank(memory._default_bank_id, embedding_dim=r[0], mission=r[1])
+    rep.notes.append(f"created prospecta bank with embedding_dim={r[0]}")
+    return r[0]
 
-    referenced_entities: set[str] = set()
-    for u in units:
-        rep.units.total += 1
-        uid = str(u.get("id")) if isinstance(u, dict) and u.get("id") else None
-        label = uid or f"#{rep.units.total}"
-        try:
-            text = u.get("text") if isinstance(u, dict) else None
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("missing or empty text")
-            if uid is None:
-                raise ValueError("missing id (needed for idempotency)")
-            source = SOURCE_PREFIX + uid
-            chash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            with memory._pool.cursor() as cur:
-                cur.execute(
-                    "SELECT content_hash FROM documents "
-                    "WHERE bank_id=%s AND source=%s",
-                    (memory._default_bank_id, source))
-                row = cur.fetchone()
-                if row is None:
-                    cur.execute(
-                        "SELECT source FROM documents "
-                        "WHERE bank_id=%s AND content_hash=%s",
-                        (memory._default_bank_id, chash))
-                    dup = cur.fetchone()
+
+def _fail(rep, table, key, reason, n=1):
+    rep.counts(table).failed += n
+    rep.failures.append({"table": table, "key": str(key), "reason": reason})
+
+
+def _import_units(memory, src, hbank, dim, rep, batch):
+    c = rep.counts("memory_units")
+    bank = memory._default_bank_id
+    with src.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memory_units WHERE bank_id = %s", (hbank,))
+        c.total = cur.fetchone()[0]
+    sql = """
+        SELECT mu.id::text, mu.text, mu.embedding::real[], mu.tags, mu.created_at, mu.updated_at,
+               mu.fact_type,
+               to_jsonb(mu) - 'embedding' - 'search_vector' - 'text',
+               coalesce((SELECT array_agg(e.canonical_name) FROM unit_entities ue
+                         JOIN entities e ON e.id = ue.entity_id WHERE ue.unit_id = mu.id), '{}')
+        FROM memory_units mu WHERE mu.bank_id = %s ORDER BY mu.created_at, mu.id"""
+    with src.cursor(name="hs_units") as cur:
+        cur.execute(sql, (hbank,))
+        for rows in _batches(cur, batch):
+            with memory._pool.cursor() as tcur:
+                tcur.execute("SELECT source FROM documents WHERE bank_id = %s AND source = ANY(%s)",
+                             (bank, [f"hindsight:{r[0]}" for r in rows]))
+                have = {s for (s,) in tcur.fetchall()}
+            todo = []
+            for r in rows:
+                if f"hindsight:{r[0]}" in have:
+                    c.skipped_duplicate += 1
                 else:
-                    dup = None
-            if row is not None:
-                reason = ("already imported" if row[0] == chash else
-                          "source already imported with different text; kept existing")
-                rep.units.skipped += 1
-                rep.skipped.append({"kind": "unit", "id": uid, "reason": reason})
-                outcome[uid] = ("skipped", reason)
+                    todo.append(r)
+            if not todo:
                 continue
-            if dup is not None:
-                rep.units.skipped += 1
-                reason = f"identical text already stored as {dup[0]}"
-                rep.skipped.append({"kind": "unit", "id": uid, "reason": reason})
-                outcome[uid] = ("skipped", reason)
-                continue
-
-            ents = []
-            for ref in u.get("entities") or []:
-                if isinstance(ref, dict):
-                    ref = ref.get("id") or ref.get("name")
-                rec = ent_by_id.get(str(ref))
-                if rec is not None:
-                    referenced_entities.add(str(ref))
-                    ents.append({k: v for k, v in rec.items()})
-                else:
-                    ents.append({"name": str(ref)})  # bare name, as Hindsight lists them
-            names = [e.get("name") or e.get("canonical_name") for e in ents]
-            tags = list(dict.fromkeys(
-                ["hindsight"]
-                + ([f"fact_type:{u['fact_type']}"] if u.get("fact_type") else [])
-                + [f"entity:{_slug(n)}" for n in names if n]
-                + [str(t) for t in (u.get("tags") or [])]))
-            known = {"id", "text", "context", "fact_type", "entities", "tags",
-                     "metadata", "created_at", "event_date", "occurred_start",
-                     "occurred_end", "mentioned_at", "document_id", "observations",
-                     "proof_count", "source_unit_ids"}
-            meta = {
-                "hindsight_id": uid,
-                "hindsight_fact_type": u.get("fact_type"),
-                "hindsight_context": u.get("context"),
-                "hindsight_document_id": u.get("document_id"),
-                "hindsight_entities": ents,
-                "hindsight_links": out_links.get(uid, []),
-                "hindsight_timestamps": {k: u.get(k) for k in (
-                    "created_at", "event_date", "occurred_start", "occurred_end",
-                    "mentioned_at") if u.get(k) is not None},
-                "hindsight_metadata": u.get("metadata") or {},
-                # observation-only provenance (what consolidated it)
-                "hindsight_provenance": {k: u[k] for k in (
-                    "proof_count", "source_unit_ids", "observations") if k in u},
-                "hindsight_extra": {k: v for k, v in u.items() if k not in known},
-            }
-            created = None
+            carried = [r[2] is not None and len(r[2]) == dim for r in todo]
+            redo = [r[1] for r, ok in zip(todo, carried) if not ok]
+            vecs = []
+            if redo:
+                try:
+                    if memory._embed is None:
+                        raise RuntimeError("no embedder configured to re-embed units")
+                    vecs = list(memory._embed(redo))
+                    if len(vecs) != len(redo):
+                        raise RuntimeError("embedder returned wrong number of vectors")
+                except Exception as e:
+                    for r, ok in zip(todo, carried):
+                        if ok:
+                            _write_unit(memory, bank, hbank, r, r[2], c, rep)
+                            rep.embeddings["carried"] += 1
+                        else:
+                            _fail(rep, "memory_units", r[0], f"re-embed failed: {e}")
+                    continue
+            it = iter(vecs)
             try:
-                created = _parse_ts(u.get("created_at"))
-            except ValueError:
-                rep.warnings.append({"kind": "unit", "id": uid,
-                                     "reason": "unparseable created_at; kept raw in metadata"})
-            doc_id = memory.retain(
-                text,
-                source=source,
-                tags=tags,
-                metadata=meta,
-                index_text=None if synthesize else [text],
-            )
-            if created is not None:
-                with memory._pool.cursor() as cur:
-                    cur.execute("UPDATE documents SET created_at=%s WHERE id=%s",
-                                (created, doc_id))
-                    cur.execute("UPDATE memory_items SET created_at=%s "
-                                "WHERE document_id=%s", (created, doc_id))
-            rep.units.imported += 1
-            outcome[uid] = ("imported", "")
-        except Exception as e:  # reported, never dropped
-            rep.units.failed += 1
-            rep.failed.append({"kind": "unit", "id": label,
-                               "reason": f"{type(e).__name__}: {e}"})
-            if uid is not None:
-                outcome[uid] = ("failed", f"{type(e).__name__}: {e}")
+                with memory._pool.connection() as conn:
+                    for r, ok in zip(todo, carried):
+                        _insert_unit(conn, bank, r, r[2] if ok else next(it))
+                    conn.commit()
+                c.imported += len(todo)
+                rep.embeddings["carried"] += sum(carried)
+                rep.embeddings["re_embedded"] += len(redo)
+            except Exception:
+                # isolate the bad row(s): retry one by one
+                it = iter(vecs)
+                for r, ok in zip(todo, carried):
+                    v = r[2] if ok else next(it)
+                    if _write_unit(memory, bank, hbank, r, v, c, rep):
+                        rep.embeddings["carried" if ok else "re_embedded"] += 1
 
-    for src, labels in link_labels.items():
-        status, why = outcome.get(src, ("failed", "source unit not processed"))
-        for lid in labels:
-            if status == "imported":
-                rep.links.imported += 1
-            elif status == "skipped":
-                rep.links.skipped += 1
-                rep.skipped.append({"kind": "link", "id": lid,
-                                    "reason": f"source unit skipped: {why}"})
+
+def _write_unit(memory, bank, hbank, r, vec, c, rep) -> bool:
+    try:
+        with memory._pool.connection() as conn:
+            _insert_unit(conn, bank, r, vec)
+            conn.commit()
+        c.imported += 1
+        return True
+    except Exception as e:
+        _fail(rep, "memory_units", r[0], f"{type(e).__name__}: {e}")
+        return False
+
+
+def _insert_unit(conn, bank, r, vec):
+    uid, text, _emb, tags, created, updated, fact_type, row, ents = r
+    row = dict(row)
+    tag_list = list(dict.fromkeys(
+        [SYSTEM, f"fact_type:{fact_type}"] + [f"entity:{_slug(n)}" for n in ents]
+        + [t for t in (tags or [])]))
+    chash = hashlib.sha256(f"hindsight:{uid}\n{text}".encode("utf-8")).hexdigest()
+    lit = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO documents (bank_id, source, original_text, content_hash, tags,
+                                      document_metadata, created_at, updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s) RETURNING id""",
+            (bank, f"hindsight:{uid}", text, chash, tag_list,
+             json.dumps({"hindsight": row, "hindsight_entities": list(ents)}),
+             created, updated))
+        doc_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding,
+                                         metadata, tags, update_mode, llm_generated,
+                                         created_at, updated_at)
+               VALUES (%s,%s,%s,%s,%s::vector,%s::jsonb,%s,'append',false,%s,%s)""",
+            (bank, doc_id, text, text, lit,
+             json.dumps({"index_text_caller_supplied": True, "hindsight_id": uid,
+                         "fact_type": fact_type}),
+             tag_list, created, updated))
+
+
+def _import_carried(memory, src, hbank, table, rep, batch):
+    kind, keys, where = CARRIED[table]
+    c = rep.counts(table)
+    bank = memory._default_bank_id
+    with src.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {table} WHERE {where}", (hbank,))
+        c.total = cur.fetchone()[0]
+    ins = """INSERT INTO imported_records (bank_id, system, kind, source_key, data)
+             SELECT %s, %s, %s, u.k, u.d::jsonb FROM unnest(%s::text[], %s::text[]) AS u(k, d)
+             ON CONFLICT DO NOTHING"""
+    with src.cursor(name=f"hs_{table}") as cur:
+        cur.execute(f"SELECT to_jsonb(t) FROM {table} t WHERE {where}", (hbank,))
+        for rows in _batches(cur, batch):
+            ks = [":".join(str(r[0][k]) for k in keys) for r in rows]
+            ds = [json.dumps(r[0]) for r in rows]
+            _insert_batch(memory, ins, (bank, SYSTEM, kind), table, c, rep, ks, [ks, ds])
+
+
+def _import_edges(memory, src, hbank, table, rep, batch):
+    kind, select = EDGES[table]
+    c = rep.counts(table)
+    bank = memory._default_bank_id
+    with src.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM ({select}) q", (hbank,))
+        c.total = cur.fetchone()[0]
+    ins = """INSERT INTO imported_edges (bank_id, system, kind, src, dst, subtype, ref,
+                                         weight, count, ts)
+             SELECT %s, %s, %s, a, b, s, r, w, n, t
+             FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[],
+                         %s::float8[], %s::int[], %s::timestamptz[]) AS u(a,b,s,r,w,n,t)
+             ON CONFLICT DO NOTHING"""
+    with src.cursor(name=f"hs_{table}") as cur:
+        cur.execute(select, (hbank,))
+        for rows in _batches(cur, batch):
+            cols = list(zip(*rows))
+            keys = [f"{r[0]}->{r[1]}/{r[2]}/{r[3]}" for r in rows]
+            _insert_batch(memory, ins, (bank, SYSTEM, kind), table, c, rep, keys,
+                          [list(x) for x in cols])
+
+
+def _insert_batch(memory, sql, head, table, c, rep, keys, cols):
+    def run(conn, idx):
+        args = head + tuple([col[i] for i in idx] for col in cols)
+        with conn.cursor() as cur:
+            cur.execute(sql, args)
+            return cur.rowcount
+    try:
+        with memory._pool.connection() as conn:
+            n = run(conn, range(len(keys)))
+            conn.commit()
+        c.imported += n
+        c.skipped_duplicate += len(keys) - n
+    except Exception:
+        for i in range(len(keys)):  # isolate the bad row(s)
+            try:
+                with memory._pool.connection() as conn:
+                    n = run(conn, [i])
+                    conn.commit()
+                c.imported += n
+                c.skipped_duplicate += 1 - n
+            except Exception as e:
+                _fail(rep, table, keys[i], f"{type(e).__name__}: {e}")
+
+
+def list_banks(src_url: str) -> list[str]:
+    with psycopg.connect(src_url) as src, src.cursor() as cur:
+        cur.execute("SELECT bank_id FROM banks ORDER BY bank_id")
+        return [r[0] for r in cur.fetchall()]
+
+
+def import_bank(memory: "Memory", src_url: str, hbank: str, *, batch: int = 1000) -> ImportReport:
+    """Import Hindsight bank `hbank` from the source DB into memory's bank."""
+    rep = ImportReport(hindsight_bank=hbank, prospecta_bank=memory._default_bank_id)
+    with psycopg.connect(src_url) as src:
+        src.read_only = True
+        with src.cursor() as cur:
+            cur.execute("SELECT 1 FROM banks WHERE bank_id = %s", (hbank,))
+            if cur.fetchone() is None:
+                raise ValueError(f"no bank {hbank!r} in source")
+        dim = _ensure_bank(memory, src, hbank, rep)
+        with memory._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_DDL)
+            conn.commit()
+        _import_units(memory, src, hbank, dim, rep, batch)
+        for table in CARRIED:
+            if _table_exists(src, table):
+                _import_carried(memory, src, hbank, table, rep, batch)
             else:
-                rep.links.failed += 1
-                rep.failed.append({"kind": "link", "id": lid,
-                                   "reason": f"source unit failed: {why}"})
-
-    # Entities are carried inside the units that mention them; ones nothing
-    # references have nowhere to live, so report them rather than drop quietly.
-    for eid in ent_by_id:
-        if eid in referenced_entities:
-            rep.entities.imported += 1
-        else:
-            rep.entities.skipped += 1
-            rep.skipped.append({"kind": "entity", "id": eid,
-                                "reason": "no imported unit references it (or units were skipped)"})
+                rep.notes.append(f"source has no table {table}")
+        for table in EDGES:
+            if _table_exists(src, table):
+                _import_edges(memory, src, hbank, table, rep, batch)
+            else:
+                rep.notes.append(f"source has no table {table}")
+        for table, (count_sql, reason) in NOT_CARRIED.items():
+            n = 0
+            if _table_exists(src, table):
+                with src.cursor() as cur:
+                    cur.execute(count_sql or f"SELECT count(*) FROM {table}",
+                                (hbank,) if count_sql else ())
+                    n = cur.fetchone()[0]
+            c = rep.counts(table)
+            c.total = c.not_carried = n
+            rep.notes.append(f"{table}: not carried ({reason})")
     return rep

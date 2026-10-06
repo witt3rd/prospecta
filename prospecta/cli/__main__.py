@@ -103,10 +103,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- import ---------------------------------------------------------
     im = sub.add_parser("import", help="Import memories from another system")
     im_sub = im.add_subparsers(dest="import_kind", required=True)
-    hs = im_sub.add_parser("hindsight", help="Import a Hindsight bank dump")
-    hs.add_argument("dump", type=Path)
-    hs.add_argument("--synthesize", action="store_true",
-                    help="LLM-generate index_text (default: use the fact text, no LLM)")
+    hs = im_sub.add_parser(
+        "hindsight", help="Import a Hindsight bank from a Postgres holding its schema")
+    hs.add_argument("source", help="postgres:// URL of the (restored) Hindsight database")
+    hs.add_argument("--hindsight-bank", default=None,
+                    help="Hindsight bank id (default: the only one); lands in --bank")
+    hs.add_argument("--all-banks", action="store_true",
+                    help="Import every Hindsight bank into a same-named prospecta bank")
+    hs.add_argument("--batch", type=int, default=1000, help="Rows per batch (default 1000)")
     hs.add_argument("--json", action="store_true", help="Emit report as JSON")
 
     # ---- stats (T15) ----------------------------------------------------
