@@ -241,6 +241,27 @@ def test_invalid_index_is_rebuilt(populated_v3):
         ).fetchone()[0]
 
 
+def test_backfill_ignores_post_migration_user_metadata(populated_v3):
+    url = populated_v3
+    migrate.run_migrations(url)
+    with psycopg.connect(url) as c:
+        doc = c.execute("SELECT id FROM documents LIMIT 1").fetchone()[0]
+        for content, meta in (
+            ("u1", '{"chunk_index": 3, "start_char": 1, "end_char": 5}'),
+            ("u2", '{"chunk_index": "a", "start_char": "b", "end_char": "c"}'),
+        ):
+            c.execute(
+                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk, "
+                "embedding, metadata) VALUES ('live', %s, %s, 'body', %s::vector, %s::jsonb)",
+                (doc, content, _vec(1), meta))
+        c.commit()
+    migrate.run_migrations(url)
+    with psycopg.connect(url) as c:
+        rows = c.execute(
+            "SELECT kind, ordinal FROM memory_items WHERE content IN ('u1','u2')").fetchall()
+    assert rows == [("question", None)] * 2
+
+
 def test_kind_index_name_fits_and_is_unique_for_long_banks():
     a = hnsw_kind_index_name("x" * 63, "chunk")
     b = hnsw_kind_index_name("x" * 62 + "y", "chunk")

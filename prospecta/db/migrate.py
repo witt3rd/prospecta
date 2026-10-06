@@ -129,7 +129,12 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
                     """
                     WITH batch AS (
                         SELECT id FROM memory_items
-                        WHERE kind = 'question' AND metadata ? 'chunk_index'
+                        WHERE kind = 'question'
+                          AND created_at <= (SELECT applied_at FROM prospecta_schema_version
+                                             WHERE version = 4)
+                          AND metadata->>'chunk_index' ~ '^[0-9]{1,9}$'
+                          AND metadata->>'start_char' ~ '^[0-9]{1,9}$'
+                          AND metadata->>'end_char' ~ '^[0-9]{1,9}$'
                         LIMIT %s
                         FOR UPDATE SKIP LOCKED
                     )
