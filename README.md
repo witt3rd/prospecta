@@ -206,6 +206,10 @@ Three channels, fused via Reciprocal Rank Fusion (k=60 default, configurable per
 
 ---
 
+### Configurable channels (v0.2, opt-in per bank)
+
+`banks.channel_config` (default `[]`) lists a bank's recall channels, e.g. `prospecta.channels.DEFAULT_CHANNEL_CONFIG` (`dense_chunk` weight 4 over `kind='chunk'` items, `question` weight 1 over `kind='question'` items). `Memory.set_channel_config(config)` sets it. With a non-empty config, hybrid `search`/`recall` runs the channels, fuses them by weighted RRF at document level (k=60, ties by source name) and records the plan, per-channel counts/latency/errors, the fusion and one `recall_event_candidates` row per channel candidate (migration 0007). An empty config keeps the three-channel recall above unchanged. New channels implement `prospecta.channels.Channel` and register in `REGISTRY`.
+
 ## What's load-bearing
 
 Read `PRINCIPLES.md` for the full set of 18 principles that govern this codebase. The four that matter most for users:
