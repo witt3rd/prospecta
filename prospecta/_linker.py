@@ -24,9 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+import psycopg.errors
 
 from prospecta._template import render_prompt
 from prospecta.stages import (
@@ -43,6 +46,8 @@ VECTOR_TOP = 5
 TEMPORAL_DAYS = 3
 TEMPORAL_CLOSE_CAP = 5
 ENTITY_CAP = 10            # items linked per shared entity
+DEADLOCK_RETRIES = 6       # attempts per step on deadlock / serialization failure
+DEADLOCK_BACKOFF_S = 0.05  # first backoff; doubles with jitter
 ETYPES = {"person", "org", "place", "project", "product", "event", "other"}
 
 _ANCHORS = """
@@ -59,6 +64,7 @@ SELECT %(bank)s, a.id, b.id, 'TEMPORAL', 'NEXT', 1.0, 'sql'
 FROM memory_items a JOIN memory_items b
   ON b.document_id = a.document_id AND b.kind = 'chunk' AND b.ordinal = a.ordinal + 1
 WHERE a.document_id = %(doc)s AND a.kind = 'chunk'
+ORDER BY a.id, b.id
 ON CONFLICT DO NOTHING
 """
 
@@ -102,6 +108,7 @@ INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, confidence, ori
 SELECT %(bank)s, ra.item, rb.item, 'TEMPORAL', e.subtype, e.conf, 'sql',
        jsonb_build_object('person', (SELECT person FROM me))
 FROM edges e JOIN rep ra ON ra.doc = e.a JOIN rep rb ON rb.doc = e.b
+ORDER BY ra.item, rb.item, e.subtype
 ON CONFLICT DO NOTHING
 """
 
@@ -124,6 +131,7 @@ FROM (
     WHERE ai.document_id = %(doc)s
 ) x
 GROUP BY x.a_item, x.b_item
+ORDER BY x.a_item, x.b_item
 ON CONFLICT DO NOTHING
 """
 
@@ -275,23 +283,55 @@ class Linker:
             for name, step in (("temporal", self._temporal), ("entities", self._entities),
                                ("semantic", self._semantic)):
                 try:
-                    step(conn, bank_id, document_id, anchors, stats, calls)
-                    conn.commit()
+                    self._retrying(conn, name, lambda: self._run_step(
+                        step, conn, bank_id, document_id, anchors, stats, calls))
                 except Exception as exc:
                     conn.rollback()
                     stats["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
-                    logger.warning("linker %s failed for %s: %s", name, document_id, exc)
+                    logger.error("linker %s failed for %s (recorded; link_pending "
+                                 "will retry): %s", name, document_id, exc)
         stats.update(totals(calls))
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO memory_link_state (document_id, bank_id, status, stats, error) "
-                "VALUES (%s, %s, %s, %s::jsonb, %s) ON CONFLICT (document_id) DO UPDATE "
-                "SET status = EXCLUDED.status, stats = EXCLUDED.stats, "
-                "error = EXCLUDED.error, linked_at = now()",
-                (document_id, bank_id, "error" if stats["errors"] else "linked",
-                 json.dumps(stats), "; ".join(stats["errors"]) or None))
-        conn.commit()
+
+        def write_state():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO memory_link_state (document_id, bank_id, status, stats, error) "
+                    "VALUES (%s, %s, %s, %s::jsonb, %s) ON CONFLICT (document_id) DO UPDATE "
+                    "SET status = EXCLUDED.status, stats = EXCLUDED.stats, "
+                    "error = EXCLUDED.error, linked_at = now()",
+                    (document_id, bank_id, "error" if stats["errors"] else "linked",
+                     json.dumps(stats), "; ".join(stats["errors"]) or None))
+            conn.commit()
+        self._retrying(conn, "state", write_state)
         return stats
+
+    @staticmethod
+    def _run_step(step, conn, bank_id, doc, anchors, stats, calls):
+        before = dict(stats)
+        try:
+            step(conn, bank_id, doc, anchors, stats, calls)
+            conn.commit()
+        except Exception:
+            stats.clear()
+            stats.update(before)   # a retried step must not double count
+            raise
+
+    @staticmethod
+    def _retrying(conn, name, fn):
+        """Run fn; on deadlock / serialization failure roll back and retry with
+        exponential backoff and jitter. Other errors propagate at once."""
+        delay = DEADLOCK_BACKOFF_S
+        for attempt in range(1, DEADLOCK_RETRIES + 1):
+            try:
+                return fn()
+            except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure) as exc:
+                conn.rollback()
+                if attempt == DEADLOCK_RETRIES:
+                    raise
+                logger.warning("linker %s: %s, retry %d/%d", name, type(exc).__name__,
+                               attempt, DEADLOCK_RETRIES - 1)
+                time.sleep(delay * (1 + random.random()))
+                delay *= 2
 
     # --------------------------------------------------------------- the steps
     def _temporal(self, conn, bank_id, doc, anchors, stats, calls):
@@ -314,7 +354,7 @@ class Linker:
         found = parse_entities(raw)
         if found:
             with conn.cursor() as cur:
-                for name, etype in found:
+                for name, etype in sorted(found, key=lambda e: (normalise(e[0]), e[1])):
                     norm = normalise(name)
                     cur.execute(
                         "INSERT INTO memory_entities (bank_id, name, norm, etype) "
@@ -365,7 +405,11 @@ class Linker:
                         for i, c in enumerate(cands[:VECTOR_TOP])
                         if float(c["cos"]) >= self.vector_floor]
             with conn.cursor() as cur:
-                for h in hits:
+                def edge(h):
+                    c = cands[h.candidate]
+                    return ((a["id"], c["id"]) if h.forward else (c["id"], a["id"])) + (
+                        h.link_type, h.subtype)
+                for h in sorted(hits, key=edge):
                     c = cands[h.candidate]
                     src, dst = (a["id"], c["id"]) if h.forward else (c["id"], a["id"])
                     cur.execute(
@@ -403,12 +447,15 @@ def parse_entities(raw: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------- the worker
 
 def pending_documents(conn, bank_id: str, limit: int) -> list[str]:
-    """Documents with items and no memory_link_state row, oldest first."""
+    """Documents with items and no finished link state (no row, or a row with
+    status 'error': a failed step is retried), oldest first."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT d.id::text FROM documents d "
             "WHERE d.bank_id = %s "
-            "  AND NOT EXISTS (SELECT 1 FROM memory_link_state s WHERE s.document_id = d.id) "
+            "  AND NOT EXISTS (SELECT 1 FROM memory_link_state s "
+            "                  WHERE s.document_id = d.id AND s.status <> 'error') "
             "  AND EXISTS (SELECT 1 FROM memory_items m WHERE m.document_id = d.id) "
-            "ORDER BY d.created_at, d.id LIMIT %s", (bank_id, limit))
+            "ORDER BY EXISTS (SELECT 1 FROM memory_link_state s WHERE s.document_id = d.id), "
+            "d.created_at, d.id LIMIT %s", (bank_id, limit))
         return [r[0] for r in cur.fetchall()]

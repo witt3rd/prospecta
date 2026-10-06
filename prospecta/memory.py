@@ -338,7 +338,7 @@ class Memory:
         if self._linker is None:
             raise RuntimeError("link_document needs Memory(linker=...)")
         calls: list[dict] = []
-        with self._pool.connection() as conn:
+        with self._pool.dedicated() as conn:   # own connection: never the retain one
             stats = self._linker.link_document(
                 conn, bank_id or self._default_bank_id, document_id, calls)
         for c in calls:
@@ -353,7 +353,7 @@ class Memory:
         net for documents written by the sweeper or before a Linker was set)."""
         from prospecta._linker import pending_documents
         bank = bank_id or self._default_bank_id
-        with self._pool.connection() as conn:
+        with self._pool.dedicated() as conn:
             docs = pending_documents(conn, bank, limit)
         for d in docs:
             self.link_document(d, bank)

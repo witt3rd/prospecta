@@ -8,7 +8,10 @@ The Jev-Mem techniques, Postgres-native (hybrid retrieval design 8.7).
 **Linker** (`prospecta._linker.Linker`, `JevRelationJudge`; `Memory(linker=Linker(llm=..., judge=...))`) runs after
 `retain` / `index_single_file` on one worker thread (`asynchronous=False` runs inline;
 `Memory.wait_for_links()` drains; `Memory.link_document(id)` and `Memory.link_pending()`
-are the on-demand and safety-net paths). Per document:
+are the on-demand and safety-net paths). Each link run uses its own dedicated connection
+(`ConnectionPool.dedicated()`), never the shared one; a step that deadlocks is retried with
+backoff, and a step that still fails is recorded in `memory_link_state` as `error` and picked
+up again by `link_pending`. Per document:
 
 - `NEXT` between consecutive chunks, and `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE`
   (within 3 days, at most 5) to the chronological neighbours of the same `person`, in SQL
