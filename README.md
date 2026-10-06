@@ -14,7 +14,7 @@ This is **not** classical RAG over chunks. Classical RAG embeds content and hope
 
 ## Status
 
-**v0.1, ship-ready.** 241 tests pass. Bilateral spine validated empirically (see `tests/integration/test_bilateral_spine.py`). Hybrid safety net validated empirically (see `tests/integration/test_hybrid_safety_net.py`).
+**v0.1, ship-ready.** Test suite: see `tests/` (Postgres-backed tests use testcontainers). Bilateral spine validated empirically (see `tests/integration/test_bilateral_spine.py`). Hybrid safety net validated empirically (see `tests/integration/test_hybrid_safety_net.py`).
 
 Substrate: Postgres 14+ with the `pgvector` extension. The library has zero provider imports — embedding model and LLM are injected callables; pick your own, or use the LiteLLM-backed defaults.
 

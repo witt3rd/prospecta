@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["tui/**"]
+  pull_request:
+    paths-ignore: ["tui/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      # Postgres tests start throwaway pgvector containers via testcontainers
+      # (docker is available on ubuntu-latest).
+      - run: uv run pytest -q

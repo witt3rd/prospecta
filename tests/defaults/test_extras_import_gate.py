@@ -18,7 +18,7 @@ def test_p3_audit_core_has_no_litellm_imports():
         ["grep", "-rn", "-l", r"\bimport litellm\|from litellm", "prospecta/"],
         capture_output=True,
         text=True,
-        cwd="/home/dt/src/witt3rd/prospecta",
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[2]),
     )
     matched_files = [line for line in result.stdout.strip().split("\n") if line]
     for f in matched_files:
