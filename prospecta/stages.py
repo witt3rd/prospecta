@@ -58,7 +58,7 @@ BLEND_DEFAULTS = {"weight_rerank": 0.7, "weight_fused": 0.3, "keep": 3, "within"
 DEFAULT_RECALL_CONFIG: dict = {
     "rerank": {"enabled": True, "stage": "sonnet_listwise", "pool": RERANK_POOL,
                "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3,
-                         "keep": 3, "within": 10}},
+                         "floor": False, "keep": 3, "within": 10}},
     "gate": {"enabled": False, "threshold": JEV_GATE_THRESHOLD},
     "reader": {"enabled": False, "top": 8, "join_top": 15,
                "max_follow_ups": 2, "max_new": 10},
@@ -82,13 +82,15 @@ def validate_recall_config(cfg: dict) -> None:
         if rr.get("stage", "sonnet_listwise") != "sonnet_listwise":
             raise ValueError("gate needs rerank.stage = sonnet_listwise")
     bl = rr.get("blend") or {}
-    if not isinstance(bl, dict) or set(bl) - set(BLEND_DEFAULTS) - {"enabled"}:
+    if not isinstance(bl, dict) or set(bl) - set(BLEND_DEFAULTS) - {"enabled", "floor"}:
         raise ValueError("rerank.blend must be an object of enabled/weight_rerank/"
                          "weight_fused/keep/within")
     for name in ("weight_rerank", "weight_fused"):
         v = bl.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
             raise ValueError(f"blend.{name} must be a number >= 0")
+    if not isinstance(bl.get("floor", False), bool):
+        raise ValueError("blend.floor must be true or false")
     for name in ("keep", "within"):
         v = bl.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
@@ -440,11 +442,13 @@ class JevGate:
 
 
 def blend_order(items: list[Item], order: list[int], *, weight_rerank: float,
-                weight_fused: float, keep: int, within: int) -> list[int]:
+                weight_fused: float, floor: bool = False, keep: int = 3,
+                within: int = 10) -> list[int]:
     """Blend the reranker's order with the fused order instead of replacing it.
     score = weight_rerank * rank_score(reranker position) + weight_fused *
     (fused RRF score / best fused RRF score); rank_score runs 1.0 (first) to 0.0
-    (last). Floor: the fused top `keep` always stay inside the first `within`."""
+    (last). Optional floor (off by default): the fused top `keep` always stay
+    inside the first `within`."""
     n = len(order)
     if n < 2:
         return list(order)
@@ -454,6 +458,8 @@ def blend_order(items: list[Item], order: list[int], *, weight_rerank: float,
         blended[i] = (weight_rerank * (1 - pos / (n - 1))
                       + weight_fused * items[i].doc.score / top_fused)
     final = sorted(order, key=lambda i: (-blended[i], order.index(i)))
+    if not floor:
+        return final
     protected = sorted(range(len(items)), key=lambda i: -items[i].doc.score)[:keep]
     head = final[:within]
     missing = [i for i in protected if i not in head]
@@ -473,6 +479,7 @@ class BlendedReranker:
     def __init__(self, inner: Reranker, blend: dict):
         self.inner = inner
         self.params = {k: blend.get(k, d) for k, d in BLEND_DEFAULTS.items()}
+        self.params["floor"] = bool(blend.get("floor", False))
         self.name = getattr(inner, "name", "?")
 
     def rerank(self, query: str, items: list[Item], calls: list[dict]) -> Outcome:
