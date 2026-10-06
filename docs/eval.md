@@ -27,6 +27,10 @@ gold2: kelly-trip.md
 answer: She said it was too expensive; we stayed at the Harbour Inn.
 ```
 
+The project's `questions.md` format is also read directly: `### Qnnn` blocks with
+`class:`, `question:` (may continue on following lines), `gold:` and optional
+`gold2:` / `answer:` lines (used when the file has `###` blocks and no `##`).
+
 `gold` (note names = `documents.source`; folder and `.md` ignored) and the
 optional second gold `gold2` give hit@1, hit@10, MRR and cover@10 each; `answer`
 is for `--judge` (answer-correct by a Sonnet judge). `--ablate` reruns with
@@ -35,7 +39,9 @@ registered channel the bank lacks on at weight 1; a channel **earns** its
 weight when removing it costs hit@10, hit@1 or MRR ≥ 0.03 on either gold, or
 cover@10 ≥ 0.03 on the multi-note questions (a channel not yet run **gains** by
 the same margin). The report gives latency and cost per stage (each channel,
-each LLM stage, total). Nothing is written to the bank (no config change, no
+each LLM stage, total). Recall runs through the production path (`_search_channels`: filter extraction,
+promotion, rerank, hop), and a channel or stage error is shown in the report
+(`ERROR xN`). Nothing is written to the bank (no config change, no
 `recall_events` rows from the retrieval runs); `--synth` runs real
 `recall_synth(grounded=True)` and so does log those events. Eval never changes
 channel weights: it tells the owner which to set.
