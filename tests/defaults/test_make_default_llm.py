@@ -109,3 +109,27 @@ def test_llm_env_var_resolves_model(monkeypatch):
     llm(messages=[{"role": "user", "content": "x"}])
 
     assert captured["model"] == "anthropic/claude-3-5-haiku"
+
+
+def test_per_call_model_overrides_bank_model(monkeypatch):
+    import litellm
+
+    calls = []
+
+    class FakeResponse:
+        choices = [type("C", (), {"message": type("M", (), {"content": "x"})})()]
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+
+    from prospecta.channels.extract import _accepts_model
+    from prospecta.defaults import make_default_llm
+
+    llm = make_default_llm(model="openai/gpt-4o-mini")
+    assert _accepts_model(llm)
+    llm(messages=[], model="anthropic/claude-sonnet-5.5")
+    llm(messages=[])
+    assert [c["model"] for c in calls] == ["anthropic/claude-sonnet-5.5", "openai/gpt-4o-mini"]
