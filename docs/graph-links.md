@@ -40,3 +40,68 @@ set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_
 **JevReader** (`recall_config.reader.type = "jev"`, needs `Memory(jev=...)`): Jev's
 `evidence_sufficient`, `continue_useful`, `missing_evidence` as one request decide
 sufficiency; the follow-up probe is the best excerpt itself.
+
+## Link completeness: all-pairs (default) or connected
+
+The linker judges per NOTE (an item pair per note pair, A->B and B->A one pair; the
+first anchor of each note represents it). `link_completeness` sets how many qualifying
+neighbour notes (cosine floor + relative stop, as before) are judged:
+
+- `all-pairs` (DEFAULT): every qualifying pair; 96 questions per call, the pair cache and
+  the similarity floor keep it affordable.
+- `connected`: the reduced-pairs rule: at most `judge_top_k` (32 = one call) neighbours per
+  note, judged only if MUTUAL (each in the other's top 32) or among the note's
+  `judge_nearest` (3). SEMANTIC (same subject) is treated as transitive inside a dense
+  cluster (members beyond the top 32 are reached through cluster neighbours); CAUSAL /
+  LEADS_TO is not transitive and is written only for judged pairs. It DROPS some direct
+  semantic pair links in dense clusters (connectivity is preserved); the quality/cost knob.
+- both: a pair whose normalised text (modulo frontmatter, whitespace, case) is identical
+  is RELATED_TO at 1.0 with no call; the cache `memory_link_pairs` is keyed by the
+  text-hash pair, so a re-run asks nothing (rows cascade with their items: re-indexing a
+  note re-judges its pairs).
+
+Set it per bank: `Memory.set_recall_config({"link_completeness": "connected"})` (key of
+`banks.recall_config`, no migration); per process/import: `Linker(link_completeness=...)`
+or `PROSPECTA_LINK_COMPLETENESS=connected|all-pairs` for the CLI (wins over the bank).
+
+### Upgrading later: `link-pass` (resumable, background)
+
+A bank can import with `connected` and be upgraded without a re-import:
+
+    prospecta link-pass --mode all-pairs [--resume] [--limit N]
+    memory.link_pass("all-pairs", limit=None, background=True)   # a Future of the progress dict
+
+It re-runs only the semantic step of every linked document whose link state does not
+record `completeness = all-pairs`, on its own connection (never blocks retain, own thread
+when background). Progress lines/dicts: documents, pairs_judged (`judged`), pairs_cached,
+failed, remaining. Resumable: a finished document records its completeness, and the pair
+cache means no pair is asked twice, so an interrupted pass loses nothing; failed documents
+stay for the next run.
+
+### Benchmark (`scripts/bench_linker.py`)
+
+STUB Jev with a per-call token cost model (nothing leaves the process); Postgres+pgvector
+real. Dense synthetic corpus: clusters of 226/170/130/110/100 notes (~40 percent of 1,845),
+a third of notes multi-chunk, exact duplicates, a planted causal partner every 10th note.
+Before = main at 6f0e54c. Figures are modelled; the scout re-measures on the real corpus.
+
+| notes | judged pairs/note: before / all-pairs / connected | calls/note: before / all-pairs / connected | cost USD: before / all-pairs / connected |
+|---|---|---|---|
+| 500  | 10.2 / 9.1 / 6.0   | 0.94 / 0.88 / 0.81 | 12.4 / 11.2 / 7.6 |
+| 1000 | 18.9 / 17.1 / 6.5  | 1.21 / 1.11 / 0.84 | 45.7 / 41.7 / 16.2 |
+| 1845 | 32.2 / 28.9 / 6.6  | 1.63 / 1.49 / 0.85 | 144.5 / 131.1 / 30.8 |
+| 3690 | 21.9 / 19.7 / 5.9  | 1.31 / 1.21 / 0.86 | 195.6 / 177.7 / 54.4 |
+
+Recall (same corpus, ground truth from the generator): causal 100 percent in every mode and
+size; cluster connectivity 1.0 in every mode; semantic DIRECT pair recall (pairs of one
+cluster with a link): before 0.78; all-pairs 0.84/0.78/0.78/0.78 (500/1000/1845/3690; the
+relative stop, not the cap, bounds it); connected 0.58/0.27/0.14/0.13.
+
+Scaling of all-pairs calls/note. Fixed absolute cluster sizes (above; growth past 1845
+adds unrelated notes): 0.88 / 1.11 / 1.49 / 1.21: a plateau. Worst case, every cluster
+growing with the bank (`BENCH_CLUSTERS=scaled`): 0.88 / 1.11 / 1.49 / 2.20 calls/note and
+judged pairs/note 9 / 17 / 29 / 52: NOT near-linear: per-note work grows with the cluster
+size, i.e. near-quadratic in the cluster (judging all pairs of a cluster is inherently
+so); `connected` stays flat at ~6 judged pairs/note in both. The stub's calls/note is
+below the real 6-20 because synthetic notes have few anchors; the real driver was
+chunk-level pairs, now one pair per note pair.

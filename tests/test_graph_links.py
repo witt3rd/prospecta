@@ -640,3 +640,115 @@ def test_each_unordered_pair_is_judged_once_and_rerun_asks_nothing(mem):
             c.commit()
         mem.link_document(d)
     assert len(jev.requests) == 1
+
+
+def test_duplicate_notes_link_without_a_model_call(mem):
+    body = "cats purr softly on warm mats"
+    mem.retain(body, source="a", index_text=body)
+    mem.retain("---\ntitle: copy\n---\n\n" + body.replace(" ", "   ").upper(), source="b",
+               index_text=body.upper())
+    jev = JevStub(lambda rel, cand, query: 3)
+    mem._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0)
+    stats = [mem.link_document(d) for d in docs(mem).values()]
+    assert jev.requests == [] and sum(s.get("candidates_duplicate", 0) for s in stats) == 2
+    ls = {(x, y, lt) for x, y, lt, st, o, c in links(mem) if o == "jev"}
+    assert {("a", "b", "SEMANTIC"), ("b", "a", "SEMANTIC")} <= ls
+
+
+def test_only_mutual_or_nearest_pairs_are_judged_and_cache_survives_reruns(fresh_db):
+    vec = {"A": [1, 0, 0, 0], "B": [1, 0.1, 0, 0], "C": [1, 0.6, 0, 0]}   # B's nearest is A; C's is B
+
+    def embed(ts):
+        out = []
+        for t in ts:
+            v = vec[t[0]]
+            n = sum(x * x for x in v) ** 0.5
+            out.append([x / n for x in v])
+        return out
+    m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
+    m.create_bank("b", embedding_dim=4)
+    for k in "ABC":
+        m.retain(f"{k} body text", source=k, index_text=f"{k} q")
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+    m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
+                       judge_top_k=1, judge_nearest=0, link_completeness="connected")
+    stats = [m.link_document(d) for d in docs(m).values()]
+    pairs = {frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"}
+    assert pairs == {frozenset("AB")}   # C -> B is not mutual (B's top-1 is A): not judged
+    assert sum(s.get("candidates_not_mutual", 0) for s in stats) >= 1
+    assert sum(s.get("candidates_judged", 0) for s in stats) == 1
+    # a forced re-run (state removed) asks nothing: the cache holds the judged pair. (The row is
+    # keyed by the text pair but cascades away with its items, so a re-index re-judges.)
+    n = len(jev.requests)
+    for d in docs(m).values():
+        with conn_of(m) as c:
+            c.execute("DELETE FROM memory_link_state WHERE document_id=%s", (d,))
+            c.commit()
+        m.link_document(d)
+    assert len(jev.requests) == n
+    m.close()
+
+
+def test_link_completeness_setting_per_bank_and_per_linker(fresh_db):
+    from prospecta.stages import validate_recall_config
+    validate_recall_config({"link_completeness": "connected"})
+    with pytest.raises(ValueError):
+        validate_recall_config({"link_completeness": "some"})
+    vec = {"A": [1, 0, 0, 0], "B": [1, 0.1, 0, 0], "C": [1, 0.6, 0, 0]}
+
+    def embed(ts):
+        return [[x / sum(y * y for y in vec[t[0]]) ** 0.5 for x in vec[t[0]]] for t in ts]
+
+    def run(set_bank, field):
+        import uuid
+        conn_of_url = psycopg.connect
+        with conn_of_url(fresh_db) as c:   # the banks share one database: start clean
+            c.execute("DELETE FROM documents")
+            c.commit()
+        m = Memory(database_url=fresh_db, bank_id="b" + uuid.uuid4().hex[:6], llm=None, embed=embed)
+        m.create_bank(m.default_bank_id, embedding_dim=4)
+        if set_bank:
+            m.set_recall_config({"link_completeness": set_bank})
+        for k in "ABC":
+            m.retain(f"{k} body text", source=k, index_text=f"{k} q")
+        jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+        m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
+                           judge_top_k=1, judge_nearest=0, link_completeness=field)
+        for d in docs(m).values():
+            m.link_document(d)
+        n = len({frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"})
+        m.close()
+        return n
+    assert run(None, None) == 3                 # default 'all-pairs': every qualifying pair
+    assert run("connected", None) == 1          # the bank asks for the reduced-pairs rule
+    assert run("connected", "all-pairs") == 3   # the linker's own setting wins
+
+
+def test_link_pass_upgrades_connected_to_all_pairs_resumably(fresh_db):
+    vec = {"A": [1, 0, 0, 0], "B": [1, 0.1, 0, 0], "C": [1, 0.6, 0, 0]}
+
+    def embed(ts):
+        return [[x / sum(y * y for y in vec[t[0]]) ** 0.5 for x in vec[t[0]]] for t in ts]
+    m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
+    m.create_bank("b", embedding_dim=4)
+    for k in "ABC":
+        m.retain(f"{k} body text", source=k, index_text=f"{k} q")
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+    m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
+                       judge_top_k=1, judge_nearest=0, link_completeness="connected")
+    for d in docs(m).values():
+        m.link_document(d)
+    pairs = lambda: {frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"}
+    assert pairs() == {frozenset("AB")}
+    m._linker.link_completeness = "all-pairs"
+    seen = []
+    first = m.link_pass("all-pairs", limit=1, on_progress=seen.append)   # an interrupted pass ...
+    assert first["documents"] == 1 and first["remaining"] == 2 and seen
+    rest = m.link_pass("all-pairs")                                      # ... resumes
+    assert rest["documents"] == 2 and rest["remaining"] == 0 and rest["failed"] == 0
+    assert pairs() == {frozenset("AB"), frozenset("AC"), frozenset("BC")}
+    n = len(jev.requests)
+    assert m.link_pass("all-pairs")["documents"] == 0 and len(jev.requests) == n   # nothing left
+    fut = m.link_pass("all-pairs", background=True)
+    assert fut.result()["documents"] == 0
+    m.close()

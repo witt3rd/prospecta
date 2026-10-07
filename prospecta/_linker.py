@@ -53,6 +53,8 @@ JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfa
 JUDGE_BACKOFF_S = 0.5
 HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
 NEIGHBOUR_PAGE = 16        # rows per HNSW fetch (throughput; doubles until the stop rule is decided)
+JUDGE_TOP_K = 32           # neighbour notes judged per note: one call at 96 questions (32 x 3 relations)
+JUDGE_NEAREST = 3          # a note's nearest neighbours are judged even when not mutual
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 TEMPORAL_DAYS = 3
@@ -365,6 +367,9 @@ class Linker:
     temporal_days: int = TEMPORAL_DAYS
     entity_hub: int = ENTITY_HUB
     vector_floor: float = VECTOR_FLOOR
+    judge_top_k: int = JUDGE_TOP_K          # a note judges at most its top-K neighbour notes ...
+    judge_nearest: int = JUDGE_NEAREST      # ... always its nearest few, the rest only if mutual
+    link_completeness: str | None = None    # 'all-pairs' | 'connected'; None = the bank's recall_config, else 'all-pairs'
     asynchronous: bool = True      # Memory runs it on a worker thread after retain
 
     # ------------------------------------------------------------ one document
@@ -603,6 +608,63 @@ class Linker:
                 conn.commit()
         return len(ids), last
 
+    def link_pass(self, conn, bank_id: str, mode: str = "all-pairs", limit: int | None = None,
+                  calls: list[dict] | None = None, on_progress=None) -> dict:
+        """Upgrade already linked documents to `mode` ('all-pairs'): re-run the semantic
+        step only, for every linked document whose state does not record that
+        completeness. Never touches retain (own connection, no lock beyond the link
+        rows), RESUMABLE: a finished document records its completeness in its link
+        state and is skipped next run, and the pair cache (memory_link_pairs) means a
+        pair judged before is never asked again, so an interrupted pass loses nothing.
+        Returns {"documents", "judged", "cached", "failed", "remaining"}; `limit`
+        bounds the documents of this run; `on_progress(dict)` is called after each."""
+        if mode not in ("connected", "all-pairs"):
+            raise ValueError(f"mode must be 'connected' or 'all-pairs', got {mode!r}")
+        calls = calls if calls is not None else []
+        out = {"documents": 0, "judged": 0, "cached": 0, "failed": 0, "remaining": 0}
+        if mode == "connected" or self.judge is None:   # all-pairs is a superset: nothing to upgrade to
+            return out
+        todo_sql = ("FROM memory_link_state s WHERE s.bank_id = %s "
+                    "AND s.stats->>'completeness' IS DISTINCT FROM %s")
+        with conn.cursor() as cur:
+            cur.execute("SELECT s.document_id::text " + todo_sql + " ORDER BY s.document_id",
+                        (bank_id, mode))
+            ids = [r[0] for r in cur.fetchall()]
+        total = len(ids)
+        out["remaining"] = total
+        for doc in ids[:limit]:
+            with conn.cursor() as cur:
+                cur.execute(_ANCHORS, {"doc": doc})
+                anchors = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
+            stats: dict = {"semantic": 0, "errors": []}
+            try:
+                if anchors:
+                    self._retrying(conn, "pass", lambda: self._run_step(
+                        lambda *a: self._semantic(*a, mode=mode), conn, bank_id, doc,
+                        anchors, stats, calls))
+                if stats["errors"]:
+                    raise RuntimeError("; ".join(stats["errors"]))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE memory_link_state SET stats = stats || %s::jsonb, linked_at = now() "
+                        "WHERE document_id = %s",
+                        (json.dumps({"completeness": mode,
+                                     "pass_judged": stats.get("candidates_judged", 0)}), doc))
+                conn.commit()
+            except Exception as exc:   # recorded in the log; the document stays to do next run
+                conn.rollback()
+                out["failed"] += 1
+                logger.error("link pass failed for %s (left for the next run): %s: %s",
+                             doc, type(exc).__name__, exc)
+            else:
+                out["judged"] += stats.get("candidates_judged", 0)
+                out["cached"] += stats.get("candidates_cached", 0)
+                out["remaining"] -= 1
+            out["documents"] += 1
+            if on_progress:
+                on_progress(dict(out))
+        return out
+
     def _judge_with_retry(self, source, texts, calls):
         delay = JUDGE_BACKOFF_S
         for attempt in range(1, JUDGE_RETRIES + 1):
@@ -617,58 +679,126 @@ class Linker:
                 delay *= 2
 
     @staticmethod
-    def _pair_hash(a_id, b_id) -> str:
-        lo, hi = sorted((str(a_id), str(b_id)))
+    def text_hash(text: str) -> str:
+        """sha256 of the text modulo frontmatter, whitespace and case: two chunks
+        with the same hash are the same content."""
+        return hashlib.sha256(normalise_text(text).encode()).hexdigest()
+
+    @staticmethod
+    def _pair_hash(th_a: str, th_b: str) -> str:
+        lo, hi = sorted((th_a, th_b))
         return hashlib.sha256(f"{lo}:{hi}".encode()).hexdigest()
 
-    def _judged_hits(self, conn, bank_id, a, cands, stats, calls) -> list[RelationHit]:
-        """Relation hits of anchor `a` against `cands`: a pair already judged (from
-        either side) is read back from memory_link_pairs, the rest go to the judge
-        in one batched call per 16 candidates; each judgment is stored once."""
-        hashes = [self._pair_hash(a["id"], c["id"]) for c in cands]
+    @staticmethod
+    def _text(item) -> str:
+        return item["original_chunk"] or item["content"]
+
+    def _doc_reps(self, conn, docs, kind):
+        """The representative item of each document: its first anchor of `kind`
+        (the order of _ANCHORS). One symmetric pair per document pair."""
         with conn.cursor() as cur:
-            cur.execute("SELECT pair_hash, src, hits FROM memory_link_pairs "
-                        "WHERE pair_hash = ANY(%s)", (hashes,))
-            cached = {h: (str(src), hits) for h, src, hits in cur.fetchall()}
-        todo = [i for i, h in enumerate(hashes) if h not in cached]
-        fresh: dict[int, list[RelationHit]] = {}
-        if todo:
-            got = self._judge_with_retry(
-                a["original_chunk"] or a["content"],
-                [cands[i]["original_chunk"] or cands[i]["content"] for i in todo], calls)
-            for k, i in enumerate(todo):
-                fresh[i] = [RelationHit(i, h.link_type, h.subtype, h.confidence, h.forward)
-                            for h in got if h.candidate == k]
+            cur.execute(
+                "SELECT DISTINCT ON (document_id) id, document_id, content, original_chunk "
+                "FROM memory_items WHERE document_id = ANY(%s) AND kind = %s "
+                "ORDER BY document_id, ordinal NULLS LAST, id", (list(docs), kind))
+            return {r[1]: dict(zip(("id", "document_id", "content", "original_chunk"), r))
+                    for r in cur.fetchall()}
+
+    def _mutual(self, conn, bank_id, kind, dim, me_doc, rep) -> bool:
+        """Is `me_doc` among the top `judge_top_k` neighbour documents of `rep`?"""
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(f"SET LOCAL hnsw.ef_search = {max(2 * self.judge_top_k, 40)}")
+            cur.execute(_NEIGHBOUR_SQL.format(kind=kind, dim=dim), {
+                "bank": bank_id, "doc": rep["document_id"], "n": self.judge_top_k,
+                "item": rep["id"]})
+            return any(str(r[1]) == str(me_doc) for r in cur.fetchall())
+
+    def _completeness(self, conn, bank_id, mode=None) -> str:
+        mode = mode or self.link_completeness
+        if mode is None:
+            from prospecta.stages import read_recall_config
+            mode = read_recall_config(conn, bank_id).get("link_completeness", "all-pairs")
+        if mode not in ("connected", "all-pairs"):
+            raise ValueError(f"link_completeness must be 'connected' or 'all-pairs', got {mode!r}")
+        return mode
+
+    def _judged_edges(self, conn, bank_id, me, cands, kind, dim, stats, calls,
+                      all_pairs=False):
+        """Relation edges (src, dst, link_type, subtype, confidence) between the
+        representative item `me` and each candidate representative in `cands`
+        (best first).
+
+        Fewer pairs, no model call for:
+        - a pair with the same normalised text (a duplicate): RELATED_TO at 1.0;
+        - a pair already judged, from either side or in an earlier run: read back
+          from memory_link_pairs (keyed by the text-hash pair, so it is global);
+        - a pair outside the candidate's top-K reach: a pair is judged only when it
+          is MUTUAL (each in the other's top `judge_top_k` neighbours) or the
+          candidate is among my `judge_nearest` best, so no note loses its nearest
+          links. SEMANTIC (same subject) is taken as transitive inside a dense
+          cluster: members beyond a note's top-K are reached through their cluster
+          neighbours; CAUSAL / LEADS_TO is NOT transitive, so it is kept only for
+          the judged pairs (the nearest, mutual ones).
+        With all_pairs (link_completeness = 'all-pairs', the default) every qualifying
+        candidate is judged: no top-K cap, no mutual test (duplicates and the cache still
+        apply). 'connected' is the cheaper explicit setting.
+        The rest are judged in batched calls; each judgment is stored once."""
+        th_me = self.text_hash(self._text(me))
+        edges: list[tuple] = []
+        fresh_rows: list[tuple] = []
+        pending = []   # (rank, cand, th_c, hash, me_is_lo)
+        for rank, c in enumerate(cands):
+            th_c = self.text_hash(self._text(c))
+            if th_c == th_me:
+                stats["candidates_duplicate"] = stats.get("candidates_duplicate", 0) + 1
+                edges += [(me["id"], c["id"], "SEMANTIC", "RELATED_TO", 1.0, rank)]
+                continue
+            pending.append((rank, c, th_c, self._pair_hash(th_me, th_c), th_me < th_c))
+        hashes = [p[3] for p in pending]
+        cached = {}
+        if hashes:
             with conn.cursor() as cur:
-                for i in todo:
-                    cur.execute(
+                cur.execute("SELECT pair_hash, hits FROM memory_link_pairs "
+                            "WHERE pair_hash = ANY(%s)", (hashes,))
+                cached = dict(cur.fetchall())
+        todo = []
+        for p in pending:
+            rank, c, th_c, h, me_lo = p
+            if h in cached:
+                edges += [(me["id"], c["id"], lt, st, float(cf), rank, (bool(fw) == me_lo))
+                          for lt, st, cf, fw in cached[h]]
+                stats["candidates_cached"] = stats.get("candidates_cached", 0) + 1
+            elif all_pairs or rank < self.judge_nearest or self._mutual(
+                    conn, bank_id, kind, dim, me["document_id"], c):
+                todo.append(p)
+            else:
+                stats["candidates_not_mutual"] = stats.get("candidates_not_mutual", 0) + 1
+        if todo:
+            got = self._judge_with_retry(self._text(me), [self._text(p[1]) for p in todo], calls)
+            with conn.cursor() as cur:
+                for k, (rank, c, th_c, h, me_lo) in enumerate(todo):
+                    mine = [x for x in got if x.candidate == k]
+                    edges += [(me["id"], c["id"], x.link_type, x.subtype, x.confidence, rank,
+                               x.forward) for x in mine]
+                    lo, hi = (me, c) if me_lo else (c, me)
+                    cur.execute(   # stored relative to lo -> hi
                         "INSERT INTO memory_link_pairs (pair_hash, bank_id, src, dst, hits) "
                         "VALUES (%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
-                        (hashes[i], bank_id, a["id"], cands[i]["id"], json.dumps(
-                            [[h.link_type, h.subtype, h.confidence, h.forward]
-                             for h in fresh[i]])))
+                        (h, bank_id, lo["id"], hi["id"], json.dumps(
+                            [[x.link_type, x.subtype, x.confidence, x.forward == me_lo]
+                             for x in mine])))
         stats["candidates_judged"] = stats.get("candidates_judged", 0) + len(todo)
-        stats["candidates_cached"] = stats.get("candidates_cached", 0) + len(cands) - len(todo)
-        out: list[RelationHit] = []
-        for i, h in enumerate(hashes):
-            if i in fresh:
-                out.extend(fresh[i])
-                continue
-            src, hits = cached[h]
-            same = src == str(a["id"])   # judged from the other side: directions flip
-            out.extend(RelationHit(i, lt, st, float(cf), bool(fw) == same)
-                       for lt, st, cf, fw in hits)
-        return out
+        return edges
 
-    def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
+    def _semantic(self, conn, bank_id, doc, anchors, stats, calls, mode=None):
         with conn.cursor() as cur:   # the HNSW indexes are on embedding::vector(dim)
             cur.execute("SELECT vector_dims(embedding) FROM memory_items WHERE id = %s",
                         (anchors[0]["id"],))
             dim = int(cur.fetchone()[0])
+        kind = "chunk" if anchors[0]["kind"] == "chunk" else "question"
+        best: dict = {}   # candidate document -> best cosine over my anchors
         for a in anchors:
-            kind = "chunk" if a["kind"] == "chunk" else "question"
-
-            def fetch(n, kind=kind, a=a, dim=dim):
+            def fetch(n, a=a):
                 from prospecta.channels.semantic import _scan_everything
 
                 def query(exhaustive):
@@ -691,36 +821,54 @@ class Linker:
                 fetch, lambda c: float(c["cos"]), self.neighbour_min_rel,
                 floor=self.neighbour_min_cos)
             stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
-            if not cands:
-                continue
-            hits: list[RelationHit] | None = None
-            origin = "jev"
-            if self.judge is not None:
-                try:
-                    hits = self._judged_hits(conn, bank_id, a, cands, stats, calls)
-                except Exception as exc:   # surfaced: state error row, retried by link_pending
-                    stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
-            if hits is None:   # no judge, or Jev could not answer: pgvector neighbours
-                origin = "pgvector"
-                hits = [RelationHit(i, "SEMANTIC", "RELATED_TO", float(c["cos"]))
-                        for i, c in enumerate(cands)
-                        if float(c["cos"]) >= self.vector_floor]
-            with conn.cursor() as cur:
-                def edges(h):   # SEMANTIC is symmetric: one judgment writes both directions
-                    c = cands[h.candidate]
-                    fwd, rev = (a["id"], c["id"]), (c["id"], a["id"])
-                    if h.link_type == "SEMANTIC":
-                        return [fwd, rev]
-                    return [fwd if h.forward else rev]
-                rows = sorted((e + (h.link_type, h.subtype, h.confidence, float(cands[h.candidate]["cos"]))
-                               for h in hits for e in edges(h)), key=lambda r: r[:4])
-                for src, dst, lt, st, conf, cos in rows:
-                    cur.execute(
-                        "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
-                        "confidence, origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb) "
-                        "ON CONFLICT DO NOTHING",
-                        (bank_id, src, dst, lt, st, conf, origin, json.dumps({"cosine": cos})))
-                    stats["semantic"] += cur.rowcount
+            for c in cands:
+                d = c["document_id"]
+                best[d] = max(best.get(d, 0.0), float(c["cos"]))
+        if not best:
+            return
+        ranked = sorted(best.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        reps = self._doc_reps(conn, [d for d, _ in ranked], kind)
+        me = dict(anchors[0], document_id=doc)
+        cands = [dict(reps[d], cos=cos) for d, cos in ranked if d in reps]
+        edges = None
+        origin = "jev"
+        if self.judge is not None:
+            try:   # 'connected': the top judge_top_k documents only; mutual / nearest / cached inside
+                stats["completeness"] = self._completeness(conn, bank_id, mode)
+                all_pairs = stats["completeness"] == "all-pairs"
+                edges = self._judged_edges(
+                    conn, bank_id, me, cands if all_pairs else cands[:self.judge_top_k],
+                    kind, dim, stats, calls, all_pairs=all_pairs)
+            except Exception as exc:   # surfaced: state error row, retried by link_pending
+                stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
+        if edges is None:   # no judge, or Jev could not answer: pgvector neighbours
+            origin = "pgvector"
+            edges = [(me["id"], c["id"], "SEMANTIC", "RELATED_TO", c["cos"], i)
+                     for i, c in enumerate(cands) if c["cos"] >= self.vector_floor]
+        with conn.cursor() as cur:
+            rows = []
+            for e in edges:   # SEMANTIC is symmetric: one judgment writes both directions
+                src, dst, lt, st, conf, rank = e[:6]
+                fwd = e[6] if len(e) > 6 else True
+                cos = cands[rank]["cos"]
+                if lt == "SEMANTIC":
+                    rows += [(src, dst, lt, st, conf, cos), (dst, src, lt, st, conf, cos)]
+                else:
+                    rows.append((src, dst, lt, st, conf, cos) if fwd
+                                else (dst, src, lt, st, conf, cos))
+            for src, dst, lt, st, conf, cos in sorted(rows, key=lambda r: r[:4]):
+                cur.execute(
+                    "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
+                    "confidence, origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb) "
+                    "ON CONFLICT DO NOTHING",
+                    (bank_id, src, dst, lt, st, conf, origin, json.dumps({"cosine": cos})))
+                stats["semantic"] += cur.rowcount
+
+
+def normalise_text(text: str) -> str:
+    """Text modulo YAML frontmatter, whitespace and case."""
+    t = re.sub(r"\A\s*---\n.*?\n---\s*(\n|\Z)", "", text or "", flags=re.S)
+    return re.sub(r"\s+", " ", t.strip().lower())
 
 
 def neighbours_until_drop(fetch, score, rel: float,

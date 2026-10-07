@@ -158,6 +158,7 @@ class Memory:
         # None = no linking; with `asynchronous` it runs on one worker thread.
         self._linker = linker
         self._link_executor = None
+        self._pass_executor = None
         self._link_futures: list = []
         self._default_bank_id = bank_id
         # Shadow reads (embedding migration): recall() also queries this bank
@@ -326,6 +327,8 @@ class Memory:
     def close(self) -> None:
         """Close the connection pool (after the link worker drains)."""
         self.wait_for_links()
+        if self._pass_executor is not None:
+            self._pass_executor.shutdown(wait=True)
         if self._link_executor is not None:
             self._link_executor.shutdown(wait=True)
         self._pool.close()
@@ -359,6 +362,34 @@ class Memory:
         for d in docs:
             self.link_document(d, bank)
         return len(docs)
+
+    def link_pass(self, mode: str = "all-pairs", limit: int | None = None,
+                  bank_id: str | None = None, background: bool = False, on_progress=None):
+        """Upgrade linked documents to `mode` after the import (see Linker.link_pass):
+        resumable by the link state and the pair cache, never blocks retain (own
+        connection; with background=True it runs on its own thread and a Future of the
+        progress dict {documents, judged, cached, failed, remaining} is returned)."""
+        if self._linker is None:
+            raise RuntimeError("link_pass needs Memory(linker=...)")
+        bank = bank_id or self._default_bank_id
+
+        def run():
+            calls: list[dict] = []
+            try:
+                with self._pool.dedicated() as conn:
+                    return self._linker.link_pass(conn, bank, mode, limit, calls, on_progress)
+            finally:
+                for c in calls:
+                    try:
+                        self._tracer("llm_call", {"bank_id": bank, **c})
+                    except Exception:  # pragma: no cover
+                        logger.exception("tracer raised on llm_call; ignoring")
+        if not background:
+            return run()
+        from concurrent.futures import ThreadPoolExecutor
+        if getattr(self, "_pass_executor", None) is None:
+            self._pass_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="link-pass")
+        return self._pass_executor.submit(run)
 
     def _enqueue_link(self, document_id: str) -> None:
         if self._linker is None:

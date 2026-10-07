@@ -89,8 +89,11 @@ def validate_recall_config(cfg: dict) -> None:
     if not isinstance(cfg, dict):
         raise ValueError("recall_config must be an object")
     for key in cfg:
-        if key not in ("rerank", "gate", "reader", "evidence", "depth"):
+        if key not in ("rerank", "gate", "reader", "evidence", "depth",
+                       "link_completeness"):
             raise ValueError(f"unknown recall_config key {key!r}")
+    if cfg.get("link_completeness", "connected") not in ("connected", "all-pairs"):
+        raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
     check_depth(cfg.get("depth"))
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
     if rr.get("stage", "sonnet_listwise") not in STAGES:
