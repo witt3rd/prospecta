@@ -106,6 +106,18 @@ for query, chunks in result.queries_to_results.items():
     print(query, len(chunks))        # which sub-question retrieved what
 ```
 
+For SET / discovery questions ("what are Greg's nicknames?") top-k retrieval
+cannot be complete. `recall_mapreduce` reads every note tied to the entity
+(`documents.person`, the entity table by name or `aliases`, `metadata_filter`)
+in batches, extracts the asked facts with a citation each, and merges them into
+one deduplicated cited list. Progress, cost, notes visited and facts found are
+recorded in `recall_events.plan` (mode `mapreduce`).
+
+```python
+res = m.recall_mapreduce("what are Greg's nicknames?", entity="Greg", batch_size=8)
+print(res.synthesis, res.citations)
+```
+
 ### Caller-supplied index_text — the spine override
 
 When the caller knows the right anticipated questions (or has refined them via a tighter prompt elsewhere), pass them directly. The library uses them verbatim and skips the LLM call. **Caller wins on every override.**
