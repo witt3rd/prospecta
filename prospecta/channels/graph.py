@@ -122,7 +122,10 @@ h2 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 2 AS hops,
            score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
            via || (subtype || ':' || nid::text) AS via, link_types || link_type AS link_types
-    FROM e2 WHERE nid <> parent
+    FROM e2, best1
+    WHERE nid <> parent
+      AND score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence
+          >= %(rel)s * best1.b   -- below the final cut whatever the rest of the walk finds
     ORDER BY nid, score * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
 ),
 reached AS (
@@ -134,13 +137,15 @@ reached AS (
 top AS (
     SELECT r.*, m.document_id FROM reached r JOIN memory_items m ON m.id = r.item_id
     WHERE m.document_id <> r.origin_doc
+),
+kept AS MATERIALIZED (   -- the cut runs before the content and source joins
+    SELECT t.* FROM top t WHERE t.score >= %(rel)s * (SELECT max(score) FROM top)
 )
 SELECT t.item_id, t.document_id, d.source, m.content, m.original_chunk, m.metadata,
        t.hops, t.score, t.via, t.link_types
-FROM top t
+FROM kept t
 JOIN memory_items m ON m.id = t.item_id
 JOIN documents d ON d.id = t.document_id
-WHERE t.score >= %(rel)s * (SELECT max(score) FROM top)
 ORDER BY t.score DESC, d.source, t.item_id
 """
 

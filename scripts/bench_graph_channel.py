@@ -1,5 +1,6 @@
 """Measure the graph channel on a synthetic large links table (F12).
 
+BENCH_STAGES=1 adds per-stage timings (cumulative CTE targets of graph._SQL).
 Usage: PROSPECTA_TEST_PG_URL=postgresql://... python scripts/bench_graph_channel.py [docs] [queries] [items_per_doc] [semantic_per_item]
 
 Builds a throwaway database (dropped at the end) with `docs` documents of `items_per_doc` items,
@@ -20,12 +21,60 @@ import time
 import psycopg
 
 from prospecta.channels import Candidate, GraphExpand, QueryPlan, RecallState
+from prospecta.channels import graph as graph_mod
 from prospecta.db.migrate import run_migrations
 
 
 SEEDS = 30        # seed documents per query (rrf >= 0.5 x best admits many)
 HUBS = 4          # hub entities
 HUB_SIZE = 5000   # items held by each hub entity
+LINK_HUBS = 4     # items that 5k other items link to (memory_links hubs, both link directions)
+LINK_HUB_DEGREE = 5000
+
+
+# Cumulative stage targets of graph._SQL: running the CTE chain up to a target (CTEs that are not
+# referenced are never executed) and subtracting the previous cumulative time gives the stage.
+STAGES = [("hop 1 edges", "e1"), ("hub join (hop 1)", "a_hubs"), ("hop 1 merge", "h1"),
+          ("frontier", "frontier"), ("hub join (hop 2)", "b_hubs"), ("hop 2 edges", "e2"),
+          ("hop 2 merge", "h2"), ("reach+scoring prep", "top"), ("final scoring/join", None)]
+
+
+def stage_times(c, g, state, docs_ws) -> dict[str, float]:
+    """Cumulative seconds per target for one query, plus seed selection."""
+    p = g.params
+    docs, ws = docs_ws
+    tw = {**graph_mod.DEFAULT_TYPE_WEIGHTS}
+    args = {"docs": docs, "ws": ws, "bank": state.bank_id, "decay": graph_mod.DEFAULT_DECAY,
+            "tw": __import__("json").dumps(tw), "wmax": max([1.0, *tw.values()]),
+            "max_hops": graph_mod.MAX_HOPS, "rel": graph_mod.DEFAULT_NODE_MIN_REL,
+            "hub": graph_mod.ENTITY_HUB, "hub_cap": graph_mod.DEFAULT_HUB_CAP}
+    cut = graph_mod._SQL.index("SELECT t.item_id")
+    out = {}
+    # a CTE that is only a prefix of the chain: s0 first, then each target
+    for label, target in [("seeds -> s0", "s0")] + STAGES:
+        sql = graph_mod._SQL if target is None else graph_mod._SQL[:cut] + f"SELECT count(*) FROM {target}"
+        t0 = time.perf_counter()
+        with c.cursor() as cur:
+            cur.execute(sql, args)
+            cur.fetchall()
+        out[label] = time.perf_counter() - t0
+    c.rollback()
+    return out
+
+
+def report_stages(rows: list[dict[str, float]]) -> None:
+    print("stage                    mean(s)   p90(s)   (increment over the previous target)")
+    prev = None
+    worst = (None, -1.0)
+    for label in rows[0]:
+        inc = [r[label] - (r[prev] if prev else 0.0) for r in rows]
+        inc_s = sorted(inc)
+        mean = statistics.mean(inc)
+        print(f"  {label:<22} {mean:7.3f}  {inc_s[int(0.9 * (len(inc_s) - 1))]:7.3f}")
+        if mean > worst[1]:
+            worst = (label, mean)
+        prev = label
+    print(f"slowest stage: {worst[0]} ({worst[1]:.3f}s mean)")
 
 
 def main() -> None:
@@ -85,26 +134,48 @@ def main() -> None:
                     cur.executemany("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)",
                                     [(it, eid) for it in members])
                 hubs.append(members)
+            link_hubs = [r[0] for r in c.execute(
+                "SELECT id FROM n WHERE r %% %s = 1 ORDER BY r LIMIT %s", (docs * per_doc // (LINK_HUBS + 1), LINK_HUBS))]
+            for i, hid in enumerate(link_hubs):   # even hubs: in-links; odd hubs: out-links
+                c.execute("""
+                  INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, confidence, origin)
+                  SELECT 'b', CASE WHEN %s THEN a.id ELSE %s END, CASE WHEN %s THEN %s ELSE a.id END,
+                         'SEMANTIC', 'RELATED_TO', 0.6 + random() * 0.4, 'pgvector'
+                  FROM (SELECT id FROM n WHERE id <> %s ORDER BY random() LIMIT %s) a
+                  ON CONFLICT DO NOTHING""", (i % 2 == 0, hid, i % 2 == 0, hid, hid, LINK_HUB_DEGREE))
             c.execute("ANALYZE")
             c.commit()
             nl = c.execute("SELECT count(*) FROM memory_links").fetchone()[0]
             allDocs = [str(r[0]) for r in c.execute("SELECT id FROM documents")]
             print(f"docs={docs} items={docs * per_doc} links={nl}")
             times = []
+            stage_rows = []
             g = GraphExpand()
             for q in range(queries):
                 pool = random.sample(allDocs, SEEDS)
                 if q % 3 == 0:   # a third of the queries seed from hub members
                     pool[0] = str(c.execute("SELECT document_id FROM memory_items WHERE id=%s",
                                             (random.choice(random.choice(hubs)),)).fetchone()[0])
+                if q % 3 == 1:   # a third seed from a link hub (5k+ links)
+                    pool[0] = str(c.execute("SELECT document_id FROM memory_items WHERE id=%s",
+                                            (random.choice(link_hubs),)).fetchone()[0])
                 st = RecallState(conn=c, bank_id="b", pool=[
                     Candidate(document_id=d, item_id=None, source="", channel="dense_chunk",
                               rank=i + 1, score=1.0, evidence="") for i, d in enumerate(pool)])
+                if os.environ.get("BENCH_STAGES"):
+                    t0 = time.perf_counter()
+                    sd = g.seeds(st, graph_mod.DEFAULT_SEED_MIN_REL)
+                    seed_s = time.perf_counter() - t0
+                    r = stage_times(c, g, st, sd)
+                    r["seed selection (python)"] = seed_s
+                    stage_rows.append({"seed selection (python)": seed_s, **{k: v for k, v in r.items() if k != "seed selection (python)"}})
                 t0 = time.perf_counter()
                 out = g.retrieve(QueryPlan(text="q"), st, 50)
                 times.append(time.perf_counter() - t0)
                 c.rollback()
             times.sort()
+            if stage_rows:
+                report_stages(stage_rows)
             print(f"graph channel over {queries} queries: mean {statistics.mean(times):.3f}s "
                   f"p90 {times[int(0.9 * (len(times) - 1))]:.3f}s max {times[-1]:.3f}s (last result {len(out)} docs)")
     finally:
