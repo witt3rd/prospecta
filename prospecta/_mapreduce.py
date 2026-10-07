@@ -42,7 +42,8 @@ WITH cand AS (
          d.id IN (SELECT m.document_id FROM memory_item_entities ie
                   JOIN memory_items m ON m.id = ie.item_id
                   WHERE ie.entity_id = ANY(%(ids)s)) AS linked,
-         (%(rx)s <> '' AND d.original_text ~* %(rx)s) AS scanned
+         (%(rx)s <> '' AND d.original_text ~* %(rx)s) AS scanned,
+         (%(hrx)s <> '' AND d.original_text ~* %(hrx)s) AS named
   FROM documents d
   WHERE d.bank_id = %(bank)s
     AND (%(meta)s::jsonb IS NULL OR EXISTS (
@@ -51,7 +52,7 @@ WITH cand AS (
 ), hubness AS (
   SELECT c.*, (SELECT count(*) FROM cand WHERE linked) > %(hub)s AS hub FROM cand c
 ), flagged AS (
-  SELECT h.*, (by_person OR (linked AND (NOT hub OR %(rx)s = '' OR scanned))) AS precise FROM hubness h
+  SELECT h.*, (by_person OR (linked AND (NOT hub OR %(hrx)s = '' OR named))) AS precise FROM hubness h
 ), scored AS (
   SELECT c.*, CASE WHEN c.scanned THEN
               ts_rank(to_tsvector('simple', c.original_text), nullif(%(tsq)s, '')::tsquery, 1) ELSE 0 END AS score
@@ -107,10 +108,13 @@ def fetch_entity_notes(conn, bank_id: str, names: list[str],
     scan = sorted({n.strip() for n in (scan_names if scan_names is not None else names)
                    if len(n.strip()) >= MIN_SCAN_CHARS}, key=str.casefold)
     rx = r"\m(?:" + "|".join(re.escape(n) for n in scan) + r")\M" if scan else ""
+    hub_names = sorted({n.strip() for n in [*names, *scan] if len(n.strip()) >= MIN_SCAN_CHARS},
+                       key=str.casefold)
+    hrx = r"\m(?:" + "|".join(re.escape(n) for n in hub_names) + r")\M" if hub_names else ""
     tsq = " | ".join(f"({' <-> '.join(w for w in re.findall(r'\w+', n.casefold()))})"
                      for n in scan if re.findall(r"\w+", n)) or ""
     with conn.cursor() as cur:
-        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx,
+        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx, "hrx": hrx,
                                  "tsq": tsq, "rel": scan_relevance, "hub": HUB_LINKED_NOTES,
                                  "meta": _meta_param(metadata_filter)})
         return [(r[0], r[1] or r[0], r[2]) for r in cur.fetchall()]
