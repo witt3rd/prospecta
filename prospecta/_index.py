@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_paragraphs, chunk_text
+from prospecta._scorecut import check_depth, resolve_depth
 from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
 from prospecta.channels.meta import DEFAULT_PROMOTE, DEFAULT_PROMOTE_WEIGHT
@@ -540,7 +541,9 @@ def search(
     metadata_filter: dict | None = None,
     rrf_k: int = 60,
     _trace: list | None = None,
+    depth: str | None = None,
 ) -> list[RecalledMemory]:
+    check_depth(depth)
     if mode not in ("hybrid", "semantic", "lexical"):
         raise ValueError(f"Invalid mode: {mode!r}")
     if mode in ("hybrid", "semantic") and memory._embed is None:
@@ -557,6 +560,7 @@ def search(
             return _search_channels(
                 memory, text, bank_id, channel_config, limit=limit,
                 metadata_filter=metadata_filter, rrf_k=rrf_k, trace=_trace,
+                depth=depth,
             )
         qvec = memory._embed([text])[0]
         with memory._pool.connection() as conn:
@@ -610,7 +614,7 @@ def search(
 def _search_channels(
     memory: "Memory", text: str, bank_id: str, config: list[dict],
     *, limit: int, metadata_filter: dict | None, rrf_k: int, trace: list | None,
-    recall_cfg: dict | None = None,
+    recall_cfg: dict | None = None, depth: str | None = None,
 ) -> list[RecalledMemory]:
     """Hybrid recall through the bank's configured channels (banks.channel_config).
     `recall_cfg` overrides the bank's stage config ({} = no stages); None reads it."""
@@ -646,12 +650,13 @@ def _search_channels(
                 state, text, fused, config, recall_cfg,
                 StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
                           model=memory._rerank_model),
-                k=rrf_k,
+                k=rrf_k, depth=depth,
             )
             tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
                       fallback_reason=st.get("fallback_reason"),
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
+        tr["depth"] = resolve_depth(depth, recall_cfg)
         if extract_calls:
             # The general llm's filter extraction counts in the recall's cost.
             from prospecta.stages import totals

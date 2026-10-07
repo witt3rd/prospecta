@@ -236,3 +236,16 @@ def test_mapreduce_greg_all_five_names_among_200_notes(fresh_db):
     for n in ALL5:
         assert n.casefold() in res.synthesis.casefold()
     m.close()
+
+
+def test_mapreduce_depth_defaults_deep_and_is_recorded(fresh_db):
+    m = _build(fresh_db, MapReduceLLM())
+    m.recall_mapreduce("nicknames?", entity="Pat")
+    m.recall_mapreduce("nicknames?", entity="Pat", depth="standard")
+    with psycopg.connect(fresh_db) as conn:
+        rows = conn.execute("SELECT depth FROM recall_events WHERE mode = 'mapreduce' "
+                            "ORDER BY id").fetchall()
+    assert rows == [("deep",), ("standard",)]
+    with pytest.raises(ValueError):
+        m.recall_mapreduce("nicknames?", entity="Pat", depth="shallow")
+    m.close()

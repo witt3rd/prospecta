@@ -18,6 +18,7 @@ def cmd_search(args) -> int:
             mode=args.mode,
             limit=args.limit,
             rrf_k=args.rrf_k,
+            depth=getattr(args, "depth", None),
         )
     except Exception as e:
         print(f"error: search failed: {e}", file=sys.stderr)

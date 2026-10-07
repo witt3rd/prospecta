@@ -190,7 +190,7 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
 
 def test_eval_flags_force_blend_and_promote(mem, monkeypatch):
     seen = []
-    monkeypatch.setattr(ev, "run_variant", lambda m, q, ch, rc, pool=None: (
+    monkeypatch.setattr(ev, "run_variant", lambda m, q, ch, rc, pool=None, depth=None: (
         seen.append((ch, rc)) or {"summary": {}, "stages": {}}))
     ev.run_eval(mem, [])
     assert not (seen[-1][1].get("rerank", {}).get("blend", {}).get("enabled", False))

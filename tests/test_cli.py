@@ -333,3 +333,20 @@ def test_make_memory_st_missing_extra_propagates_systemexit(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         _common.make_memory(_Args())
     assert exc.value.code == 1
+
+
+def test_cli_search_and_eval_take_depth(populated_corpus, capsys, monkeypatch):
+    from prospecta.cli import _common
+    from prospecta.cli.__main__ import main
+
+    monkeypatch.setattr(_common, "make_memory", lambda args: populated_corpus)
+    seen = {}
+    real = populated_corpus.search
+    monkeypatch.setattr(populated_corpus, "search",
+                        lambda *a, **k: (seen.update(k) or real(*a, **k)))
+    assert main(["search", "Kelly", "--depth", "deep"]) == 0
+    assert seen["depth"] == "deep"
+    with pytest.raises(SystemExit):
+        main(["search", "Kelly", "--depth", "shallow"])
+    with pytest.raises(SystemExit):
+        main(["eval", "q.md", "--depth", "shallow"])
