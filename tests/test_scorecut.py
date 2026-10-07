@@ -174,8 +174,8 @@ def test_default_rerank_pool_cut_and_report_line():
            "full": {"stages": {}, "summary": {
                "gold": {"hit1": 1.0, "hit10": 1.0, "mrr": 1.0, "cover10": 1.0},
                "gold2": {"n": 0}, "by_class": {}}},
-           "recall_config": DEFAULT_RECALL_CONFIG,
+           "recall_config": DEFAULT_RECALL_CONFIG, "depth": "standard", "rerank_min_rel": 0.15,
            "channel_config": [{"name": "bm25"}, {"name": "dense_chunk"}]}
     text = format_report(rep)
     assert ("cuts: channels bm25 0.0, dense_chunk 0.0 (0 = no cut); "
-            "rerank pool >= 0.15 x best fused score") in text
+            "rerank pool >= 0.15 x best fused score (depth: standard)") in text
