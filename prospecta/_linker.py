@@ -51,8 +51,6 @@ JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfa
 JUDGE_BACKOFF_S = 0.5
 HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
 NEIGHBOUR_PAGE = 16        # rows per HNSW fetch (throughput; doubles until the stop rule is decided)
-JEV_MAX_QUESTIONS_PER_CALL = 16  # questions per System One request: the VERIFIED wire limit (one candidate = one question
-                           # in the rank use). Raise (>= 48, with relations_per_call) only once verified on the live wire.
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 TEMPORAL_DAYS = 3
@@ -205,15 +203,8 @@ class JevRelationJudge:
     `threshold` (0.6). Same wire shape and limits as the Jev reranker."""
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
-                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD,
-                 max_questions: int = JEV_MAX_QUESTIONS_PER_CALL,
-                 relations_per_call: bool = False):
-        if relations_per_call and max_questions < len(RELATIONS):
-            raise ValueError("relations_per_call needs max_questions >= one candidate's relation questions")
-        if max_questions < 1:
-            raise ValueError("max_questions must be positive")
+                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD):
         self.transport, self.model, self.timeout = transport, model, timeout
-        self.max_questions, self.relations_per_call = max_questions, relations_per_call
         self.threshold = threshold
 
     def _question(self, relation: str, cand: str) -> dict:
@@ -224,30 +215,22 @@ class JevRelationJudge:
 
     def judge(self, source_text: str, candidates: list[str],
               calls: list[dict]) -> list[RelationHit]:
-        # one request holds at most max_questions questions in total (candidate x
-        # relation), at most JEV_MAX_BATCH candidates and JEV_INPUT_BYTES: the
-        # wire note's limits; larger sets split into several requests, no
-        # candidate is dropped. relations_per_call keeps a candidate's relation
-        # questions together in one request, otherwise questions fill requests flat.
-        asks = self._asks(list(range(len(candidates))))
-        if self.relations_per_call:
-            units = [[a for a in asks if a[0] == ci] for ci in range(len(candidates))]
-        else:
-            units = [[a] for a in asks]
+        # one request scores up to JEV_MAX_BATCH candidates (all their relation
+        # questions) within JEV_INPUT_BYTES: the wire note's limits (the live
+        # wire was verified past 300 questions; the real limit is input tokens,
+        # which the byte bound keeps clear). Larger sets split, none is dropped.
         batches: list[list[tuple[int, str]]] = []
-        cur: list[tuple[int, str]] = []
-        for unit in units:
-            trial = cur + unit
-            if cur and (len(trial) > self.max_questions
-                        or len({ci for ci, _ in trial}) > JEV_MAX_BATCH
-                        or len(json.dumps(self._request(
-                            source_text, candidates, trial)).encode()) > JEV_INPUT_BYTES):
-                batches.append(cur)
-                cur = list(unit)
+        cur: list[int] = []
+        for ci in range(len(candidates)):
+            trial = cur + [ci]
+            if cur and (len(trial) > JEV_MAX_BATCH or len(json.dumps(self._request(
+                    source_text, candidates, self._asks(trial))).encode()) > JEV_INPUT_BYTES):
+                batches.append(self._asks(cur))
+                cur = [ci]
             else:
                 cur = trial
         if cur:
-            batches.append(cur)
+            batches.append(self._asks(cur))
         hits: list[RelationHit] = []
         for batch in batches:
             req = self._request(source_text, candidates, batch)

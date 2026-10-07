@@ -17,6 +17,7 @@ from prospecta.channels import (
     run_channels,
 )
 from prospecta.memory import Memory
+from prospecta.stages import JEV_INPUT_BYTES
 from prospecta.stages import (
     JevReader, JevScore, Item, LLMResult, StageDeps, run_stages, validate_recall_config,
 )
@@ -306,7 +307,7 @@ def test_linker_jev_typed_links_with_threshold(mem):
     assert sum(1 for l in ls if l[:2] == ("cause", "effect") and l[2] == "CAUSAL") == 1
     # one question per (candidate, relation), at most 16 candidates per request, wire shape intact
     for r in jev.requests:
-        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16
+        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16 * 3
         assert all(q["type"] == "score" and len(q["criteria"]) == 4 for q in r["questions"].values())
 
 
@@ -557,29 +558,21 @@ def test_neighbours_absolute_floor_cuts_even_when_relative_stop_admits():
     assert neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.7)[0] == []
 
 
-def test_judge_default_never_exceeds_16_questions_per_call_and_drops_none():
+def test_judge_batches_16_candidates_per_call_and_drops_none():
     jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
     cands = [f"cand {i}" for i in range(40)]
     hits = JevRelationJudge(jev).judge("query", cands, [])
-    sizes = [len(r["questions"]) for r in jev.requests]
-    assert max(sizes) == 16 and sum(sizes) == 40 * 3 and len(sizes) == 8
-    assert sorted(h.candidate for h in hits) == list(range(40))
-
-
-def test_judge_raised_limit_with_relations_per_call_batches_16_candidates():
-    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
-    judge = JevRelationJudge(jev, max_questions=48, relations_per_call=True)
-    cands = [f"cand {i}" for i in range(40)]
-    hits = judge.judge("query", cands, [])
     assert [len(r["questions"]) for r in jev.requests] == [48, 48, 24]   # 16 + 16 + 8 candidates
     assert sorted(h.candidate for h in hits) == list(range(40))
 
 
-def test_judge_relations_per_call_never_splits_a_candidate_under_a_smaller_limit():
-    jev = JevStub(lambda rel, cand, query: 0)
-    JevRelationJudge(jev, max_questions=16, relations_per_call=True).judge(
-        "query", [f"cand {i}" for i in range(12)], [])
-    assert [len(r["questions"]) for r in jev.requests] == [15, 15, 6]
+def test_judge_splits_requests_at_the_byte_limit_and_drops_none():
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+    cands = [f"cand {i} " + "x" * 3000 for i in range(16)]
+    hits = JevRelationJudge(jev).judge("query", cands, [])
+    assert len(jev.requests) > 1
+    assert all(len(json.dumps(r).encode()) <= JEV_INPUT_BYTES for r in jev.requests)
+    assert sorted(h.candidate for h in hits) == list(range(16))
 
 
 def test_each_unordered_pair_is_judged_once_and_rerun_asks_nothing(mem):
