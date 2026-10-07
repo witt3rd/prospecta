@@ -45,7 +45,7 @@ WHERE a.bank_id = %(bank)s AND a.entity_id = ANY(%(ids)s)
 _NOTES_SQL = """
 WITH cand AS (
   SELECT d.id, d.source, d.original_text,
-         (   coalesce(lower(btrim(d.person)) = ANY(%(names)s), false)
+         (   coalesce(lower(regexp_replace(btrim(d.person), '\s+', ' ', 'g')) = ANY(%(names)s), false)
           OR d.id IN (SELECT m.document_id FROM memory_item_entities ie
                       JOIN memory_items m ON m.id = ie.item_id
                       WHERE ie.entity_id = ANY(%(ids)s))) AS precise,
