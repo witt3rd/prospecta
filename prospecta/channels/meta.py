@@ -14,6 +14,7 @@ from dataclasses import replace
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
+from prospecta._entities import resolve_entities
 from prospecta.db.queries import _meta_param, _vec_literal
 
 DEFAULT_PROMOTE = False       # scope-promotion re-sort is opt-in (meta param `promote`)
@@ -44,10 +45,13 @@ class MetadataScope:
         if not (f.people or f.date_from or f.date_to):
             return []
         qe = state.embed_query(plan.text)
+        people = list(f.people)
+        if people:   # name matching, not exact equality: Nelson reaches "Mr. Nelson"
+            people = list(dict.fromkeys(people + resolve_entities(state.conn, state.bank_id, people).people))
         with state.conn.cursor() as cur:
             cur.execute(_SQL, {
                 "bank_id": state.bank_id, "qe": _vec_literal(qe),
-                "people": list(f.people) or None,
+                "people": people or None,
                 "date_from": f.date_from, "date_to": f.date_to,
                 "meta": _meta_param(state.metadata_filter),
             })
