@@ -188,6 +188,22 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     json.loads(ev.report_json(rep))
 
 
+def test_eval_flags_force_blend_and_promote(mem, monkeypatch):
+    seen = []
+    monkeypatch.setattr(ev, "run_variant", lambda m, q, ch, rc, pool=None: (
+        seen.append((ch, rc)) or {"summary": {}, "stages": {}}))
+    ev.run_eval(mem, [])
+    assert not (seen[-1][1].get("rerank", {}).get("blend", {}).get("enabled", False))
+    ev.run_eval(mem, [], rerank_blend=True, scope_promote=True)
+    ch, rc = seen[-1]
+    assert rc["rerank"]["blend"]["enabled"] is True
+    assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [True]
+    ev.run_eval(mem, [], rerank_blend=False, scope_promote=False)
+    ch, rc = seen[-1]
+    assert rc["rerank"]["blend"]["enabled"] is False
+    assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [False]
+
+
 def test_run_eval_legacy_bank_scored_with_defaults(mem):
     mem.set_channel_config([])
     rep = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))

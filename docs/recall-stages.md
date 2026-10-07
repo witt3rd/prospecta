@@ -7,7 +7,7 @@ unchanged). Set it with `Memory.set_recall_config(...)`.
 ```python
 mem.set_recall_config({
   "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": 0.4,
-             "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3, "floor": False}},
+             "blend": {"enabled": False, "weight_rerank": 0.7, "weight_fused": 0.3, "floor": False}},
   "gate":   {"enabled": False, "threshold": 2.95},          # Jev, needs Memory(jev=...)
   "reader": {"enabled": False, "min_rel_score": 0.6, "hop_min_rel_score": 0.4},
 })
@@ -18,12 +18,12 @@ mem.set_recall_config({
   JSON `{grades, ranking}`; order = ranking, then grade, then fused order. Any
   failure (provider error, unparseable reply) keeps the fused order and records
   `fallback_reason` in `recall_events.rerank`.
-- **Blend** (`rerank.blend`, on by default when rerank runs): the reranker's order
+- **Blend** (`rerank.blend`, **off by default**, opt in with `enabled: true`; see `limits.md`): when on, the reranker's order
   is blended with the fused order, not substituted for it. score =
   `weight_rerank` * rank score (1.0 first .. 0.0 last) + `weight_fused` * fused
   RRF / best fused RRF. Defaults `weight_rerank` 0.7, `weight_fused` 0.3. With
   `floor: true` the fused top `keep` (3) stay inside the first `within` (10).
-  The floor is off by default. `enabled: false` restores the pure reranker order.
+  The floor is off by default. With blend off (the default) the order is the pure reranker order.
   Applies to either stage; the parameters and `moved` land in
   `recall_events.rerank.blend`.
 - **Jev** (`JevScore`, `rerank.stage = "jev_score"`) in Spire's call shape: one

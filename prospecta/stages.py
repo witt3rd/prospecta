@@ -75,7 +75,7 @@ BLEND_DEFAULTS = {"weight_rerank": 0.7, "weight_fused": 0.3, "keep": 3, "within"
 
 DEFAULT_RECALL_CONFIG: dict = {
     "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": POOL_MIN_REL,
-               "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3,
+               "blend": {"enabled": False, "weight_rerank": 0.7, "weight_fused": 0.3,
                          "floor": False, "keep": 3, "within": 10}},
     "gate": {"enabled": False, "threshold": JEV_GATE_THRESHOLD},
     "reader": {"enabled": False, "min_rel_score": READER_MIN_REL,
@@ -564,10 +564,10 @@ class BlendedReranker:
 
 def build_reranker(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None):
     """The configured Reranker (blended with the fused order unless
-    rerank.blend.enabled is false), or None when reranking is off."""
+    rerank.blend.enabled is not true (default off)), or None when reranking is off."""
     inner = _build_inner(cfg, llm=llm, jev=jev, model=model)
     blend = (cfg.get("rerank") or {}).get("blend") or {}
-    if inner is None or not blend.get("enabled", True):
+    if inner is None or not blend.get("enabled", False):
         return inner
     return BlendedReranker(inner, blend)
 

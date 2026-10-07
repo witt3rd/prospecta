@@ -78,6 +78,15 @@ question from the question channel 50 -> about 10. Cost (LLM) not measurable off
 
 No `max_tokens` is passed to any LLM call. Not audited here: CLI/TUI display widths.
 
+## Recall switches that are OFF by default
+
+| Switch | Where | Default | Why |
+|---|---|---|---|
+| Rerank blend (`rerank.blend.enabled`, 0.7/0.3) | `stages.py` | **off** | with score-based pools it regressed hit@1 (V3 re-run: gold1 0.72 vs 0.86 off, gold2 0.85 vs 0.97 off) |
+| Scope-promotion re-sort (meta param `promote`) | `channels/meta.py` | **off** | same V3 regression; opt in until it beats the v2 numbers |
+
+`prospecta eval --rerank-blend/--no-rerank-blend --scope-promote/--no-scope-promote` force each per run. The promotion table below describes the code when `promote` is on.
+
 ## Scope promotion: cover@10 (Q096-style synthetic set)
 
 60 non-members (fused 1.0 down), 40 members (fused ~0.3), 3 gold members buried in the set.

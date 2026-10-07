@@ -116,6 +116,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--judge", action="store_true",
                     help="With --synth: judge answers against `answer:` lines (implies --synth)")
     ev.add_argument("--json", action="store_true", help="Emit the full report as JSON")
+    ev.add_argument("--rerank-blend", action=argparse.BooleanOptionalAction, default=None,
+                    help="Force the 0.7/0.3 rerank blend on/off for this run (default: config, off)")
+    ev.add_argument("--scope-promote", action=argparse.BooleanOptionalAction, default=None,
+                    help="Force the scope-promotion re-sort on/off for this run (default: config, off)")
 
     # ---- retain (T15) ---------------------------------------------------
     rt = sub.add_parser("retain", help="Write a document via the spine")
