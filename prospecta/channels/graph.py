@@ -31,7 +31,10 @@ _RRF_K = 60
 # Two explicit, bounded hops instead of a recursive walk over both directions
 # of an OR join. Each hop is a UNION ALL of two index scans (src side, dst
 # side). After hop 1 every item with a positive score is expanded (no count).
-# Scores only fall along a path (decay, weight, confidence are all <= 1). Hub
+# Scores only fall along a path (decay, weight, confidence are all <= 1), so a
+# hop-1 item is expanded only if one more step (decay x the largest type weight)
+# could still reach `node_min_rel` x the best hop-1 score: the final cut keeps at
+# least that, so this prunes exactly the nodes that cannot survive it (no count). Hub
 # entities (more than `hub` items) carry no per-anchor links; hops 1 and 2 reach the
 # other holders of a frontier item's hub entities through the memory_item_entities
 # join, up to `hub_cap` per entity.
@@ -46,24 +49,41 @@ _EDGES = """
     FROM {frm} f JOIN memory_links l ON l.dst = f.item AND l.bank_id = %(bank)s
 """
 
+# Hub holders are fetched once per (entity, kind) -- not once per frontier item --
+# and then joined to every frontier item that holds the entity (the frontier item's
+# own document is left out of its neighbours). `{p}` prefixes the CTE names.
 _HUBS = """
-    SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent, b.item_id AS nid,
-           'ENTITY'::text AS link_type, 'SHARED_ENTITY'::text AS subtype, 1.0::real AS confidence
-    FROM {frm} s
+{p}he AS MATERIALIZED (
+    SELECT ie.entity_id, si.kind
+    FROM (SELECT DISTINCT item FROM {frm}) s
     JOIN memory_items si ON si.id = s.item
     JOIN memory_item_entities ie ON ie.item_id = s.item
     CROSS JOIN LATERAL (
         SELECT count(*) AS n FROM (SELECT 1 FROM memory_item_entities x
                                    WHERE x.entity_id = ie.entity_id LIMIT %(hub)s + 1) q
     ) hc
+    WHERE hc.n > %(hub)s AND %(hub_cap)s > 0
+    GROUP BY ie.entity_id, si.kind
+),
+{p}hh AS MATERIALIZED (
+    SELECT he.entity_id, he.kind, b.item_id, bi.document_id AS doc
+    FROM {p}he he
     CROSS JOIN LATERAL (
         SELECT ie2.item_id FROM memory_item_entities ie2
         JOIN memory_items bi ON bi.id = ie2.item_id
-        WHERE ie2.entity_id = ie.entity_id AND bi.kind = si.kind
-          AND bi.document_id <> s.origin_doc
+        WHERE ie2.entity_id = he.entity_id AND bi.kind = he.kind
         ORDER BY ie2.n DESC, ie2.item_id LIMIT %(hub_cap)s
     ) b
-    WHERE hc.n > %(hub)s AND %(hub_cap)s > 0
+    JOIN memory_items bi ON bi.id = b.item_id
+),
+{p}hubs AS (
+    SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent, hh.item_id AS nid,
+           'ENTITY'::text AS link_type, 'SHARED_ENTITY'::text AS subtype, 1.0::real AS confidence
+    FROM {frm} s
+    JOIN memory_items si ON si.id = s.item
+    JOIN memory_item_entities ie ON ie.item_id = s.item
+    JOIN {p}hh hh ON hh.entity_id = ie.entity_id AND hh.kind = si.kind AND hh.doc <> s.origin_doc
+)
 """
 
 _SQL = """
@@ -76,20 +96,27 @@ s0 AS (
     FROM seed s JOIN memory_items m ON m.document_id = s.doc AND m.bank_id = %(bank)s
 ),
 e1 AS (""" + _EDGES.format(frm="s0") + """),
-hubs AS (""" + _HUBS.format(frm="s0") + """),
+""" + _HUBS.format(frm="s0", p="a_") + """,
 h1 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 1 AS hops, item AS parent,
            score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
            ARRAY[subtype || ':' || nid::text] AS via, ARRAY[link_type] AS link_types
-    FROM (SELECT * FROM e1 UNION ALL SELECT * FROM hubs) e
+    FROM (SELECT * FROM e1 UNION ALL SELECT * FROM a_hubs) e
     ORDER BY nid, score * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
 ),
-frontier AS (
-    SELECT * FROM h1 WHERE score > 0 AND %(max_hops)s >= 2
+best1 AS (
+    SELECT COALESCE(max(h.score), 0) AS b
+    FROM h1 h JOIN memory_items m ON m.id = h.item WHERE m.document_id <> h.origin_doc
 ),
+frontier AS (
+    SELECT h.* FROM h1 h, best1
+    WHERE h.score > 0 AND %(max_hops)s >= 2
+      AND h.score * %(decay)s * %(wmax)s >= %(rel)s * best1.b
+),
+""" + _HUBS.format(frm="frontier", p="b_") + """,
 e2 AS (""" + _EDGES.format(frm="frontier") + """
     UNION ALL
-    SELECT * FROM (""" + _HUBS.format(frm="frontier") + """) hb2
+    SELECT * FROM b_hubs
 ),
 h2 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 2 AS hops,
@@ -150,6 +177,7 @@ class GraphExpand:
                 "docs": docs, "ws": ws, "bank": state.bank_id,
                 "decay": float(p.get("decay", DEFAULT_DECAY)),
                 "tw": json.dumps(tw),
+                "wmax": max([1.0, *tw.values()]),
                 "max_hops": int(p.get("max_hops", MAX_HOPS)),
                 "rel": float(p.get("node_min_rel", DEFAULT_NODE_MIN_REL)),
                 "hub": int(p.get("hub", ENTITY_HUB)),

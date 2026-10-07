@@ -4,10 +4,10 @@ Usage: PROSPECTA_TEST_PG_URL=postgresql://... python scripts/bench_graph_channel
 
 Builds a throwaway database (dropped at the end) with `docs` documents of `items_per_doc` items,
 `semantic_per_item` links per item (skewed in-degree, so some items are hubs: PRECEDES/SUCCEEDS
-chain + skewed SEMANTIC), and 3 person hubs of ~190 items, then times
+chain + skewed SEMANTIC), and HUBS person hubs of HUB_SIZE items, then times
 GraphExpand over random 10-seed pools. Prints mean / p90 / max seconds.
-Link rows for hub entities follow the current Linker: per-anchor capped links
-when run against the old code, entity-table joins when run against the new.
+Hub entities (HUBS x HUB_SIZE items) carry no per-anchor links: the channel reaches their holders through the
+entity table. Defaults give ~250k links over 60k items, 4 hubs of 5k items, 2 hops, 30 seeds.
 """
 from __future__ import annotations
 
@@ -23,11 +23,16 @@ from prospecta.channels import Candidate, GraphExpand, QueryPlan, RecallState
 from prospecta.db.migrate import run_migrations
 
 
+SEEDS = 30        # seed documents per query (rrf >= 0.5 x best admits many)
+HUBS = 4          # hub entities
+HUB_SIZE = 5000   # items held by each hub entity
+
+
 def main() -> None:
-    docs = int(sys.argv[1]) if len(sys.argv) > 1 else 60000
+    docs = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
     queries = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-    per_doc = int(sys.argv[3]) if len(sys.argv) > 3 else 9
-    sem = int(sys.argv[4]) if len(sys.argv) > 4 else 12
+    per_doc = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    sem = int(sys.argv[4]) if len(sys.argv) > 4 else 2
     base = os.environ["PROSPECTA_TEST_PG_URL"]
     name = f"bench_{int(time.time())}"
     with psycopg.connect(base, autocommit=True) as c:
@@ -71,20 +76,15 @@ def main() -> None:
               SELECT 'b', b.id, a.id, 'TEMPORAL', 'SUCCEEDS', 'sql' FROM n a JOIN n b ON b.r = a.r + 1
               ON CONFLICT DO NOTHING""")
             hubs = []
-            for h in range(3):
+            for h in range(HUBS):
                 eid = c.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
                                 "VALUES ('b', %s, %s, 'person') RETURNING id", (f"hub{h}", f"hub{h}")).fetchone()[0]
-                members = [r[0] for r in c.execute("SELECT id FROM n WHERE r %% 300 = %s ORDER BY r LIMIT 190", (h,))]
-                for it in members:
-                    c.execute("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)", (it, eid))
+                members = [r[0] for r in c.execute(
+                    "SELECT id FROM n WHERE r %% %s = %s ORDER BY r LIMIT %s", (HUBS * 2, h, HUB_SIZE))]
+                with c.cursor() as cur:
+                    cur.executemany("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)",
+                                    [(it, eid) for it in members])
                 hubs.append(members)
-                if os.environ.get("BENCH_OLD_ENTITY_LINKS", "1") == "1":   # old behaviour: capped links per anchor
-                    for it in members:
-                        for o in random.sample(members, 10):
-                            if o != it:
-                                c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, origin) "
-                                          "VALUES ('b', %s, %s, 'ENTITY', 'SHARED_ENTITY', 'sql') ON CONFLICT DO NOTHING",
-                                          (it, o))
             c.execute("ANALYZE")
             c.commit()
             nl = c.execute("SELECT count(*) FROM memory_links").fetchone()[0]
@@ -93,8 +93,8 @@ def main() -> None:
             times = []
             g = GraphExpand()
             for q in range(queries):
-                pool = random.sample(allDocs, 10)
-                if q % 3 == 0:   # a third of the queries seed from a hub member
+                pool = random.sample(allDocs, SEEDS)
+                if q % 3 == 0:   # a third of the queries seed from hub members
                     pool[0] = str(c.execute("SELECT document_id FROM memory_items WHERE id=%s",
                                             (random.choice(random.choice(hubs)),)).fetchone()[0])
                 st = RecallState(conn=c, bank_id="b", pool=[
@@ -108,6 +108,9 @@ def main() -> None:
             print(f"graph channel over {queries} queries: mean {statistics.mean(times):.3f}s "
                   f"p90 {times[int(0.9 * (len(times) - 1))]:.3f}s max {times[-1]:.3f}s (last result {len(out)} docs)")
     finally:
+        if os.environ.get("BENCH_KEEP"):
+            print(f"kept database {name}")
+            return
         with psycopg.connect(base, autocommit=True) as c:
             c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
