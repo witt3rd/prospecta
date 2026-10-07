@@ -55,7 +55,8 @@ HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fe
 NEIGHBOUR_PAGE = 16        # rows per HNSW fetch (throughput; doubles until the stop rule is decided)
 JUDGE_TOP_K = 32           # neighbour notes judged per note: one call at 96 questions (32 x 3 relations)
 JUDGE_NEAREST = 3          # a note's nearest neighbours are judged even when not mutual
-JUDGE_FLOOR_FRAC = 0.25    # all-pairs: judge a candidate above median + frac x (best - median) of the anchor's neighbours; 0 = off
+JUDGE_FLOOR_FRAC = 0.1     # all-pairs: judge a candidate above low + frac x (best - low) of the anchor's neighbours; 0 = off
+JUDGE_FLOOR_QUANTILE = 0.1  # the low end of the anchor's neighbour cosines
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 TEMPORAL_DAYS = 3
@@ -726,15 +727,15 @@ class Linker:
 
     def anchor_floor(self, cands) -> float:
         """The per-anchor similarity floor of the all-pairs pass, relative to the
-        anchor's own neighbour distribution (no count cap): median + judge_floor_frac
-        x (best - median) of the candidates' cosines. In a dense cluster the median
-        is close to the best, so the floor sits high and only distinctly related
+        anchor's own neighbour distribution (no count cap): low + judge_floor_frac
+        x (best - low) of the candidates' cosines, low being their JUDGE_FLOOR_QUANTILE
+        quantile. In a dense cluster the low end is close to the best, so the floor sits high and only distinctly related
         pairs are judged; in a sparse region the spread is wide and the floor falls."""
         if self.judge_floor_frac <= 0 or len(cands) < 2:
             return float("-inf")
         cos = sorted(float(c["cos"]) for c in cands)
-        median = cos[len(cos) // 2]
-        return median + self.judge_floor_frac * (cos[-1] - median)
+        low = cos[int(JUDGE_FLOOR_QUANTILE * (len(cos) - 1))]
+        return low + self.judge_floor_frac * (cos[-1] - low)
 
     def _judged_edges(self, conn, bank_id, me, cands, kind, dim, stats, calls,
                       all_pairs=False, floor=float("-inf")):
