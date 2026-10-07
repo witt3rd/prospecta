@@ -297,16 +297,16 @@ def test_linker_jev_typed_links_with_threshold(mem):
         return 1   # 0.33 < 0.6: below Jev-Mem's threshold
 
     jev = JevStub(rule)
-    link_all(mem, Linker(judge=JevRelationJudge(jev)))
+    link_all(mem, Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0))   # stub vectors are not semantic
     ls = [(a, b, lt, st, o) for a, b, lt, st, o, c in links(mem) if o == "jev"]
     assert ("cause", "effect", "CAUSAL", "LEADS_TO", "jev") in ls
     assert ("effect", "cause", "SEMANTIC", "RELATED_TO", "jev") in ls
     assert not any("other" in (a, b) for a, b, *_ in ls)
     # caused_by is stored as the reverse CAUSAL edge: the cause leads to the effect, once
     assert sum(1 for l in ls if l[:2] == ("cause", "effect") and l[2] == "CAUSAL") == 1
-    # one question per (candidate, relation), at most 16 per request, wire shape intact
+    # one question per (candidate, relation), at most 16 candidates per request, wire shape intact
     for r in jev.requests:
-        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16
+        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16 * 3
         assert all(q["type"] == "score" and len(q["criteria"]) == 4 for q in r["questions"].values())
 
 
@@ -541,3 +541,47 @@ def test_linker_judge_failure_is_retried_before_it_is_surfaced(mem, monkeypatch)
     mem._linker = Linker(judge=JevRelationJudge(flaky))
     stats = mem.link_document(docs(mem)["a"])
     assert stats["errors"] == [] and {l[4] for l in links(mem) if l[2] == "SEMANTIC"} == {"jev"}
+
+
+def _cluster_mem(mem, texts):
+    for i, t in enumerate(texts):
+        mem.retain(t, source=f"s{i}", index_text=t)
+
+
+def test_neighbours_absolute_floor_cuts_even_when_relative_stop_admits():
+    from prospecta._linker import neighbours_until_drop
+    scores = [0.60, 0.59, 0.58, 0.57]   # flat: relative stop admits all four
+    rows = lambda n: [{"cos": s} for s in scores[:n]]
+    got, _ = neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.585)
+    assert [r["cos"] for r in got] == [0.60, 0.59]
+    assert neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.7)[0] == []
+
+
+def test_judge_batches_16_candidates_per_call_and_drops_none():
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+    judge = JevRelationJudge(jev)
+    cands = [f"cand {i}" for i in range(40)]
+    hits = judge.judge("query", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [48, 48, 24]   # 16 + 16 + 8 candidates
+    assert sorted(h.candidate for h in hits) == list(range(40))
+
+
+def test_each_unordered_pair_is_judged_once_and_rerun_asks_nothing(mem):
+    a, b = "cats purr softly on warm mats", "cats purr softly on warm mats today"
+    mem.retain(a, source="a", index_text=a)
+    mem.retain(b, source="b", index_text=b)
+    jev = JevStub(lambda rel, cand, query: 3 if rel in ("semantic", "causes") else 0)
+    mem._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0)
+    mem.link_document(docs(mem)["a"])
+    first = len(jev.requests)
+    stats = mem.link_document(docs(mem)["b"])   # B -> A: the pair is cached
+    assert len(jev.requests) == first == 1 and stats["candidates_cached"] == 1
+    # the stored judgment is read back with its direction flipped: a causes b, so b succeeds a
+    ls = {(x, y, lt) for x, y, lt, st, o, c in links(mem) if o == "jev"}
+    assert ("a", "b", "CAUSAL") in ls and ("b", "a", "CAUSAL") not in ls
+    for d in docs(mem).values():   # a forced re-run (state removed) asks nothing either
+        with conn_of(mem) as c:
+            c.execute("DELETE FROM memory_link_state WHERE document_id=%s", (d,))
+            c.commit()
+        mem.link_document(d)
+    assert len(jev.requests) == 1

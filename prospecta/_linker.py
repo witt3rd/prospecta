@@ -22,6 +22,7 @@ document's items removes that row and cascades its links away.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -35,7 +36,7 @@ import psycopg.errors
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
-    JEV_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
+    JEV_MAX_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
     JevTransport, call_llm, parse_json_object, totals,
 )
 
@@ -44,6 +45,8 @@ logger = logging.getLogger(__name__)
 NEIGHBOUR_MIN_REL = 0.9    # candidates per anchor: neighbours with cosine >= 0.9 x the nearest, ending at the first
                            # marginal drop larger than (1 - 0.9) x the nearest (no count). Embedding cosines are
                            # compressed (0.5..0.9), so 0.6 admitted nearly every note: the import was quadratic.
+NEIGHBOUR_MIN_COS = 0.5    # absolute floor: a neighbour below this cosine is never judged, whatever the relative stop
+                           # says (cosines of unrelated notes sit at 0.2..0.4; related ones above 0.5). Configurable.
 JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfaced (state error, pgvector fallback)
 JUDGE_BACKOFF_S = 0.5
 HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
@@ -212,19 +215,21 @@ class JevRelationJudge:
 
     def judge(self, source_text: str, candidates: list[str],
               calls: list[dict]) -> list[RelationHit]:
-        asks = [(ci, rel) for ci in range(len(candidates)) for rel in RELATIONS]
+        # one request scores up to JEV_MAX_BATCH candidates (all their relation
+        # questions) and at most JEV_INPUT_BYTES: both physical (the wire note);
+        # larger sets split into several requests, no candidate is dropped.
         batches: list[list[tuple[int, str]]] = []
-        cur: list[tuple[int, str]] = []
-        for a in asks:
-            trial = cur + [a]
-            if cur and (len(trial) > JEV_BATCH or len(json.dumps(
-                    self._request(source_text, candidates, trial)).encode()) > JEV_INPUT_BYTES):
-                batches.append(cur)
-                cur = [a]
+        cur: list[int] = []
+        for ci in range(len(candidates)):
+            trial = cur + [ci]
+            if cur and (len(trial) > JEV_MAX_BATCH or len(json.dumps(self._request(
+                    source_text, candidates, self._asks(trial))).encode()) > JEV_INPUT_BYTES):
+                batches.append(self._asks(cur))
+                cur = [ci]
             else:
                 cur = trial
         if cur:
-            batches.append(cur)
+            batches.append(self._asks(cur))
         hits: list[RelationHit] = []
         for batch in batches:
             req = self._request(source_text, candidates, batch)
@@ -262,6 +267,10 @@ class JevRelationJudge:
                 calls.append(rec)
         return hits
 
+    @staticmethod
+    def _asks(cis: list[int]) -> list[tuple[int, str]]:
+        return [(ci, rel) for ci in cis for rel in RELATIONS]
+
     def _request(self, source_text, candidates, batch) -> dict:
         return {"model": self.model, "state": {"query": source_text},
                 "questions": {f"p{n}": self._question(rel, candidates[ci])
@@ -276,6 +285,7 @@ class Linker:
     judge: RelationJudge | None = None
     model: str | None = None
     neighbour_min_rel: float = NEIGHBOUR_MIN_REL
+    neighbour_min_cos: float = NEIGHBOUR_MIN_COS
     temporal_min_rel: float = TEMPORAL_MIN_REL
     temporal_days: int = TEMPORAL_DAYS
     entity_hub: int = ENTITY_HUB
@@ -504,6 +514,50 @@ class Linker:
                 time.sleep(delay)
                 delay *= 2
 
+    @staticmethod
+    def _pair_hash(a_id, b_id) -> str:
+        lo, hi = sorted((str(a_id), str(b_id)))
+        return hashlib.sha256(f"{lo}:{hi}".encode()).hexdigest()
+
+    def _judged_hits(self, conn, bank_id, a, cands, stats, calls) -> list[RelationHit]:
+        """Relation hits of anchor `a` against `cands`: a pair already judged (from
+        either side) is read back from memory_link_pairs, the rest go to the judge
+        in one batched call per 16 candidates; each judgment is stored once."""
+        hashes = [self._pair_hash(a["id"], c["id"]) for c in cands]
+        with conn.cursor() as cur:
+            cur.execute("SELECT pair_hash, src, hits FROM memory_link_pairs "
+                        "WHERE pair_hash = ANY(%s)", (hashes,))
+            cached = {h: (str(src), hits) for h, src, hits in cur.fetchall()}
+        todo = [i for i, h in enumerate(hashes) if h not in cached]
+        fresh: dict[int, list[RelationHit]] = {}
+        if todo:
+            got = self._judge_with_retry(
+                a["original_chunk"] or a["content"],
+                [cands[i]["original_chunk"] or cands[i]["content"] for i in todo], calls)
+            for k, i in enumerate(todo):
+                fresh[i] = [RelationHit(i, h.link_type, h.subtype, h.confidence, h.forward)
+                            for h in got if h.candidate == k]
+            with conn.cursor() as cur:
+                for i in todo:
+                    cur.execute(
+                        "INSERT INTO memory_link_pairs (pair_hash, bank_id, src, dst, hits) "
+                        "VALUES (%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
+                        (hashes[i], bank_id, a["id"], cands[i]["id"], json.dumps(
+                            [[h.link_type, h.subtype, h.confidence, h.forward]
+                             for h in fresh[i]])))
+        stats["candidates_judged"] = stats.get("candidates_judged", 0) + len(todo)
+        stats["candidates_cached"] = stats.get("candidates_cached", 0) + len(cands) - len(todo)
+        out: list[RelationHit] = []
+        for i, h in enumerate(hashes):
+            if i in fresh:
+                out.extend(fresh[i])
+                continue
+            src, hits = cached[h]
+            same = src == str(a["id"])   # judged from the other side: directions flip
+            out.extend(RelationHit(i, lt, st, float(cf), bool(fw) == same)
+                       for lt, st, cf, fw in hits)
+        return out
+
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
         with conn.cursor() as cur:   # the HNSW indexes are on embedding::vector(dim)
             cur.execute("SELECT vector_dims(embedding) FROM memory_items WHERE id = %s",
@@ -532,19 +586,16 @@ class Linker:
                 # source: confirm with the exhaustive scan before treating it as the end
                 return rows if len(rows) >= n else query(True)
             cands, examined = neighbours_until_drop(
-                fetch, lambda c: float(c["cos"]), self.neighbour_min_rel)
+                fetch, lambda c: float(c["cos"]), self.neighbour_min_rel,
+                floor=self.neighbour_min_cos)
             stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
-            stats["candidates_judged"] = stats.get("candidates_judged", 0) + (
-                len(cands) if self.judge is not None else 0)
             if not cands:
                 continue
             hits: list[RelationHit] | None = None
             origin = "jev"
             if self.judge is not None:
                 try:
-                    hits = self._judge_with_retry(
-                        a["original_chunk"] or a["content"],
-                        [c["original_chunk"] or c["content"] for c in cands], calls)
+                    hits = self._judged_hits(conn, bank_id, a, cands, stats, calls)
                 except Exception as exc:   # surfaced: state error row, retried by link_pending
                     stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
             if hits is None:   # no judge, or Jev could not answer: pgvector neighbours
@@ -553,27 +604,28 @@ class Linker:
                         for i, c in enumerate(cands)
                         if float(c["cos"]) >= self.vector_floor]
             with conn.cursor() as cur:
-                def edge(h):
+                def edges(h):   # SEMANTIC is symmetric: one judgment writes both directions
                     c = cands[h.candidate]
-                    return ((a["id"], c["id"]) if h.forward else (c["id"], a["id"])) + (
-                        h.link_type, h.subtype)
-                for h in sorted(hits, key=edge):
-                    c = cands[h.candidate]
-                    src, dst = (a["id"], c["id"]) if h.forward else (c["id"], a["id"])
+                    fwd, rev = (a["id"], c["id"]), (c["id"], a["id"])
+                    if h.link_type == "SEMANTIC":
+                        return [fwd, rev]
+                    return [fwd if h.forward else rev]
+                rows = sorted((e + (h.link_type, h.subtype, h.confidence, float(cands[h.candidate]["cos"]))
+                               for h in hits for e in edges(h)), key=lambda r: r[:4])
+                for src, dst, lt, st, conf, cos in rows:
                     cur.execute(
                         "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
                         "confidence, origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb) "
                         "ON CONFLICT DO NOTHING",
-                        (bank_id, src, dst, h.link_type, h.subtype, h.confidence, origin,
-                         json.dumps({"cosine": float(c["cos"])})))
+                        (bank_id, src, dst, lt, st, conf, origin, json.dumps({"cosine": cos})))
                     stats["semantic"] += cur.rowcount
 
 
 def neighbours_until_drop(fetch, score, rel: float,
-                          page: int = NEIGHBOUR_PAGE) -> tuple[list, int]:
+                          page: int = NEIGHBOUR_PAGE, floor: float = 0.0) -> tuple[list, int]:
     """Candidates from `fetch(n)` (best first, an HNSW top-n): the leading rows
     with score >= rel x the best, ending at the first marginal drop larger than
-    (1 - rel) x the best. Grows n (doubling) only until that stop is decided, so
+    (1 - rel) x the best and >= the absolute `floor`. Grows n (doubling) only until that stop is decided, so
     the rows touched per anchor do not grow with the bank. Returns
     (qualifying rows, rows examined)."""
     n = page
@@ -582,11 +634,13 @@ def neighbours_until_drop(fetch, score, rel: float,
         if not rows:
             return [], 0
         best = score(rows[0])
+        if best < floor:
+            return [], len(rows)
         if rel <= 0 or best <= 0:
             if len(rows) < n:
-                return rows, len(rows)
+                return [r for r in rows if score(r) >= floor], len(rows)
         else:
-            cut, gap = rel * best, (1 - rel) * best
+            cut, gap = max(rel * best, floor), (1 - rel) * best
             out = [rows[0]]
             for prev, r in zip(rows, rows[1:]):
                 if score(r) < cut or score(prev) - score(r) > gap:
