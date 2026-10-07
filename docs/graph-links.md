@@ -24,9 +24,9 @@ up again by `link_pending`. Per document:
   is held by the person; mentions already extracted under an alias move onto the person.
   `Linker.backfill_aliases(conn, bank_id, limit, after)` is the resumable backfill by document id
   (progress in `memory_alias_state`; errors recorded and skipped).
-- Semantic links: every pgvector neighbour per anchor item with cosine >= `neighbour_min_rel` (0.9) x the nearest, ending at the first marginal drop > (1 - `neighbour_min_rel`) x the nearest (see `limits.md`). With a
+- Semantic links: every pgvector neighbour per anchor item with cosine >= `neighbour_min_rel` (0.9) x the nearest, ending at the first marginal drop > (1 - `neighbour_min_rel`) x the nearest, and never below the absolute cosine floor `neighbour_min_cos` (0.5; see `limits.md`). With a
   `JevRelationJudge(transport)` Jev answers `semantic`, `causes`, `caused_by` as System
-  One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`); without one, or if
+  One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`). Each unordered pair is judged once and cached in `memory_link_pairs` (migration 0016; A->B and B->A share it, SEMANTIC writes both directions; re-runs ask nothing), and one request carries up to 96 questions (32 candidates x 3 relations) within an estimated 45,000 input tokens (`JevRelationJudge(max_questions_per_call, max_input_tokens, relations_per_call)`; a 400 `max_tokens_exceeded` halves and retries); without one, or if
   Jev fails, neighbours with cosine >= 0.75 become `RELATED_TO` (`origin='pgvector'`).
 
 **GraphExpand** (`graph`, kind `expand`) seeds from every pool document with RRF >= `seed_min_rel` (0.5) x the best,

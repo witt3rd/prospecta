@@ -22,6 +22,7 @@ document's items removes that row and cascades its links away.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -35,7 +36,7 @@ import psycopg.errors
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
-    JEV_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
+    CHARS_PER_TOKEN, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
     JevTransport, call_llm, parse_json_object, totals,
 )
 
@@ -44,6 +45,10 @@ logger = logging.getLogger(__name__)
 NEIGHBOUR_MIN_REL = 0.9    # candidates per anchor: neighbours with cosine >= 0.9 x the nearest, ending at the first
                            # marginal drop larger than (1 - 0.9) x the nearest (no count). Embedding cosines are
                            # compressed (0.5..0.9), so 0.6 admitted nearly every note: the import was quadratic.
+NEIGHBOUR_MIN_COS = 0.5    # absolute floor: a neighbour below this cosine is never judged, whatever the relative stop
+                           # says (cosines of unrelated notes sit at 0.2..0.4; related ones above 0.5). Configurable.
+JEV_MAX_QUESTIONS_PER_CALL = 96   # questions per Jev request (verified live: 48, 96, 150, 300 answered; config)
+JEV_MAX_INPUT_TOKENS = 45_000     # estimated input tokens per request (verified: 56.6k ok, ~110k+ fails 400); split above it
 JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfaced (state error, pgvector fallback)
 JUDGE_BACKOFF_S = 0.5
 HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
@@ -163,6 +168,20 @@ WHERE a.id = %(item)s
 """
 
 
+class _TooLarge(Exception):
+    """Jev answered HTTP 400 max_tokens_exceeded: the request is split and retried."""
+
+
+def _is_max_tokens(exc: Exception) -> bool:
+    body = ""
+    if hasattr(exc, "read"):   # urllib HTTPError: the body names the error
+        try:
+            body = exc.read().decode(errors="replace")
+        except Exception:
+            pass
+    return "max_tokens_exceeded" in f"{exc} {body}"
+
+
 @dataclass
 class RelationHit:
     candidate: int          # index into the candidates asked about
@@ -197,12 +216,27 @@ class JevRelationJudge:
     """Jev (System One, `score` questions, 0..3) answers the relation questions
     of Jev-Mem's linker: semantic, causes, caused_by, one question per
     (candidate, relation). score / 3 is the confidence; a link needs at least
-    `threshold` (0.6). Same wire shape and limits as the Jev reranker."""
+    `threshold` (0.6).
+
+    Batching (verified on the live wire by the scout: 48, 96, 150 and 300
+    questions per request were answered; 300 questions of 1,000 chars, 419 KB,
+    failed loud with HTTP 400 max_tokens_exceeded): the real limit is input
+    TOKENS, not questions. A request holds up to `max_questions_per_call`
+    questions (96) and an estimated `max_input_tokens` (45,000) at most; with
+    `relations_per_call` all relation questions of a candidate travel together.
+    A larger set SPLITS into several requests; no candidate or text is dropped
+    or cut. A 400 max_tokens_exceeded halves the request and retries."""
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
-                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD):
+                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD,
+                 max_questions_per_call: int = JEV_MAX_QUESTIONS_PER_CALL,
+                 max_input_tokens: int = JEV_MAX_INPUT_TOKENS,
+                 relations_per_call: bool = True):
         self.transport, self.model, self.timeout = transport, model, timeout
         self.threshold = threshold
+        self.max_questions_per_call = max_questions_per_call
+        self.max_input_tokens = max_input_tokens
+        self.relations_per_call = relations_per_call
 
     def _question(self, relation: str, cand: str) -> dict:
         return {"type": "score",
@@ -210,56 +244,106 @@ class JevRelationJudge:
                                  "title": relation, "text": fit_passage(cand, relation)},
                 "criteria": _RELATION_CRITERIA}
 
-    def judge(self, source_text: str, candidates: list[str],
-              calls: list[dict]) -> list[RelationHit]:
-        asks = [(ci, rel) for ci in range(len(candidates)) for rel in RELATIONS]
-        batches: list[list[tuple[int, str]]] = []
-        cur: list[tuple[int, str]] = []
-        for a in asks:
-            trial = cur + [a]
-            if cur and (len(trial) > JEV_BATCH or len(json.dumps(
-                    self._request(source_text, candidates, trial)).encode()) > JEV_INPUT_BYTES):
+    def _units(self, candidates: list[str]) -> list[list[tuple[int, str]]]:
+        """The indivisible groups of questions: a candidate's relation questions
+        together (when relations_per_call and they fit one request), else single."""
+        together = self.relations_per_call and self.max_questions_per_call >= len(RELATIONS)
+        if together:
+            return [[(ci, rel) for rel in RELATIONS] for ci in range(len(candidates))]
+        return [[(ci, rel)] for ci in range(len(candidates)) for rel in RELATIONS]
+
+    def _batches(self, source_text, candidates) -> list[list[tuple[int, str]]]:
+        base = len(json.dumps(self._request(source_text, candidates, [])).encode())
+        batches, cur, q, size = [], [], 0, base
+        for unit in self._units(candidates):
+            usize = sum(len(json.dumps(self._question(rel, candidates[ci])).encode()) + 12
+                        for ci, rel in unit)
+            if cur and (q + len(unit) > self.max_questions_per_call
+                        or (size + usize) // CHARS_PER_TOKEN > self.max_input_tokens):
                 batches.append(cur)
-                cur = [a]
-            else:
-                cur = trial
+                cur, q, size = [], 0, base
+            cur += unit
+            q += len(unit)
+            size += usize
         if cur:
             batches.append(cur)
+        return batches
+
+    def judge(self, source_text: str, candidates: list[str],
+              calls: list[dict]) -> list[RelationHit]:
         hits: list[RelationHit] = []
-        for batch in batches:
-            req = self._request(source_text, candidates, batch)
-            t0 = time.monotonic()
-            rec: dict = {"purpose": "jev_relations", "model": self.model, "tokens_in": None,
-                         "tokens_out": None, "cost_usd": None, "json_mode": False,
-                         "messages_count": len(batch), "prompt_text": json.dumps(req),
-                         "response_text": None, "error": None}
+        pending = self._batches(source_text, candidates)
+        while pending:
+            batch = pending.pop(0)
+            try:
+                hits.extend(self._send(source_text, candidates, batch, calls))
+            except _TooLarge:
+                units = self._regroup(batch)
+                if len(units) < 2:
+                    logger.error("jev link request of one candidate is over the token limit "
+                                 "(max_tokens_exceeded); full source text: %s; full candidate "
+                                 "text: %s", source_text, candidates[batch[0][0]])
+                    raise
+                mid = len(units) // 2
+                logger.warning("jev max_tokens_exceeded on %d questions: halving", len(batch))
+                pending[:0] = [[a for u in units[:mid] for a in u],
+                               [a for u in units[mid:] for a in u]]
+        return hits
+
+    @staticmethod
+    def _regroup(batch):
+        """The batch's asks grouped by candidate, in order (a candidate stays whole
+        when it is the only one it can be split into)."""
+        groups: list[list[tuple[int, str]]] = []
+        for ask in batch:
+            if groups and groups[-1][0][0] == ask[0]:
+                groups[-1].append(ask)
+            else:
+                groups.append([ask])
+        if len(groups) < 2 and len(batch) > 1:   # one candidate, several questions
+            return [[a] for a in batch]
+        return groups
+
+    def _send(self, source_text, candidates, batch, calls) -> list[RelationHit]:
+        hits: list[RelationHit] = []
+        req = self._request(source_text, candidates, batch)
+        t0 = time.monotonic()
+        rec: dict = {"purpose": "jev_relations", "model": self.model, "tokens_in": None,
+                     "tokens_out": None, "cost_usd": None, "json_mode": False,
+                     "messages_count": len(batch), "prompt_text": json.dumps(req),
+                     "response_text": None, "error": None}
+        try:
             try:
                 resp = self.transport(req, self.timeout)
-                rec["response_text"] = json.dumps(resp)
-                u = resp.get("usage") or {}
-                rec.update(model=resp.get("model") or self.model,
-                           tokens_in=u.get("input_tokens"),
-                           tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
-                answers = resp.get("answers")
-                if not isinstance(answers, dict) or set(answers) != {
-                        f"p{n}" for n in range(len(batch))}:
-                    raise ValueError("answers are not exactly the asked ids")
-                for n, (ci, rel) in enumerate(batch):
-                    a = answers[f"p{n}"]
-                    v = a.get("score") if isinstance(a, dict) else None
-                    if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                            or not 0 <= v <= 3:
-                        raise ValueError("answer does not score every question in 0..3")
-                    conf = float(v) / 3.0
-                    if conf >= self.threshold:
-                        lt, st, fwd = RELATIONS[rel]
-                        hits.append(RelationHit(ci, lt, st, conf, fwd))
             except Exception as exc:
-                rec["error"] = f"{type(exc).__name__}: {exc}"
+                if _is_max_tokens(exc):
+                    raise _TooLarge(str(exc)) from exc
                 raise
-            finally:
-                rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
-                calls.append(rec)
+            rec["response_text"] = json.dumps(resp)
+            u = resp.get("usage") or {}
+            rec.update(model=resp.get("model") or self.model,
+                       tokens_in=u.get("input_tokens"),
+                       tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
+            answers = resp.get("answers")
+            if not isinstance(answers, dict) or set(answers) != {
+                    f"p{n}" for n in range(len(batch))}:
+                raise ValueError("answers are not exactly the asked ids")
+            for n, (ci, rel) in enumerate(batch):
+                a = answers[f"p{n}"]
+                v = a.get("score") if isinstance(a, dict) else None
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not 0 <= v <= 3:
+                    raise ValueError("answer does not score every question in 0..3")
+                conf = float(v) / 3.0
+                if conf >= self.threshold:
+                    lt, st, fwd = RELATIONS[rel]
+                    hits.append(RelationHit(ci, lt, st, conf, fwd))
+        except Exception as exc:
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            calls.append(rec)
         return hits
 
     def _request(self, source_text, candidates, batch) -> dict:
@@ -276,6 +360,7 @@ class Linker:
     judge: RelationJudge | None = None
     model: str | None = None
     neighbour_min_rel: float = NEIGHBOUR_MIN_REL
+    neighbour_min_cos: float = NEIGHBOUR_MIN_COS
     temporal_min_rel: float = TEMPORAL_MIN_REL
     temporal_days: int = TEMPORAL_DAYS
     entity_hub: int = ENTITY_HUB
@@ -504,6 +589,50 @@ class Linker:
                 time.sleep(delay)
                 delay *= 2
 
+    @staticmethod
+    def _pair_hash(a_id, b_id) -> str:
+        lo, hi = sorted((str(a_id), str(b_id)))
+        return hashlib.sha256(f"{lo}:{hi}".encode()).hexdigest()
+
+    def _judged_hits(self, conn, bank_id, a, cands, stats, calls) -> list[RelationHit]:
+        """Relation hits of anchor `a` against `cands`: a pair already judged (from
+        either side) is read back from memory_link_pairs, the rest go to the judge
+        in one batched call per 16 candidates; each judgment is stored once."""
+        hashes = [self._pair_hash(a["id"], c["id"]) for c in cands]
+        with conn.cursor() as cur:
+            cur.execute("SELECT pair_hash, src, hits FROM memory_link_pairs "
+                        "WHERE pair_hash = ANY(%s)", (hashes,))
+            cached = {h: (str(src), hits) for h, src, hits in cur.fetchall()}
+        todo = [i for i, h in enumerate(hashes) if h not in cached]
+        fresh: dict[int, list[RelationHit]] = {}
+        if todo:
+            got = self._judge_with_retry(
+                a["original_chunk"] or a["content"],
+                [cands[i]["original_chunk"] or cands[i]["content"] for i in todo], calls)
+            for k, i in enumerate(todo):
+                fresh[i] = [RelationHit(i, h.link_type, h.subtype, h.confidence, h.forward)
+                            for h in got if h.candidate == k]
+            with conn.cursor() as cur:
+                for i in todo:
+                    cur.execute(
+                        "INSERT INTO memory_link_pairs (pair_hash, bank_id, src, dst, hits) "
+                        "VALUES (%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
+                        (hashes[i], bank_id, a["id"], cands[i]["id"], json.dumps(
+                            [[h.link_type, h.subtype, h.confidence, h.forward]
+                             for h in fresh[i]])))
+        stats["candidates_judged"] = stats.get("candidates_judged", 0) + len(todo)
+        stats["candidates_cached"] = stats.get("candidates_cached", 0) + len(cands) - len(todo)
+        out: list[RelationHit] = []
+        for i, h in enumerate(hashes):
+            if i in fresh:
+                out.extend(fresh[i])
+                continue
+            src, hits = cached[h]
+            same = src == str(a["id"])   # judged from the other side: directions flip
+            out.extend(RelationHit(i, lt, st, float(cf), bool(fw) == same)
+                       for lt, st, cf, fw in hits)
+        return out
+
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
         with conn.cursor() as cur:   # the HNSW indexes are on embedding::vector(dim)
             cur.execute("SELECT vector_dims(embedding) FROM memory_items WHERE id = %s",
@@ -532,19 +661,16 @@ class Linker:
                 # source: confirm with the exhaustive scan before treating it as the end
                 return rows if len(rows) >= n else query(True)
             cands, examined = neighbours_until_drop(
-                fetch, lambda c: float(c["cos"]), self.neighbour_min_rel)
+                fetch, lambda c: float(c["cos"]), self.neighbour_min_rel,
+                floor=self.neighbour_min_cos)
             stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
-            stats["candidates_judged"] = stats.get("candidates_judged", 0) + (
-                len(cands) if self.judge is not None else 0)
             if not cands:
                 continue
             hits: list[RelationHit] | None = None
             origin = "jev"
             if self.judge is not None:
                 try:
-                    hits = self._judge_with_retry(
-                        a["original_chunk"] or a["content"],
-                        [c["original_chunk"] or c["content"] for c in cands], calls)
+                    hits = self._judged_hits(conn, bank_id, a, cands, stats, calls)
                 except Exception as exc:   # surfaced: state error row, retried by link_pending
                     stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
             if hits is None:   # no judge, or Jev could not answer: pgvector neighbours
@@ -553,27 +679,28 @@ class Linker:
                         for i, c in enumerate(cands)
                         if float(c["cos"]) >= self.vector_floor]
             with conn.cursor() as cur:
-                def edge(h):
+                def edges(h):   # SEMANTIC is symmetric: one judgment writes both directions
                     c = cands[h.candidate]
-                    return ((a["id"], c["id"]) if h.forward else (c["id"], a["id"])) + (
-                        h.link_type, h.subtype)
-                for h in sorted(hits, key=edge):
-                    c = cands[h.candidate]
-                    src, dst = (a["id"], c["id"]) if h.forward else (c["id"], a["id"])
+                    fwd, rev = (a["id"], c["id"]), (c["id"], a["id"])
+                    if h.link_type == "SEMANTIC":
+                        return [fwd, rev]
+                    return [fwd if h.forward else rev]
+                rows = sorted((e + (h.link_type, h.subtype, h.confidence, float(cands[h.candidate]["cos"]))
+                               for h in hits for e in edges(h)), key=lambda r: r[:4])
+                for src, dst, lt, st, conf, cos in rows:
                     cur.execute(
                         "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
                         "confidence, origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb) "
                         "ON CONFLICT DO NOTHING",
-                        (bank_id, src, dst, h.link_type, h.subtype, h.confidence, origin,
-                         json.dumps({"cosine": float(c["cos"])})))
+                        (bank_id, src, dst, lt, st, conf, origin, json.dumps({"cosine": cos})))
                     stats["semantic"] += cur.rowcount
 
 
 def neighbours_until_drop(fetch, score, rel: float,
-                          page: int = NEIGHBOUR_PAGE) -> tuple[list, int]:
+                          page: int = NEIGHBOUR_PAGE, floor: float = 0.0) -> tuple[list, int]:
     """Candidates from `fetch(n)` (best first, an HNSW top-n): the leading rows
     with score >= rel x the best, ending at the first marginal drop larger than
-    (1 - rel) x the best. Grows n (doubling) only until that stop is decided, so
+    (1 - rel) x the best and >= the absolute `floor`. Grows n (doubling) only until that stop is decided, so
     the rows touched per anchor do not grow with the bank. Returns
     (qualifying rows, rows examined)."""
     n = page
@@ -582,11 +709,13 @@ def neighbours_until_drop(fetch, score, rel: float,
         if not rows:
             return [], 0
         best = score(rows[0])
+        if best < floor:
+            return [], len(rows)
         if rel <= 0 or best <= 0:
             if len(rows) < n:
-                return rows, len(rows)
+                return [r for r in rows if score(r) >= floor], len(rows)
         else:
-            cut, gap = rel * best, (1 - rel) * best
+            cut, gap = max(rel * best, floor), (1 - rel) * best
             out = [rows[0]]
             for prev, r in zip(rows, rows[1:]):
                 if score(r) < cut or score(prev) - score(r) > gap:

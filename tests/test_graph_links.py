@@ -297,16 +297,16 @@ def test_linker_jev_typed_links_with_threshold(mem):
         return 1   # 0.33 < 0.6: below Jev-Mem's threshold
 
     jev = JevStub(rule)
-    link_all(mem, Linker(judge=JevRelationJudge(jev)))
+    link_all(mem, Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0))   # stub vectors are not semantic
     ls = [(a, b, lt, st, o) for a, b, lt, st, o, c in links(mem) if o == "jev"]
     assert ("cause", "effect", "CAUSAL", "LEADS_TO", "jev") in ls
     assert ("effect", "cause", "SEMANTIC", "RELATED_TO", "jev") in ls
     assert not any("other" in (a, b) for a, b, *_ in ls)
     # caused_by is stored as the reverse CAUSAL edge: the cause leads to the effect, once
     assert sum(1 for l in ls if l[:2] == ("cause", "effect") and l[2] == "CAUSAL") == 1
-    # one question per (candidate, relation), at most 16 per request, wire shape intact
+    # one question per (candidate, relation), at most 16 candidates per request, wire shape intact
     for r in jev.requests:
-        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16
+        assert set(r) == {"model", "state", "questions"} and len(r["questions"]) <= 16 * 3
         assert all(q["type"] == "score" and len(q["criteria"]) == 4 for q in r["questions"].values())
 
 
@@ -541,3 +541,102 @@ def test_linker_judge_failure_is_retried_before_it_is_surfaced(mem, monkeypatch)
     mem._linker = Linker(judge=JevRelationJudge(flaky))
     stats = mem.link_document(docs(mem)["a"])
     assert stats["errors"] == [] and {l[4] for l in links(mem) if l[2] == "SEMANTIC"} == {"jev"}
+
+
+def _cluster_mem(mem, texts):
+    for i, t in enumerate(texts):
+        mem.retain(t, source=f"s{i}", index_text=t)
+
+
+def test_neighbours_absolute_floor_cuts_even_when_relative_stop_admits():
+    from prospecta._linker import neighbours_until_drop
+    scores = [0.60, 0.59, 0.58, 0.57]   # flat: relative stop admits all four
+    rows = lambda n: [{"cos": s} for s in scores[:n]]
+    got, _ = neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.585)
+    assert [r["cos"] for r in got] == [0.60, 0.59]
+    assert neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.7)[0] == []
+
+
+def _sem(rel, cand, query):
+    return 3 if rel == "semantic" else 0
+
+
+def test_judge_default_96_questions_per_call_relations_together_and_drops_none():
+    jev = JevStub(_sem)
+    cands = [f"cand {i}" for i in range(40)]
+    hits = JevRelationJudge(jev).judge("query", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [96, 24]   # 32 + 8 candidates
+    assert sorted(h.candidate for h in hits) == list(range(40))
+
+
+def test_judge_question_limit_is_configurable_and_relations_switch():
+    cands = [f"cand {i}" for i in range(10)]
+    jev = JevStub(_sem)
+    hits = JevRelationJudge(jev, max_questions_per_call=16).judge("query", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [15, 15]   # 5 whole candidates a call
+    assert sorted(h.candidate for h in hits) == list(range(10))
+    jev = JevStub(_sem)   # relations_per_call off: single questions fill the limit
+    JevRelationJudge(jev, max_questions_per_call=16, relations_per_call=False).judge("q", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [16, 14]
+
+
+def test_judge_splits_at_the_token_estimate_and_drops_none():
+    jev = JevStub(_sem)
+    cands = [f"cand {i} " + "x" * 12000 for i in range(20)]   # ~720 KB: far over 45k tokens
+    hits = JevRelationJudge(jev).judge("query", cands, [])
+    assert len(jev.requests) > 1
+    assert all(len(json.dumps(r).encode()) // 4 <= 45_000 for r in jev.requests)
+    assert sorted(h.candidate for h in hits) == list(range(20))
+    assert sum(len(r["questions"]) for r in jev.requests) == 60
+
+
+class TokenLimitedJev(JevStub):
+    """The live behaviour: a request over the token limit fails loud with HTTP 400."""
+
+    def __init__(self, rule, limit_tokens):
+        super().__init__(rule)
+        self.limit, self.rejected = limit_tokens, 0
+
+    def __call__(self, request, timeout):
+        if len(json.dumps(request).encode()) // 3 > self.limit:
+            self.rejected += 1
+            raise RuntimeError('HTTP 400 {"error": "max_tokens_exceeded"}')
+        return super().__call__(request, timeout)
+
+
+def test_judge_halves_and_retries_on_max_tokens_exceeded():
+    # the estimate (45k tokens at 4 chars) lets 29 KB-ish through that the wire (3 chars/token, 8k) refuses
+    jev = TokenLimitedJev(_sem, limit_tokens=8_000)
+    cands = [f"cand {i} " + "x" * 3000 for i in range(16)]
+    calls: list = []
+    hits = JevRelationJudge(jev).judge("query", cands, calls)
+    assert jev.rejected >= 1
+    assert sorted(h.candidate for h in hits) == list(range(16))   # every candidate judged
+    assert sum(1 for c in calls if c["error"]) == jev.rejected
+
+
+def test_judge_single_candidate_over_the_limit_surfaces():
+    jev = TokenLimitedJev(_sem, limit_tokens=100)
+    with pytest.raises(Exception, match="max_tokens_exceeded"):
+        JevRelationJudge(jev).judge("query", ["cand " + "x" * 3000], [])
+
+
+def test_each_unordered_pair_is_judged_once_and_rerun_asks_nothing(mem):
+    a, b = "cats purr softly on warm mats", "cats purr softly on warm mats today"
+    mem.retain(a, source="a", index_text=a)
+    mem.retain(b, source="b", index_text=b)
+    jev = JevStub(lambda rel, cand, query: 3 if rel in ("semantic", "causes") else 0)
+    mem._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0)
+    mem.link_document(docs(mem)["a"])
+    first = len(jev.requests)
+    stats = mem.link_document(docs(mem)["b"])   # B -> A: the pair is cached
+    assert len(jev.requests) == first == 1 and stats["candidates_cached"] == 1
+    # the stored judgment is read back with its direction flipped: a causes b, so b succeeds a
+    ls = {(x, y, lt) for x, y, lt, st, o, c in links(mem) if o == "jev"}
+    assert ("a", "b", "CAUSAL") in ls and ("b", "a", "CAUSAL") not in ls
+    for d in docs(mem).values():   # a forced re-run (state removed) asks nothing either
+        with conn_of(mem) as c:
+            c.execute("DELETE FROM memory_link_state WHERE document_id=%s", (d,))
+            c.commit()
+        mem.link_document(d)
+    assert len(jev.requests) == 1
