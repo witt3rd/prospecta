@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from prospecta._entities import resolve_entities
+from prospecta._entities import fold_path, norm_key, resolve_entities, same_name
 from prospecta._llmutil import llm_call_record, llm_text
 from prospecta._template import render_prompt
 from prospecta.db.queries import _meta_param
@@ -68,17 +68,8 @@ class MapReduceResult:
     plan: dict = field(default_factory=dict)
 
 
-def _norm_name(name: str) -> str:
-    n = name.strip().replace("\\", "/").casefold()
-    return n[:-3] if n.endswith(".md") else n
-
-
 def _norm_fact(fact: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", fact.casefold())).strip()
-
-
-def _clean(n: str) -> str:
-    return re.sub(r"\s+", " ", n.strip().lower())
 
 
 def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list[str], list]:
@@ -86,7 +77,7 @@ def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list
     or alias norm is one of them, its name and EVERY alias row. Returns
     (all names as written, normalised names, entity ids)."""
     r = resolve_entities(conn, bank_id, names)
-    return (r.names, sorted(set(r.norms) | {_clean(x) for x in r.people}), r.ids)
+    return (r.names, sorted(set(r.norms) | {norm_key(x) for x in r.people}), r.ids)
 
 
 def fetch_entity_notes(conn, bank_id: str, names: list[str],
@@ -179,16 +170,16 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
     _, _, found = resolve_names(conn, bank_id, [entity, *(aliases or [])])
     # alias strings, not the bare name; but when nothing resolved the bare name is all we have
-    scan = [n for n in names if _clean(n) != _clean(entity)] if found else list(names)
+    scan = [n for n in names if not same_name(n, entity)] if found else list(names)
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
                                scan_relevance=scan_relevance)
-    by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
+    by_norm = {fold_path(src): (doc, src) for doc, src, _ in notes}
     base_count: dict[str, int] = {}
     for _, src, _ in notes:
-        b = _norm_name(src).rsplit("/", 1)[-1]
+        b = fold_path(src).rsplit("/", 1)[-1]
         base_count[b] = base_count.get(b, 0) + 1
-    by_base = {_norm_name(src).rsplit("/", 1)[-1]: (doc, src) for doc, src, _ in notes
-               if base_count[_norm_name(src).rsplit("/", 1)[-1]] == 1}
+    by_base = {fold_path(src).rsplit("/", 1)[-1]: (doc, src) for doc, src, _ in notes
+               if base_count[fold_path(src).rsplit("/", 1)[-1]] == 1}
     calls: list[dict] = []
     progress: list[dict] = []
     raw_facts: list[dict] = []   # {fact, note}
@@ -233,12 +224,12 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     for it in items:
         it["citations"] = []
         for n in it["notes"]:
-            k = _norm_name(n)
+            k = fold_path(n)
             doc, src = by_norm.get(k) or by_base.get(k.rsplit("/", 1)[-1], (None, n))
             c = {"note": src, "document_id": doc, "known": doc is not None}
             it["citations"].append(c)
-            if _norm_name(src) not in seen:
-                seen.add(_norm_name(src))
+            if fold_path(src) not in seen:
+                seen.add(fold_path(src))
                 citations.append(c)
     text = "\n".join(f"- {it['fact']} " + " ".join(f"[{n}]" for n in
                      dict.fromkeys(c["note"] for c in it["citations"])) for it in items) \
@@ -249,7 +240,7 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     return MapReduceResult(
         synthesis=text, items=items, citations=citations, progress=progress, calls=calls,
         notes_visited=visited, facts_found=len(items),
-        plan={"mode": "mapreduce", "entity": entity, "aliases": [n for n in names if _clean(n) != _clean(entity)],
+        plan={"mode": "mapreduce", "entity": entity, "aliases": [n for n in names if not same_name(n, entity)],
               "batch_size": batch_size, "n_notes": len(notes), "n_batches": n_batches,
               "metadata_filter": metadata_filter, "progress": progress,
               "raw_facts": len(raw_facts), "failed_notes": failed_notes})

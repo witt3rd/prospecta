@@ -47,12 +47,24 @@ def fold(name: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
 
 
+def fold_path(name: str) -> str:
+    """Fold a note path/name: fold() each path segment, drop a trailing .md."""
+    n = name.strip().replace("\\", "/")
+    if n.casefold().endswith(".md"):
+        n = n[:-3]
+    return "/".join(fold(seg) for seg in n.split("/"))
+
+
 def tokens(name: str) -> list[str]:
     """Core tokens: folded, honorifics/articles removed, initials kept only if
     nothing longer remains."""
     toks = [t for t in fold(name).split() if t not in HONORIFICS]
     long = [t for t in toks if len(t) > 1]
     return long or toks
+
+
+def same_name(a: str, b: str) -> bool:
+    return tokens(a) == tokens(b)
 
 
 def _tok_match(a: str, b: str) -> bool:
@@ -75,7 +87,7 @@ class Resolution:
     people: list[str] = field(default_factory=list)  # documents.person values that match
 
 
-def _clean(n: str) -> str:
+def norm_key(n: str) -> str:
     return re.sub(r"\s+", " ", n.strip().lower())
 
 
@@ -85,8 +97,8 @@ def resolve_entities(conn, bank_id: str, names: list[str]) -> Resolution:
         raise ValueError("entity resolution needs a name")
     toks = sorted({t for n in given for t in tokens(n) if len(t) >= 2})
     pats = [f"%{t.replace('%', '').replace('_', '')}%" for t in toks] or ["%"]
-    p = {"bank": bank_id, "pats": pats, "norms": sorted({_clean(n) for n in given})}
-    written, norms = list(given), [_clean(n) for n in given]
+    p = {"bank": bank_id, "pats": pats, "norms": sorted({norm_key(n) for n in given})}
+    written, norms = list(given), [norm_key(n) for n in given]
     ids: list = []
     with conn.cursor() as cur:
         cur.execute(_ENTITIES_SQL, p)

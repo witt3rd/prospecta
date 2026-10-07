@@ -335,3 +335,37 @@ def test_mapreduce_keeps_every_entity_linked_note_despite_weak_text_hits(fresh_d
     assert set(linked) <= got and set(linked) <= got_alias
     assert {"ws0.md", "ws1.md", "ws2.md"} <= got
     m.close()
+
+
+def test_mapreduce_citations_resolve_through_shared_fold(fresh_db):
+    class Sloppy(MapReduceLLM):
+        def __call__(self, messages, *, json_mode=False):
+            r = super().__call__(messages, json_mode=json_mode)
+            if isinstance(r, LLMResult):
+                r = LLMResult(r.text.replace("People/Mr. Nelson.md", "people\\\\mr.  NELSON.MD"),
+                              model=r.model, tokens_in=r.tokens_in, tokens_out=r.tokens_out,
+                              cost_usd=r.cost_usd)
+            return r
+
+    m = Memory(database_url=fresh_db, bank_id="b", llm=Sloppy(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    body = "Pat, also called Pip."
+    m.retain("---\nperson: Pat\n---\n" + body, source="People/Mr. Nelson.md", index_text=body)
+    res = m.recall_mapreduce("nicknames?", entity="Pat")
+    cites = [c for e in res.evidence for c in e["citations"]]
+    assert cites and all(c["known"] and c["note"] == "People/Mr. Nelson.md" for c in cites)
+    m.close()
+
+
+def test_mapreduce_alias_list_excludes_variants_of_the_entity(fresh_db):
+    from prospecta import _mapreduce
+    m = Memory(database_url=fresh_db, bank_id="b", llm=MapReduceLLM(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    body = "Nelson, also called Pip."
+    m.retain("---\nperson: Nelson\n---\n" + body, source="n.md", index_text=body)
+    with psycopg.connect(fresh_db) as conn:
+        res = _mapreduce.run_mapreduce(
+            conn, "b", "nicknames?", MapReduceLLM(), entity="Mr. Nelson",
+            aliases=["Nelson", "Mr Nelson", "Nélson", "Pippin"])
+    assert res.plan["aliases"] == ["Pippin"]
+    m.close()
