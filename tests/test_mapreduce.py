@@ -322,12 +322,16 @@ def test_mapreduce_keeps_every_entity_linked_note_despite_weak_text_hits(fresh_d
                 "WHERE d.source = %s LIMIT 1", (src,)).fetchone()[0]
             conn.execute("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)",
                          (item, eid))
+        for i, person in enumerate(["Pat  Smith", "Pat\tSmith", " pat smith "]):
+            m.retain(f"Unrelated body {i}.", source=f"ws{i}.md", index_text=f"ws {i}")
+            conn.execute("UPDATE documents SET person = %s WHERE source = %s", (person, f"ws{i}.md"))
         conn.commit()
         from prospecta import _mapreduce
-        names, _, _ = _mapreduce.resolve_names(conn, "b", ["Pat"])
+        names, _, _ = _mapreduce.resolve_names(conn, "b", ["Pat", "Pat Smith"])
         got = {s for _, s, _ in _mapreduce.fetch_entity_notes(
             conn, "b", names, scan_names=["Patricia"], scan_relevance=0.25)}
         got_alias = {s for _, s, _ in _mapreduce.fetch_entity_notes(
             conn, "b", ["Patricia"], scan_names=["Patricia"], scan_relevance=0.99)}
     assert set(linked) <= got and set(linked) <= got_alias
+    assert {"ws0.md", "ws1.md", "ws2.md"} <= got
     m.close()
