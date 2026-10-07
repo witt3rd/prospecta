@@ -93,6 +93,15 @@ def corpus(n: int, seed: int = 7):
             v = mix((0.55, common), (0.85, gauss()))
         vecs[i] = v
         cluster.append(k)
+    hub_n = int(os.environ.get("BENCH_HUB", "0"))   # a hub note with hub_n near neighbours of graded closeness
+    if hub_n:   # the last hub_n notes lean on the first unrelated note by a in [0.2, 0.95]; a >= 0.8 is truly related
+        hub = next(i for i, k in enumerate(plan) if k < 0)
+        cluster[hub] = 99
+        for i in range(n - hub_n, n):
+            if i != hub:
+                a = 0.2 + 0.75 * rng.random()
+                vecs[i] = mix((0.55, common), (a, vecs[hub]), (0.45, gauss()))
+                cluster[i] = 99 if a >= 0.8 else -1
     for i in range(0, n - 1, 10):   # planted partner: the next note becomes a near copy of note i
         j = i + 1
         vecs[j] = mix((0.93, vecs[i]), (0.07, gauss()))
@@ -169,18 +178,26 @@ def run(base_url: str, n: int, mode: str):
             m.retain(t, source=f"s{i}", index_text=f"note {dup.get(i, i)} summary", child_chunks=True, metadata={   # one note a day, as a diary
                 "created": (datetime.date(2020, 1, 1) + datetime.timedelta(days=i // 2)).isoformat()})
         t_retain = time.monotonic() - t0
-        kw = {}   # BENCH_MAX_QUESTIONS / BENCH_RELATIONS_PER_CALL=0 select the other settings
+        kw = {}   # BENCH_FLOOR_FRAC sets judge_floor_frac (0 = the unbounded all-pairs pass); BENCH_MAX_QUESTIONS / BENCH_RELATIONS_PER_CALL=0 select the other settings
         if os.environ.get("BENCH_MAX_QUESTIONS"):
             kw["max_questions_per_call"] = int(os.environ["BENCH_MAX_QUESTIONS"])
         if os.environ.get("BENCH_RELATIONS_PER_CALL") == "0":
             kw["relations_per_call"] = False
         m._linker = Linker(judge=JevRelationJudge(jev, **kw),
-                          link_completeness=os.environ.get("BENCH_COMPLETENESS") or None)
+                          link_completeness=os.environ.get("BENCH_COMPLETENESS") or None,
+                          **({"judge_floor_frac": float(os.environ["BENCH_FLOOR_FRAC"])}
+                             if os.environ.get("BENCH_FLOOR_FRAC") else {}))
         t1 = time.monotonic()
         with psycopg.connect(url) as c:
             ids = [r[0] for r in c.execute("SELECT id::text FROM documents ORDER BY created_at, id")]
-        for d in ids:
-            m.link_document(d)
+        per_doc = []   # (calls, judged) per document
+        with psycopg.connect(url) as c2:
+            for d in ids:
+                before = st["calls"]
+                m.link_document(d)
+                jd1 = c2.execute("SELECT coalesce((stats->>'candidates_judged')::int,0) "
+                                 "FROM memory_link_state WHERE document_id=%s", (d,)).fetchone()[0]
+                per_doc.append((st["calls"] - before, jd1))
         t_link = time.monotonic() - t1
     finally:
         for k, f in originals.items():
@@ -232,6 +249,8 @@ def run(base_url: str, n: int, mode: str):
             "semantic_links": int(sem),
             "pairs_examined": int(ex), "pairs_judged": int(jd),
             "judged_per_note": round(int(jd) / n, 1),
+            "worst_doc_judged": max(j for _, j in per_doc), "worst_doc_calls": max(c for c, _ in per_doc),
+            "calls_per_note_mean": round(sum(c for c, _ in per_doc) / n, 2),
             "causal_recall": f"{hit}/{len(partner)}",
             "semantic_pair_direct_recall": round(d_ok / max(pairs, 1), 4),
             "semantic_cluster_connectivity": round(c_ok / max(pairs, 1), 4)}

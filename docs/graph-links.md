@@ -53,6 +53,21 @@ so `all-pairs` is the default knowingly and `connected` is the explicit cheaper 
   the pair cache (keyed by the text-hash pair), links written between the judged chunks. 96
   questions per call, the pair cache and the similarity floor keep it affordable. No
   per-note collapse, no top-K, no mutual test.
+- Per-anchor bound (all-pairs, `judge_floor_frac`, default 0.1, env `PROSPECTA_JUDGE_FLOOR_FRAC`, 0 = off): a RELATIVE floor, not a count cap. For each anchor the candidates' cosines give a floor `low + frac x (best - low)`, where `low` is the 10th-percentile cosine of its neighbourhood; a candidate below it is not judged (the `judge_nearest` best always are; cached pairs are still read back). In a dense cluster the low end sits near the best, so the floor rises and only distinctly related pairs are judged; in a sparse region it falls. Skipped pairs are counted in the state stats (`candidates_below_floor`), never dropped silently; a judge failure still errors the document for retry. `link_completeness`, the pair cache, `link_pass` resumability and the background pass are unchanged.
+
+  Benchmark (`BENCH_HUB=1500 BENCH_FLOOR_FRAC=<f> scripts/bench_linker.py 1845`: Greg-style 226-note cluster + 4 more dense clusters, a hub note with 1,500 graded near neighbours, STUB judge with a token cost model, Sonnet-class prices; not live). Ground truth: cluster members are semantically related, every 10th note has a planted causal partner:
+
+  | floor | pairs judged | calls | worst doc judged / calls | per note judged / calls | planted causal recall | direct semantic pair recall | connectivity |
+  |---|---|---|---|---|---|---|---|
+  | f=0 (unbounded) | 736,191 | 24,004 | 1,996 / 64 | 399.0 / 13.0 | 174/185 | 0.9442 | 1.0000 |
+  | f=0.05 | 623,832 | 20,487 | 1,692 / 54 | 338.1 / 11.1 | 169/185 | 0.9216 | 0.9994 |
+  | **f=0.1 (default)** | 567,911 | 18,766 | 1,598 / 50 | 307.8 / 10.2 | 174/185 | 0.9079 | 1.0000 |
+  | f=0.12 | 545,546 | 18,096 | 1,557 / 50 | 295.7 / 9.8 | 174/185 | 0.8992 | 0.9997 |
+  | f=0.15 | 511,230 | 17,013 | 1,485 / 48 | 277.1 / 9.2 | 172/185 | 0.8860 | 0.9994 |
+  | f=0.25 | 397,382 | 13,449 | 1,223 / 40 | 215.4 / 7.3 | 173/185 | 0.8222 | 1.0000 |
+  | f=0.5 | 146,656 | 5,655 | 505 / 17 | 79.5 / 3.1 | 170/185 | 0.4604 | 0.9982 |
+
+  What each setting loses: direct pairwise SEMANTIC links, the ones in the bottom of an anchor's neighbourhood. The default drops about 9% of them; f=0.25 about 18%; f=0.5 about 54%, keeping the nearest links and the most distinct pairs (connectivity holds, but that is not the justification). The default was chosen to keep direct semantic pair recall >= 0.90. The honest cost of all-pairs on a dense hub remains large: at the default the worst document is still 1,598 judged pairs / 50 calls (unbounded 1,996 / 64), so the relative floor at a 0.90 recall bar buys only about 20%. Real savings need the stricter settings (0.25, 0.5) and their recall loss.
 - `connected`: the reduced-pairs rule, and ONLY here the per-note collapse (the first anchor of
   each note represents it: one pair per note pair, A->B and B->A one pair; links between a
   note's other chunks and other notes are NOT judged): at most `judge_top_k` (32 = one call) neighbours per

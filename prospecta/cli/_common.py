@@ -95,11 +95,12 @@ def _stage_kwargs() -> dict:
     if not _truthy_off("PROSPECTA_JEV"):
         kw["jev"] = JevScore(transport)
     if not _truthy_off("PROSPECTA_LINKER"):
-        from prospecta._linker import JevRelationJudge, Linker
+        from prospecta._linker import JUDGE_FLOOR_FRAC, JevRelationJudge, Linker
         judge = None if _truthy_off("PROSPECTA_JEV") else JevRelationJudge(transport)
         # PROSPECTA_LINK_COMPLETENESS=all-pairs|connected overrides the bank's recall_config for this run
         kw["linker"] = Linker(llm=accounted, judge=judge,
-                              link_completeness=os.environ.get("PROSPECTA_LINK_COMPLETENESS") or None)
+                              link_completeness=os.environ.get("PROSPECTA_LINK_COMPLETENESS") or None,
+                              judge_floor_frac=float(os.environ.get("PROSPECTA_JUDGE_FLOOR_FRAC", JUDGE_FLOOR_FRAC)))
     return kw
 
 
