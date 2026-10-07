@@ -1,7 +1,7 @@
 """Grounded, cited synthesis over the blended evidence (design 8.8).
 
-Opt-in mode of recall_synth: the evidence is the best chunk of each of the top
-notes plus its neighbours (at most 3 chunks per note), or the whole scope set;
+Opt-in mode of recall_synth: the evidence is the best chunk of each
+high-scoring note plus its near-scoring chunks, or the whole scope set;
 the model cites [note name] for every claim and may answer "not in memory";
 the citation list comes back with the answer and is stored on the recall event.
 """
@@ -16,12 +16,14 @@ from prospecta._template import render_prompt
 
 logger = logging.getLogger(__name__)
 
-CHUNKS_PER_NOTE = 3
-SCORE_FRACTION = 0.5          # default selection: notes scoring >= this fraction of the top score
-MAX_CONTEXT_CHARS = 400_000   # physical context window bound for the evidence block
+DEFAULT_MIN_REL_SCORE = 0.5       # evidence_min_rel_score: keep notes/chunks scoring >= this x the best
+DEFAULT_CONTEXT_TOKENS = 200_000  # physical: the synthesizer model's context window (config override)
+PROMPT_RESERVE_TOKENS = 4_000     # physical headroom for the template, the question and the answer
+CHARS_PER_TOKEN = 4               # token estimate
 
 _CHUNKS_SQL = """
-SELECT original_chunk, ordinal
+SELECT original_chunk, ordinal,
+       COALESCE(1 - (embedding <=> %s::vector), 0)::float
 FROM memory_items
 WHERE bank_id = %s AND document_id = %s::uuid AND kind = 'chunk'
 """
@@ -54,34 +56,26 @@ def _norm(name: str) -> str:
     return n[:-3] if n.endswith(".md") else n
 
 
-def pick_chunks(rows: list[tuple[str, int | None]], best_text: str,
-                best_index: int | None, n: int = CHUNKS_PER_NOTE) -> list[str]:
-    """The best chunk plus its nearest neighbours by ordinal, at most `n`,
-    returned in document order. Without chunk rows, the best text alone."""
-    indexed = sorted((i, t) for t, i in rows if i is not None)
-    if not indexed:
-        return [best_text] if best_text else []
-    pos = next((p for p, (i, _) in enumerate(indexed) if i == best_index), None)
-    if pos is None:
-        pos = next((p for p, (_, t) in enumerate(indexed) if t == best_text), None)
-    if pos is None:   # best came from a non-chunk item: show it, then the note's head
-        head = [t for _, t in indexed[: n - 1]]
-        return ([best_text] if best_text else []) + head
-    chosen, lo, hi = [pos], pos - 1, pos + 1
-    while len(chosen) < n and (lo >= 0 or hi < len(indexed)):
-        if hi < len(indexed):
-            chosen.append(hi)
-            hi += 1
-        if len(chosen) < n and lo >= 0:
-            chosen.append(lo)
-            lo -= 1
-    return [indexed[p][1] for p in sorted(chosen)]
+def pick_chunks(rows: list[tuple[str, int | None, float]], best_text: str,
+                min_rel: float = DEFAULT_MIN_REL_SCORE) -> list[tuple[float, int, str]]:
+    """The chunks of a note scored at or above `min_rel` x the note's best chunk
+    score, plus the recalled best chunk itself. (score, position, text), best first;
+    position is the document order."""
+    indexed = sorted(((i, t, sc) for t, i, sc in rows if i is not None), key=lambda r: r[0])
+    top = max((sc for _, _, sc in indexed), default=0.0)
+    out = [(sc, p, t) for p, (_, t, sc) in enumerate(indexed)
+           if t == best_text or (top > 0 and sc >= min_rel * top)]
+    if best_text and not any(t == best_text for _, _, t in out):
+        out.append((top, -1, best_text))
+    return sorted(out, key=lambda c: (-c[0], c[1]))
 
 
-def _chunk_rows(conn, bank_id: str, document_id: str) -> list[tuple[str, int | None]]:
+def _chunk_rows(conn, bank_id: str, document_id: str,
+                qvec: str) -> list[tuple[str, int | None, float]]:
     with conn.cursor() as cur:
-        cur.execute(_CHUNKS_SQL, (bank_id, document_id))
-        return [(t, int(i) if i is not None else None) for t, i in cur.fetchall()]
+        cur.execute(_CHUNKS_SQL, (qvec, bank_id, document_id))
+        return [(t, int(i) if i is not None else None, float(sc))
+                for t, i, sc in cur.fetchall()]
 
 
 def resolve_scope(conn, bank_id: str, scope: list[str]) -> list[tuple[str, str]]:
@@ -92,51 +86,58 @@ def resolve_scope(conn, bank_id: str, scope: list[str]) -> list[tuple[str, str]]
 
 
 def gather_evidence(conn, bank_id: str, recalled: list, *, top: int | None = None,
-                    scope: list[str] | None = None,
-                    per_note: int = CHUNKS_PER_NOTE) -> tuple[list[NoteEvidence], bool]:
+                    qvec: str, scope: list[str] | None = None,
+                    min_rel_score: float = DEFAULT_MIN_REL_SCORE,
+                    context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+                    ) -> tuple[list[NoteEvidence], bool]:
     """Evidence notes for the synthesizer. `recalled` is the blended recall in
-    rank order (RecalledMemory, one per note). Returns (notes, set_mode)."""
-    by_doc = {str(r.document_id): r for r in recalled}
+    rank order (RecalledMemory, one per note). Notes and chunks are chosen by
+    score (>= `min_rel_score` x the best); an explicit `scope` is the whole set;
+    `top` is an optional explicit note count. Only the model's context window
+    (`context_tokens`) can drop evidence, and then one warning names what was
+    dropped. Returns (notes, set_mode)."""
+    by_doc: dict[str, object] = {}
+    for r in recalled:
+        by_doc.setdefault(str(r.document_id), r)
     set_mode = False
     order: list[tuple[str, str]] = []
     if scope:
         members = resolve_scope(conn, bank_id, scope)
         if members:
             set_mode = True
-            order = members
+            order = sorted(members, key=lambda m: (-(by_doc[m[0]].score if m[0] in by_doc else 0.0), m[1]))
     if not order:
-        seen: set[str] = set()
-        cutoff = None
-        if top is None and recalled:
-            lead = recalled[0].score
-            cutoff = SCORE_FRACTION * lead if lead > 0 else lead
-        for r in recalled:
-            d = str(r.document_id)
-            if d in seen:
-                continue
-            if cutoff is not None and r.score < cutoff:
-                break
-            seen.add(d)
-            order.append((d, r.source))
-            if top is not None and len(order) >= top:
-                break
-    notes = []
+        best = max((r.score for r in by_doc.values()), default=0.0)
+        order = [(d, r.source) for d, r in by_doc.items()
+                 if best <= 0 or r.score >= min_rel_score * best]
+        if top is not None:
+            order = order[:top]
+    picked = []
     for doc_id, source in order:
         r = by_doc.get(doc_id)
-        best_text = r.original_chunk if r else ""
-        chunks = pick_chunks(_chunk_rows(conn, bank_id, doc_id), best_text, None, per_note)
+        chunks = pick_chunks(_chunk_rows(conn, bank_id, doc_id, qvec),
+                             r.original_chunk if r else "", min_rel_score)
         if chunks:
-            notes.append(NoteEvidence(name=source or doc_id, document_id=doc_id, chunks=chunks))
-    used, kept = 0, []
-    for n in notes:
-        used += sum(len(c) for c in n.chunks)
-        if used > MAX_CONTEXT_CHARS and kept:
-            break
-        kept.append(n)
-    if len(kept) < len(notes):
-        logger.warning("evidence exceeds the context window (%d chars); dropped notes: %s",
-                       MAX_CONTEXT_CHARS, ", ".join(n.name for n in notes[len(kept):]))
-    return kept, set_mode
+            picked.append((doc_id, source or doc_id, chunks))
+    budget = max(0, context_tokens - PROMPT_RESERVE_TOKENS) * CHARS_PER_TOKEN
+    used, kept, dropped = 0, {}, []
+    for doc_id, name, chunks in picked:
+        for sc, pos, text in chunks:
+            cost = len(text) + len(name) + 32
+            if used + cost > budget:
+                dropped.append((name, text))
+                continue
+            used += cost
+            kept.setdefault(doc_id, []).append((pos, text))
+    if dropped:
+        logger.warning(
+            "grounded evidence exceeds the model context window (%d tokens); dropped %d "
+            "chunk(s), lowest-ranked first: %s", context_tokens, len(dropped),
+            "; ".join(f"[{n}] {t}" for n, t in dropped))
+    notes = [NoteEvidence(name=name, document_id=doc_id,
+                          chunks=[t for _, t in sorted(kept[doc_id])])
+             for doc_id, name, _ in picked if doc_id in kept]
+    return notes, set_mode
 
 
 def render_context(notes: list[NoteEvidence]) -> str:

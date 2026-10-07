@@ -2,15 +2,21 @@
 
 The channel returns the notes inside the extracted filter (documents.person /
 created_on), ranked by their best item's dense score; empty when no filter was
-extracted. Promotion never excludes: after fusion, when the filter is `hard`
-and its set holds at most PROMOTE_MAX notes, every member moves to the front."""
+extracted. Promotion never excludes and has no count limit: after fusion and
+the stages, when the filter is `hard`, every member of the filter set gets a
+score boost of `weight * top_score * cosine` (top_score = best fused score,
+cosine = the member's filter-channel score). The boost, not a count, decides
+how far members rise, so a large filter set stays sensible. A member whose
+cosine is 0 gets no boost: the boost multiplies a real score."""
 from __future__ import annotations
+
+from dataclasses import replace
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
 from prospecta.db.queries import _meta_param, _vec_literal
 
-PROMOTE_MAX = 12
+DEFAULT_PROMOTE_WEIGHT = 1.0   # tuning weight (meta param `promote_weight`), not a cap
 NAME = "meta"
 
 _SQL = """
@@ -62,29 +68,36 @@ class MetadataScope:
         return out
 
 
-def scope_members(plan: QueryPlan, candidates: list[Candidate], limit: int) -> list[Candidate]:
-    """The filter set to promote: [] unless hard and the set is complete
-    (fewer than the channel limit were returned) and has <= PROMOTE_MAX notes."""
+def scope_members(plan: QueryPlan, candidates: list[Candidate]) -> list[Candidate]:
+    """The filter set to promote: [] unless the filter is hard. No size limit."""
     if not plan.filters.hard:
         return []
-    members = [c for c in candidates if c.channel == NAME]
-    if not members or len(members) > PROMOTE_MAX or len(members) >= limit:
-        return []
-    return members
+    return [c for c in candidates if c.channel == NAME]
 
 
-def promote_scope(fused: list[FusedDoc], members: list[Candidate]) -> list[FusedDoc]:
-    """Move every member to the front (best filter rank first), then the rest
-    in fused order. Members missing from the pool are added. Nothing is
-    removed, so the filter can never hard-exclude a note."""
-    if not members:
+def promote_scope(fused: list[FusedDoc], members: list[Candidate],
+                  weight: float = DEFAULT_PROMOTE_WEIGHT) -> list[FusedDoc]:
+    """Add `weight * top_score * cosine` to every member's score and re-sort
+    (stable). Members missing from the pool are added with score 0 first.
+    Nothing is removed, so the filter can never hard-exclude a note. A member
+    with cosine 0 gets no boost (the boost multiplies a real score); accepted."""
+    if not members or weight <= 0:
         return fused
+    top = max((f.score for f in fused), default=0.0)
+    if top <= 0:
+        top = 1.0
     by_doc = {f.document_id: f for f in fused}
-    front: list[FusedDoc] = []
+    boost = {c.document_id: weight * top * max(0.0, c.score) for c in members}
+    out = []
+    for f in fused:
+        b = boost.get(f.document_id)
+        out.append(replace(f, score=f.score + b) if b else f)
     for c in sorted(members, key=lambda c: c.rank):
-        front.append(by_doc.get(c.document_id) or FusedDoc(
-            document_id=c.document_id, source=c.source, score=0.0, best=c,
-            ranks={c.channel: c.rank}, scores={c.channel: c.score},
-        ))
-    ids = {f.document_id for f in front}
-    return front + [f for f in fused if f.document_id not in ids]
+        if c.document_id not in by_doc:
+            out.append(FusedDoc(
+                document_id=c.document_id, source=c.source,
+                score=boost[c.document_id], best=c,
+                ranks={c.channel: c.rank}, scores={c.channel: c.score},
+            ))
+    out.sort(key=lambda f: -f.score)
+    return out

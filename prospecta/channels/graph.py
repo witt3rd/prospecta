@@ -7,7 +7,7 @@ weight and its confidence; the walk keeps at most `node_cap` neighbour items
 (Jev-Mem's 60), best first, and reports them as documents. A document reached
 only through its own seed's links is not an expansion and is dropped.
 
-params (all optional): seeds (10), max_hops (2, at most 2), decay (0.5),
+params (all optional): seeds (10), max_hops (2), decay (0.5),
 node_cap (60), frontier (200, items expanded in hop 2), hub (30, the Linker's
 ENTITY_HUB), hub_cap (200, holders reached per hub entity), type_weights ({"SEMANTIC":1.0,"CAUSAL":0.8,"TEMPORAL":0.5,
 "ENTITY":0.5}).
@@ -151,7 +151,7 @@ class GraphExpand:
                 "docs": docs, "ws": ws, "bank": state.bank_id,
                 "decay": float(p.get("decay", DEFAULT_DECAY)),
                 "tw": json.dumps(tw),
-                "max_hops": min(int(p.get("max_hops", MAX_HOPS)), MAX_HOPS),
+                "max_hops": int(p.get("max_hops", MAX_HOPS)),
                 "cap": int(p.get("node_cap", DEFAULT_NODE_CAP)),
                 "frontier": int(p.get("frontier", DEFAULT_FRONTIER)),
                 "hub": int(p.get("hub", ENTITY_HUB)),

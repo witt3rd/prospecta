@@ -592,9 +592,10 @@ class Memory:
         See plan-v2.md §3.4 for canonical semantics.
 
         grounded=True (opt-in) swaps the final step for the cited synthesis of
-        design 8.8: the evidence is the best chunk plus neighbours (at most 3
-        per note) of the top `evidence_top` notes of the blended recall, or,
-        when `scope` (note sources or document ids, any number found) names a
+        design 8.8: the evidence is every note of the blended recall scoring
+        at least `recall_config.evidence.min_rel_score` x the best (chunks
+        likewise), cut to `evidence_top` notes only when given; or,
+        when `scope` (note sources or document ids) names a
         set, all of those notes. The answer cites [note name] per claim, may
         say "not in memory", and RAGResult.citations is stored on the recall
         event (recall_events.citations). `synth_prompt_override` is ignored.
@@ -656,9 +657,15 @@ class Memory:
             if not scope:   # the extracted filter's promoted set (design 8.5)
                 scope = [d for t in traces
                          for d in t.get("fusion", {}).get("scope_promoted", [])] or None
+            from prospecta.db.queries import _vec_literal
+            from prospecta.stages import read_recall_config
+            qvec = _vec_literal(self._embed([message])[0])
             with self._pool.connection() as conn:
+                ev_cfg = read_recall_config(conn, bank_id).get("evidence") or {}
                 notes, set_mode = _synth.gather_evidence(
-                    conn, bank_id, blended, top=evidence_top, scope=scope)
+                    conn, bank_id, blended, top=evidence_top, scope=scope, qvec=qvec,
+                    min_rel_score=ev_cfg.get("min_rel_score", _synth.DEFAULT_MIN_REL_SCORE),
+                    context_tokens=ev_cfg.get("context_tokens", _synth.DEFAULT_CONTEXT_TOKENS))
             grounded_res = _synth.synthesize_grounded(
                 message, notes, self._synth_llm or self._llm, set_mode=set_mode)
             synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt

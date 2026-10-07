@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 from prospecta._chunker import chunk_paragraphs, chunk_text
 from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
+from prospecta.channels.meta import DEFAULT_PROMOTE_WEIGHT
 from prospecta.channels import (
     QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
     run_channels, scope_members,
@@ -657,20 +658,19 @@ def _search_channels(
             from prospecta.stages import totals
             tr["calls"] = extract_calls + list(tr.get("calls") or [])
             tr["accounting"] = totals(tr["calls"])
-    n_out = limit
     if meta_cfg is not None:
         # Scope promotion (design 8.5): hard filter with a small complete set
         # moves every member to the front; the filter never excludes.
-        members = scope_members(plan, state.channel_lists.get("meta", []), int((meta_cfg.get("params") or {}).get("limit", 50)))
+        members = scope_members(plan, state.channel_lists.get("meta", []))
         if members:
-            fused = promote_scope(fused, members)
-            n_out = max(limit, len(members))
+            fused = promote_scope(fused, members, float(
+                (meta_cfg.get("params") or {}).get("promote_weight", DEFAULT_PROMOTE_WEIGHT)))
             tr["fusion"]["scope_promoted"] = [m.document_id for m in members]
     if trace is not None:
         trace.append(tr)
     channel_names = [c["name"] for c in tr["channels"]]
     out = []
-    for f in fused[:n_out]:
+    for f in fused[:limit]:
         b = f.best
         scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
         scores.update({n: 0.0 for n in channel_names})

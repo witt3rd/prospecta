@@ -58,14 +58,13 @@ def mem(fresh_db):
     m.close()
 
 
-def test_pick_chunks_window_and_fallbacks():
-    rows = [(f"c{i}", i) for i in range(6)]
-    assert pick_chunks(rows, "c3", None) == ["c2", "c3", "c4"]
-    assert pick_chunks(rows, "c0", None) == ["c0", "c1", "c2"]
-    assert pick_chunks(rows, "c5", None) == ["c3", "c4", "c5"]
-    assert pick_chunks([], "only", None) == ["only"]
-    assert pick_chunks(rows, "question text", None) == ["question text", "c0", "c1"]
-    assert pick_chunks(rows, "x", 2, n=1) == ["c2"]
+def test_pick_chunks_by_relative_score():
+    rows = [("c0", 0, 0.9), ("c1", 1, 0.6), ("c2", 2, 0.3), ("c3", 3, 0.1)]
+    got = pick_chunks(rows, "c0", 0.5)
+    assert [t for _, _, t in got] == ["c0", "c1"]
+    assert [t for _, _, t in pick_chunks(rows, "c0", 0.0)] == ["c0", "c1", "c2", "c3"]
+    assert [t for _, _, t in pick_chunks([], "only")] == ["only"]
+    assert "question text" in [t for _, _, t in pick_chunks(rows, "question text", 0.9)]
 
 
 def test_extract_citations_known_unknown_and_dedupe():
@@ -84,10 +83,10 @@ def test_default_recall_synth_unchanged(mem):
 
 def test_grounded_top_notes_cited_and_stored(mem):
     res = mem.recall_synth("cat sat", grounded=True, evidence_top=4)
+    assert len(res.evidence) == 4
     prompt = mem.llm.prompts[-1]
     assert "not in memory" in prompt and "### [alpha.md]" in prompt
     assert len(res.evidence) == 4
-    assert all(len(e["chunks"]) <= 3 for e in res.evidence)
     assert res.synthesis == "Cats sat [alpha.md] and [bravo.md]."
     assert [c["note"] for c in res.citations] == ["alpha.md", "bravo.md"]
     assert all(c["known"] for c in res.citations)
@@ -99,11 +98,31 @@ def test_grounded_top_notes_cited_and_stored(mem):
     assert [c["note"] for c in cit] == ["alpha.md", "bravo.md"]
 
 
-def test_grounded_alpha_gets_neighbour_chunks_at_most_three(mem):
-    res = mem.recall_synth("alpha part 2 cat", grounded=True, evidence_top=6)
+def test_grounded_no_default_clip_on_notes_or_chunks(mem):
+    mem.set_recall_config({"evidence": {"min_rel_score": 0.0}})
+    res = mem.recall_synth("alpha part 2 cat", grounded=True)
     alpha = next(e for e in res.evidence if e["note"] == "alpha.md")
-    assert len(alpha["chunks"]) == 3
+    assert len(alpha["chunks"]) > 3   # near-scoring chunks all kept: no 3-chunk clip
     assert alpha["chunks"] == sorted(alpha["chunks"])  # document order
+
+
+def test_grounded_min_rel_score_config_narrows(mem):
+    wide = mem.recall_synth("cat sat", grounded=True)
+    mem.set_recall_config({"evidence": {"min_rel_score": 1.0}})
+    narrow = mem.recall_synth("cat sat", grounded=True)
+    assert len(narrow.evidence) < len(wide.evidence)
+
+
+def test_grounded_context_budget_drops_with_one_full_warning(mem, caplog):
+    mem.set_recall_config({"evidence": {"context_tokens": 4010}})
+    with caplog.at_level("WARNING", logger="prospecta._synth"):
+        res = mem.recall_synth("cat sat", grounded=True,
+                               scope=["alpha.md", "bravo.md", "charlie.md", "delta.md"])
+    warns = [r for r in caplog.records if "context window" in r.getMessage()]
+    assert len(warns) == 1
+    dropped = [e for e in ("alpha.md", "bravo.md", "charlie.md", "delta.md")
+               if e not in {x["note"] for x in res.evidence}]
+    assert dropped and all(f"[{d}]" in warns[0].getMessage() for d in dropped)
 
 
 def test_grounded_scope_set_gives_whole_set(mem):
@@ -131,7 +150,7 @@ def test_grounded_scope_of_twenty_notes_uses_all(mem):
     assert "whole set of notes in scope" in mem.llm.prompts[-1]
 
 
-def test_grounded_scope_too_large_falls_back_to_top(mem):
+def test_grounded_unmatched_scope_falls_back_to_top(mem):
     res = mem.recall_synth("cat sat", grounded=True, evidence_top=2, scope=["nope.md"])
     assert len(res.evidence) == 2   # empty scope match: top notes
     assert "whole set of notes in scope" not in mem.llm.prompts[-1]
