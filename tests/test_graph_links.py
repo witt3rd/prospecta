@@ -124,7 +124,7 @@ def pool_of(ids, *names):
                       rank=i + 1, score=1.0, evidence=n) for i, n in enumerate(names)]
 
 
-def expand(mem, ids, seeds, limit=50, **params):
+def expand(mem, ids, seeds, limit=None, **params):
     with conn_of(mem) as c:
         st = RecallState(conn=c, bank_id="b", pool=pool_of(ids, *seeds))
         return GraphExpand(**params).retrieve(QueryPlan(text="q"), st, limit)
@@ -141,14 +141,14 @@ def test_graph_one_hop_by_join_both_directions(mem):
 
 def test_graph_two_hops_decay_and_type_weights(mem):
     ids = seed_chain(mem)
-    out = {c.source: c for c in expand(mem, ids, ["A"])}
+    out = {c.source: c for c in expand(mem, ids, ["A"], node_min_rel=0)}
     assert set(out) == {"B", "C", "D"} and out["C"].detail["hops"] == 2
     # A->B semantic (1.0) then B->C causal (0.8), D entity (0.5), decay 0.5 per hop
     assert out["B"].score == pytest.approx(0.5)
     assert out["C"].score == pytest.approx(0.5 * 0.5 * 0.8)
     assert out["D"].score == pytest.approx(0.5 * 0.5 * 0.5)
-    assert [c.source for c in expand(mem, ids, ["A"])] == ["B", "C", "D"]
-    assert [c.rank for c in expand(mem, ids, ["A"])] == [1, 2, 3]
+    assert [c.source for c in expand(mem, ids, ["A"], node_min_rel=0)] == ["B", "C", "D"]
+    assert [c.rank for c in expand(mem, ids, ["A"], node_min_rel=0)] == [1, 2, 3]
     # configurable: weights and decay
     tw = {c.source: c.score for c in expand(
         mem, ids, ["A"], type_weights={"CAUSAL": 0.0}, decay=1.0)}
@@ -157,7 +157,10 @@ def test_graph_two_hops_decay_and_type_weights(mem):
 
 def test_graph_node_cap_and_seed_exclusion(mem):
     ids = seed_chain(mem)
-    assert [c.source for c in expand(mem, ids, ["A"], node_cap=1)] == ["B"]
+    # score-based: B 0.5, C 0.2, D 0.125; the cut is node_min_rel x the best (default 0.4)
+    assert [c.source for c in expand(mem, ids, ["A"])] == ["B", "C"]
+    assert [c.source for c in expand(mem, ids, ["A"], node_min_rel=0.5)] == ["B"]
+    assert [c.source for c in expand(mem, ids, ["A"], node_min_rel=0.2)] == ["B", "C", "D"]
     assert expand(mem, ids, ["E"]) == []                   # isolated seed
     assert expand(mem, ids, []) == []                      # empty pool
     # a seed's own items are never its expansion
@@ -170,9 +173,9 @@ def test_graph_default_config_enabled_and_configurable():
     built = {c.name: c for c in build_channels(DEFAULT_CHANNEL_CONFIG)}
     assert built["graph"].channel.kind == "expand"
     assert list(built) == ["dense_chunk", "question", "meta", "graph"]   # filter then expand last
-    cfg = [{"name": "graph", "weight": 2.5, "params": {"node_cap": 7, "decay": 0.3}}]
+    cfg = [{"name": "graph", "weight": 2.5, "params": {"node_min_rel": 0.7, "decay": 0.3}}]
     g = build_channels(cfg)[0]
-    assert g.weight == 2.5 and g.channel.params["node_cap"] == 7
+    assert g.weight == 2.5 and g.channel.params["node_min_rel"] == 0.7
 
 
 def test_graph_channel_joins_the_default_blend(mem):
@@ -422,7 +425,7 @@ def test_hub_entity_reached_by_entity_join_not_capped_links(mem):
             "JOIN documents d ON d.id = a.document_id WHERE l.link_type='ENTITY' "
             "AND d.source NOT IN ('h0','h1','h2','h3','h4')").fetchone()[0] == 0
     ids = docs(mem)
-    out = expand(mem, ids, ["h0"], max_hops=1, hub=5, node_cap=100)
+    out = expand(mem, ids, ["h0"], max_hops=1, hub=5, node_min_rel=0)
     assert {c.source for c in out} == {f"h{i}" for i in range(1, n)}      # all 13, not 10
     # below the hub threshold the entity is linked directly and lossless
     with conn_of(mem) as c:
@@ -449,7 +452,44 @@ def test_hub_entity_reached_at_hop_two_through_a_link(mem):
         c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype) "
                   "VALUES ('b', %s, %s, 'SEMANTIC', 'RELATED_TO')", (s_item, x_item))
         c.commit()
-    out = expand(mem, ids, ["S"], hub=3, node_cap=100)
+    out = expand(mem, ids, ["S"], hub=3, node_min_rel=0)
     got = {c.source: c.detail["hops"] for c in out}
     assert got["h0"] == 1
     assert {got[f"h{i}"] for i in range(1, n)} == {2}
+
+
+# ------------------------------------------------ score-based caps (no counts)
+
+def test_linker_temporal_close_has_no_count_cap(mem):
+    for i in range(9):   # nine same-day notes: all are 'close' (old cap was 5)
+        mem.retain(f"day note {i}", source=f"d{i}", index_text=f"t{i}",
+                   metadata={"created": "2024-02-01", "person": "ann"})
+    link_all(mem, Linker())
+    close = {(a, b) for a, b, lt, st, o, c in links(mem) if st == "TEMPORALLY_CLOSE"}
+    assert {b for a, b in close if a == "d0"} == {f"d{i}" for i in range(1, 9)}
+
+
+def test_linker_pgvector_fallback_links_every_neighbour_above_the_floor(mem):
+    for i in range(9):   # nine near-identical notes: old caps were 10 candidates / top 5
+        t = f"cats purr softly on warm mats variant{i}"
+        mem.retain(t, source=f"c{i}", index_text=t)
+    link_all(mem, Linker(vector_floor=0.5))
+    sem = {b for a, b, lt, st, o, cf in links(mem) if lt == "SEMANTIC" and a == "c0"}
+    assert sem == {f"c{i}" for i in range(1, 9)}
+
+
+def test_graph_seeds_are_every_pool_document_within_the_relative_score(mem):
+    for s in [f"S{i}" for i in range(12)] + [f"T{i}" for i in range(12)]:
+        mem.retain(f"note {s} text", source=s, index_text=f"q {s}")
+    ids = docs(mem)
+    with conn_of(mem) as c:
+        item = {s: c.execute("SELECT id FROM memory_items WHERE document_id=%s",
+                             (ids[s],)).fetchone()[0] for s in ids}
+        for i in range(12):
+            c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype) "
+                      "VALUES ('b', %s, %s, 'SEMANTIC', 'RELATED_TO')", (item[f"S{i}"], item[f"T{i}"]))
+        c.commit()
+    out = expand(mem, ids, [f"S{i}" for i in range(12)], node_min_rel=0)
+    assert {c.source for c in out} == {f"T{i}" for i in range(12)}   # old seeds=10 would miss two
+    # a seed below seed_min_rel x the best is not a seed
+    assert len(expand(mem, ids, [f"S{i}" for i in range(12)], node_min_rel=0, seed_min_rel=0.99)) == 1
