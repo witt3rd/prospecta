@@ -19,9 +19,9 @@ GOLD = {"g1": "Pip", "g2": "Pip", "g3": "Skipper", "g4": "Quill", "g5": "Quill",
 
 
 class MapReduceLLM:
-    def __init__(self, bad_reduce=False, fail_batch=None):
+    def __init__(self, bad_reduce=False, fail_batch=None, fail_times=99):
         self.map_prompts, self.reduce_prompts = [], []
-        self.bad_reduce, self.fail_batch = bad_reduce, fail_batch
+        self.bad_reduce, self.fail_batch, self.fail_times = bad_reduce, fail_batch, fail_times
 
     def __call__(self, messages, *, json_mode=False):
         text = messages[-1]["content"]
@@ -36,7 +36,8 @@ class MapReduceLLM:
             return LLMResult(json.dumps({"items": items}), model="stub-sonnet",
                              tokens_in=10, tokens_out=5, cost_usd=0.002)
         self.map_prompts.append(text)
-        if self.fail_batch == len(self.map_prompts):
+        if self.fail_batch and len(self.map_prompts) <= self.fail_times * self.fail_batch \
+                and len(self.map_prompts) > (self.fail_batch - 1) * self.fail_times:
             raise RuntimeError("boom")
         facts = []
         for src, body in re.findall(r"### \[(.*?)\]\n(.*?)(?=\n### \[|\Z)", text.split("## Notes")[1], re.S):
@@ -118,13 +119,22 @@ def test_mapreduce_reduce_failure_falls_back_to_deterministic_merge(fresh_db):
     m.close()
 
 
-def test_mapreduce_failed_batch_is_recorded_not_fatal(fresh_db):
-    llm = MapReduceLLM(fail_batch=1)
+def test_mapreduce_failed_batch_is_surfaced_not_silent(fresh_db):
+    llm = MapReduceLLM(fail_batch=1, fail_times=2)   # batch 1 fails both attempts
     m = _build(fresh_db, llm)
     seen = []
     res = m.recall_mapreduce("nicknames?", entity="Pat", batch_size=30, on_progress=seen.append)
     assert seen[0]["error"].startswith("RuntimeError") and seen[1]["error"] is None
-    assert res.synth_call["notes_visited"] == 60
+    assert "WARNING: incomplete" in res.synthesis and "g1.md" in res.synthesis
+    assert len(llm.map_prompts) == 3
+    m.close()
+
+
+def test_mapreduce_transient_batch_failure_is_retried(fresh_db):
+    llm = MapReduceLLM(fail_batch=1, fail_times=1)   # first attempt fails, retry succeeds
+    m = _build(fresh_db, llm)
+    res = m.recall_mapreduce("nicknames?", entity="Pat", batch_size=30)
+    assert "WARNING" not in res.synthesis and len(res.evidence) == 5
     m.close()
 
 

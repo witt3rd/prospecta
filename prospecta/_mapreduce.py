@@ -21,6 +21,7 @@ from prospecta.db.queries import _meta_param
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 8
+MAP_ATTEMPTS = 2   # a failed batch is retried once, then surfaced
 DEFAULT_EXCERPT_CHARS = 6000   # a note longer than this is sent as its entity-mention paragraphs
 
 _NOTES_SQL = """
@@ -131,6 +132,7 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     progress: list[dict] = []
     raw_facts: list[dict] = []   # {fact, note}
     visited = 0
+    failed_notes: list[str] = []
     n_batches = (len(notes) + batch_size - 1) // batch_size
     for b in range(n_batches):
         batch = notes[b * batch_size:(b + 1) * batch_size]
@@ -138,13 +140,24 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
             "query": question, "context": _render_notes(batch, names, excerpt_chars)})
         found = 0
         err = None
-        try:
-            for e in _facts_of(_call(llm, prompt, purpose="mapreduce_map", calls=calls), "facts"):
+        for attempt in range(1, MAP_ATTEMPTS + 1):   # retry once; never drop a batch silently
+            try:
+                got = _facts_of(_call(llm, prompt, purpose="mapreduce_map", calls=calls), "facts")
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                logger.warning("map-reduce batch %d/%d attempt %d/%d failed: %s",
+                               b + 1, n_batches, attempt, MAP_ATTEMPTS, err)
+                continue
+            err = None
+            for e in got:
                 raw_facts.append({"fact": e["fact"].strip(), "note": str(e.get("note", "")).strip()})
-                found += 1
-        except Exception as exc:   # one bad batch must not lose the others
-            err = f"{type(exc).__name__}: {exc}"
-            logger.warning("map-reduce batch %d/%d failed: %s", b + 1, n_batches, err)
+            found = len(got)
+            break
+        if err is not None:
+            failed_notes.extend(src for _, src, _ in batch)
+            logger.warning("map-reduce batch %d/%d FAILED after %d attempts, %d note(s) NOT read: %s (%s)",
+                           b + 1, n_batches, MAP_ATTEMPTS, len(batch),
+                           ", ".join(src for _, src, _ in batch), err)
         visited += len(batch)
         rec = {"batch": b + 1, "of": n_batches, "notes": len(batch), "notes_visited": visited,
                "facts_found": found, "facts_total": len(raw_facts),
@@ -168,13 +181,16 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     text = "\n".join(f"- {it['fact']} " + " ".join(f"[{n}]" for n in
                      dict.fromkeys(c["note"] for c in it["citations"])) for it in items) \
         or "not in memory"
+    if failed_notes:
+        text += ("\nWARNING: incomplete. These notes could not be read (their batch failed after "
+                 f"{MAP_ATTEMPTS} attempts): " + ", ".join(failed_notes))
     return MapReduceResult(
         synthesis=text, items=items, citations=citations, progress=progress, calls=calls,
         notes_visited=visited, facts_found=len(items),
         plan={"mode": "mapreduce", "entity": entity, "aliases": list(aliases or []),
               "batch_size": batch_size, "n_notes": len(notes), "n_batches": n_batches,
               "metadata_filter": metadata_filter, "progress": progress,
-              "raw_facts": len(raw_facts)})
+              "raw_facts": len(raw_facts), "failed_notes": failed_notes})
 
 
 def _dedupe(raw_facts: list[dict]) -> list[dict]:
