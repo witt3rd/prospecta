@@ -6,14 +6,14 @@ unchanged). Set it with `Memory.set_recall_config(...)`.
 
 ```python
 mem.set_recall_config({
-  "rerank": {"enabled": True, "stage": "sonnet_listwise", "pool": 30,
+  "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": 0.4,
              "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3, "floor": False}},
   "gate":   {"enabled": False, "threshold": 2.95},          # Jev, needs Memory(jev=...)
-  "reader": {"enabled": False, "top": 8, "join_top": 15, "max_follow_ups": 2, "max_new": 10},
+  "reader": {"enabled": False, "min_rel_score": 0.6, "hop_min_rel_score": 0.4},
 })
 ```
 
-- **Sonnet rerank** (`SonnetListwise`): the fused top 30, one best chunk (in
+- **Sonnet rerank** (`SonnetListwise`): every fused note scoring >= `min_rel_score` x the best fused score (batched by the model window, see `limits.md`), one best chunk (in
   full, never clipped) per note under a header of note name, date and person; the model replies
   JSON `{grades, ranking}`; order = ranking, then grade, then fused order. Any
   failure (provider error, unparseable reply) keeps the fused order and records
@@ -27,8 +27,7 @@ mem.set_recall_config({
   Applies to either stage; the parameters and `moved` land in
   `recall_events.rerank.blend`.
 - **Jev** (`JevScore`, `rerank.stage = "jev_score"`) in Spire's call shape: one
-  `score` question per candidate, criteria 0 to 3, 15 candidates per request (two
-  requests for 30), 60 KB per request, 10 s timeout, Jev only reorders. With
+  `score` question per candidate, criteria 0 to 3, 15 candidates per request (requests are split by this size), 60 KB per request, 10 s timeout, Jev only reorders. With
   `gate.enabled`, Jev scores first; if its top score >= `threshold` the Jev order
   stands, else (or if Jev fails) Sonnet reranks. Jev is built dark: pass
   `Memory(jev=JevScore(openrouter_jev_transport()))` (key from `OPENROUTER_API_KEY`).
@@ -41,10 +40,10 @@ mem.set_recall_config({
   0..3, else there is no ranking and the fused order stands. Cost and tokens come
   from `usage.cost`, `usage.input_tokens`, `usage.output_tokens`. Tests use an
   offline transport of the same shape.
-- **Reader and hop**: the reader sees the top 8 excerpts and answers sufficient or
-  <= 2 follow-up queries; these run only the cheap channels (`dense_chunk`,
-  `bm25`, `question`, whichever the bank enables); <= 10 new notes join the top 15
-  and the joined set is reranked once. At most one hop; all in `recall_events.hops`.
+- **Reader and hop**: the reader sees every excerpt graded >= `reader.min_rel_score` x the best and answers sufficient or
+  gives one follow-up query per missing fact; these run only the cheap channels (`dense_chunk`,
+  `bm25`, `question`, whichever the bank enables); new notes scoring >= `hop_min_rel_score` x the best of their run join the
+  reranked set and the joined set is reranked once. At most one hop; all in `recall_events.hops`.
 - **Accounting**: `recall_events.cost_usd`, `tokens_in`, `tokens_out`,
   `n_llm_calls` sum the recall's model calls; each call also lands in `llm_calls`
   with `model`, `tokens_in`, `tokens_out`, `cost_usd`. An LLM callable reports
