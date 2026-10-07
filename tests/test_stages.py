@@ -318,7 +318,11 @@ def test_hop_keeps_scope_promotion(mem):
     mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["cat sat mat"]})
     mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
                            "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    cfg = no_cut(DEFAULT_CHANNEL_CONFIG)
+    for e in cfg:
+        if e["name"] == "meta":
+            e["params"] = {**(e.get("params") or {}), "promote": True}
+    mem.set_channel_config(cfg)
     res = mem.recall([QUERY], limit=5)
     h = last_event(mem, "hops")[0]["per_query"][0]
     assert h["verdict"] == "follow_up" and h["new_candidates"]   # the hop really fired
@@ -404,7 +408,10 @@ def test_blend_off_is_old_behaviour():
     rr = build_reranker({"rerank": {"enabled": True, "blend": {"enabled": False}}},
                         llm=lambda *a, **k: "", jev=None)
     assert type(rr).__name__ == "SonnetListwise"
-    on = build_reranker({"rerank": {"enabled": True}}, llm=lambda *a, **k: "", jev=None)
+    default = build_reranker({"rerank": {"enabled": True}}, llm=lambda *a, **k: "", jev=None)
+    assert type(default).__name__ == "SonnetListwise"      # blend is opt-in
+    on = build_reranker({"rerank": {"enabled": True, "blend": {"enabled": True}}},
+                        llm=lambda *a, **k: "", jev=None)
     assert type(on).__name__ == "BlendedReranker"
     assert _DemoteTop().rerank("q", _items(30), []).order.index(0) == 10
 

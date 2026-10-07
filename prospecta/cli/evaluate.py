@@ -26,7 +26,9 @@ def cmd_eval(args) -> int:
     try:
         report = evaluation.run_eval(
             memory, questions, ablate=args.ablate, synth=args.synth or args.judge,
-            judge=args.judge)
+            judge=args.judge,
+            rerank_blend=getattr(args, "rerank_blend", None),
+            scope_promote=getattr(args, "scope_promote", None))
     except Exception as e:
         print(f"error: eval failed: {e}", file=sys.stderr)
         return 2

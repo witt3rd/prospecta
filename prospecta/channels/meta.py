@@ -16,6 +16,7 @@ from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
 from prospecta.db.queries import _meta_param, _vec_literal
 
+DEFAULT_PROMOTE = False       # scope-promotion re-sort is opt-in (meta param `promote`)
 DEFAULT_PROMOTE_WEIGHT = 1.0   # tuning weight (meta param `promote_weight`), not a cap
 NAME = "meta"
 

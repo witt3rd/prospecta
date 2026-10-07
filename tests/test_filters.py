@@ -258,8 +258,25 @@ def test_meta_channel_ranks_filter_set_and_soft_filter_adds_no_promotion(mem):
     assert len(res) == 4  # nothing excluded
 
 
-def test_hard_scope_promotes_set_members(mem):
+def _promote_cfg(on):
+    cfg = no_cut(DEFAULT_CHANNEL_CONFIG)
+    for e in cfg:
+        if e["name"] == "meta":
+            e["params"] = {**(e.get("params") or {}), "promote": on}
+    return cfg
+
+
+def test_scope_promotion_is_off_by_default(mem):
     mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    mem._llm = llm_returning({"people": ["Alice"], "date_from": "2024-03-01",
+                              "date_to": "2024-04-30", "hard": True})
+    traces: list = []
+    mem.search("walk the dog by the park", limit=2, _trace=traces)
+    assert "scope_promoted" not in traces[0]["fusion"]
+
+
+def test_hard_scope_promotes_set_members(mem):
+    mem.set_channel_config(_promote_cfg(True))
     mem._llm = llm_returning({"people": ["Alice"], "date_from": "2024-03-01",
                               "date_to": "2024-04-30", "hard": True})
     traces: list = []

@@ -362,8 +362,11 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
 
 
 def run_eval(memory, questions: list[Question], *, ablate: bool = False,
-             synth: bool = False, judge: bool = False, pool: int | None = None) -> dict:
-    """Score the bank as configured; optionally ablate and synthesise."""
+             synth: bool = False, judge: bool = False, pool: int | None = None,
+             rerank_blend: bool | None = None, scope_promote: bool | None = None) -> dict:
+    """Score the bank as configured; optionally ablate and synthesise.
+    `rerank_blend` / `scope_promote` (None = keep config) force the rerank blend
+    and the scope-promotion re-sort on or off for this run."""
     with memory._pool.connection() as conn:
         from prospecta.channels import read_channel_config
         channel_config = read_channel_config(conn, memory.default_bank_id)
@@ -373,6 +376,14 @@ def run_eval(memory, questions: list[Question], *, ablate: bool = False,
         legacy = True   # the bank has no channel registry; score the measured default
     else:
         legacy = False
+    if rerank_blend is not None:
+        recall_cfg = copy.deepcopy(recall_cfg)
+        recall_cfg.setdefault("rerank", {}).setdefault("blend", {})["enabled"] = rerank_blend
+    if scope_promote is not None:
+        channel_config = copy.deepcopy(channel_config)
+        for e in channel_config:
+            if e.get("name") == "meta":
+                e["params"] = {**(e.get("params") or {}), "promote": scope_promote}
     report: dict = {
         "bank": memory.default_bank_id, "n_questions": len(questions),
         "channel_config": channel_config, "recall_config": recall_cfg,

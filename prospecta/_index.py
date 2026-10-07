@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 from prospecta._chunker import chunk_paragraphs, chunk_text
 from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
-from prospecta.channels.meta import DEFAULT_PROMOTE_WEIGHT
+from prospecta.channels.meta import DEFAULT_PROMOTE, DEFAULT_PROMOTE_WEIGHT
 from prospecta.channels import (
     QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
     run_channels, scope_members,
@@ -657,7 +657,7 @@ def _search_channels(
             from prospecta.stages import totals
             tr["calls"] = extract_calls + list(tr.get("calls") or [])
             tr["accounting"] = totals(tr["calls"])
-    if meta_cfg is not None:
+    if meta_cfg is not None and (meta_cfg.get("params") or {}).get("promote", DEFAULT_PROMOTE):
         # Scope promotion (design 8.5): hard filter with a small complete set
         # moves every member to the front; the filter never excludes.
         members = scope_members(plan, state.channel_lists.get("meta", []))
