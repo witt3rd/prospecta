@@ -15,6 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from prospecta._entities import resolve_entities
 from prospecta._llmutil import llm_call_record, llm_text
 from prospecta._template import render_prompt
 from prospecta.db.queries import _meta_param
@@ -28,19 +29,6 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_SCAN_RELEVANCE = 0.25
 MAP_ATTEMPTS = 2   # a failed batch is retried once, then surfaced
 DEFAULT_EXCERPT_CHARS = 6000   # a note longer than this is sent as its entity-mention paragraphs
-
-_ENTITIES_SQL = """
-SELECT e.id, e.name, e.norm FROM memory_entities e
-WHERE e.bank_id = %(bank)s
-  AND (e.norm = ANY(%(names)s)
-       OR e.id IN (SELECT a.entity_id FROM memory_entity_aliases a
-                   WHERE a.bank_id = %(bank)s AND a.norm = ANY(%(names)s)))
-"""
-
-_ALIASES_SQL = """
-SELECT a.alias, a.norm FROM memory_entity_aliases a
-WHERE a.bank_id = %(bank)s AND a.entity_id = ANY(%(ids)s)
-"""
 
 _NOTES_SQL = """
 WITH cand AS (
@@ -97,23 +85,8 @@ def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list
     """Everything the entity is called: `names` plus, for each entity whose norm
     or alias norm is one of them, its name and EVERY alias row. Returns
     (all names as written, normalised names, entity ids)."""
-    norms = sorted({_clean(n) for n in names if n.strip()})
-    if not norms:
-        raise ValueError("map-reduce recall needs an entity name")
-    written = list(dict.fromkeys(n.strip() for n in names if n.strip()))
-    ids: list = []
-    with conn.cursor() as cur:
-        cur.execute(_ENTITIES_SQL, {"bank": bank_id, "names": norms})
-        ents = cur.fetchall()
-        ids = [r[0] for r in ents]
-        written += [r[1] for r in ents]
-        norms += [r[2] for r in ents]
-        if ids:
-            cur.execute(_ALIASES_SQL, {"bank": bank_id, "ids": ids})
-            for alias, norm in cur.fetchall():
-                written.append(alias)
-                norms.append(norm)
-    return (list(dict.fromkeys(written)), sorted(set(norms)), ids)
+    r = resolve_entities(conn, bank_id, names)
+    return (r.names, sorted(set(r.norms) | {_clean(x) for x in r.people}), r.ids)
 
 
 def fetch_entity_notes(conn, bank_id: str, names: list[str],
@@ -204,7 +177,9 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
-    scan = [n for n in names if _clean(n) != _clean(entity)]   # alias strings, not the bare name
+    _, _, found = resolve_names(conn, bank_id, [entity, *(aliases or [])])
+    # alias strings, not the bare name; but when nothing resolved the bare name is all we have
+    scan = [n for n in names if _clean(n) != _clean(entity)] if found else list(names)
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
                                scan_relevance=scan_relevance)
     by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
