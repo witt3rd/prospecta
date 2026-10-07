@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from prospecta._entities import fold_path, resolve_entities
+from prospecta._entities import fold_path, norm_key, resolve_entities, same_name
 from prospecta._llmutil import llm_call_record, llm_text
 from prospecta._template import render_prompt
 from prospecta.db.queries import _meta_param
@@ -72,16 +72,12 @@ def _norm_fact(fact: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", fact.casefold())).strip()
 
 
-def _clean(n: str) -> str:
-    return re.sub(r"\s+", " ", n.strip().lower())
-
-
 def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list[str], list]:
     """Everything the entity is called: `names` plus, for each entity whose norm
     or alias norm is one of them, its name and EVERY alias row. Returns
     (all names as written, normalised names, entity ids)."""
     r = resolve_entities(conn, bank_id, names)
-    return (r.names, sorted(set(r.norms) | {_clean(x) for x in r.people}), r.ids)
+    return (r.names, sorted(set(r.norms) | {norm_key(x) for x in r.people}), r.ids)
 
 
 def fetch_entity_notes(conn, bank_id: str, names: list[str],
@@ -174,7 +170,7 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
     _, _, found = resolve_names(conn, bank_id, [entity, *(aliases or [])])
     # alias strings, not the bare name; but when nothing resolved the bare name is all we have
-    scan = [n for n in names if _clean(n) != _clean(entity)] if found else list(names)
+    scan = [n for n in names if not same_name(n, entity)] if found else list(names)
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
                                scan_relevance=scan_relevance)
     by_norm = {fold_path(src): (doc, src) for doc, src, _ in notes}
@@ -244,7 +240,7 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     return MapReduceResult(
         synthesis=text, items=items, citations=citations, progress=progress, calls=calls,
         notes_visited=visited, facts_found=len(items),
-        plan={"mode": "mapreduce", "entity": entity, "aliases": [n for n in names if _clean(n) != _clean(entity)],
+        plan={"mode": "mapreduce", "entity": entity, "aliases": [n for n in names if not same_name(n, entity)],
               "batch_size": batch_size, "n_notes": len(notes), "n_batches": n_batches,
               "metadata_filter": metadata_filter, "progress": progress,
               "raw_facts": len(raw_facts), "failed_notes": failed_notes})

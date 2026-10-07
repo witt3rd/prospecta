@@ -355,3 +355,17 @@ def test_mapreduce_citations_resolve_through_shared_fold(fresh_db):
     cites = [c for e in res.evidence for c in e["citations"]]
     assert cites and all(c["known"] and c["note"] == "People/Mr. Nelson.md" for c in cites)
     m.close()
+
+
+def test_mapreduce_alias_list_excludes_variants_of_the_entity(fresh_db):
+    from prospecta import _mapreduce
+    m = Memory(database_url=fresh_db, bank_id="b", llm=MapReduceLLM(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    body = "Nelson, also called Pip."
+    m.retain("---\nperson: Nelson\n---\n" + body, source="n.md", index_text=body)
+    with psycopg.connect(fresh_db) as conn:
+        res = _mapreduce.run_mapreduce(
+            conn, "b", "nicknames?", MapReduceLLM(), entity="Mr. Nelson",
+            aliases=["Nelson", "Mr Nelson", "Nélson", "Pippin"])
+    assert res.plan["aliases"] == ["Pippin"]
+    m.close()

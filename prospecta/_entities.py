@@ -63,6 +63,10 @@ def tokens(name: str) -> list[str]:
     return long or toks
 
 
+def same_name(a: str, b: str) -> bool:
+    return tokens(a) == tokens(b)
+
+
 def _tok_match(a: str, b: str) -> bool:
     return a == b or (min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a)))
 
@@ -83,7 +87,7 @@ class Resolution:
     people: list[str] = field(default_factory=list)  # documents.person values that match
 
 
-def _clean(n: str) -> str:
+def norm_key(n: str) -> str:
     return re.sub(r"\s+", " ", n.strip().lower())
 
 
@@ -93,8 +97,8 @@ def resolve_entities(conn, bank_id: str, names: list[str]) -> Resolution:
         raise ValueError("entity resolution needs a name")
     toks = sorted({t for n in given for t in tokens(n) if len(t) >= 2})
     pats = [f"%{t.replace('%', '').replace('_', '')}%" for t in toks] or ["%"]
-    p = {"bank": bank_id, "pats": pats, "norms": sorted({_clean(n) for n in given})}
-    written, norms = list(given), [_clean(n) for n in given]
+    p = {"bank": bank_id, "pats": pats, "norms": sorted({norm_key(n) for n in given})}
+    written, norms = list(given), [norm_key(n) for n in given]
     ids: list = []
     with conn.cursor() as cur:
         cur.execute(_ENTITIES_SQL, p)
