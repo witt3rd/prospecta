@@ -38,6 +38,7 @@ from pathlib import Path
 from prospecta._template import render_prompt
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.channels.registry import REGISTRY
+from prospecta._scorecut import CHANNEL_MIN_REL, POOL_MIN_REL
 from prospecta.stages import parse_json_object, read_recall_config
 
 MARGIN = 0.03
@@ -423,6 +424,11 @@ def format_report(r: dict) -> str:
     for name, s in r["full"]["stages"].items():
         if name.startswith("channel:") and s.get("errors"):
             L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
+    rr = (r.get("recall_config") or {}).get("rerank") or {}
+    chans = {e["name"]: (e.get("params") or {}).get("min_rel", CHANNEL_MIN_REL)
+             for e in r.get("channel_config") or [] if e["name"] in ("dense_chunk", "question", "bm25")}
+    L.append("cuts: channels " + (", ".join(f"{n} {v}" for n, v in chans.items()) or "none")
+             + f" (0 = no cut); rerank pool >= {rr.get('min_rel_score', POOL_MIN_REL)} x best fused score")
     L.append(f"full: {_fmt(r['full']['summary'])}")
     for c, s in r["full"]["summary"]["by_class"].items():
         L.append(f"  {c} (n={s['n']}): hit@1 {s['hit1']:.2f}  hit@10 {s['hit10']:.2f}  "

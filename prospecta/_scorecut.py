@@ -15,10 +15,14 @@ RESERVED_TOKENS = 4_000        # template, question and answer
 CHARS_PER_TOKEN = 4
 
 # Defaults chosen from the v0.2 eval design (docs/limits.md).
-POOL_MIN_REL = 0.4             # fused RRF score >= 0.4 x best fused
+# Pool cut = the size of the RERANK input only (quality/cost knob): fused score >= 0.15 x
+# best fused (the scout's knee); configurable down to 0.05 (recall_config.rerank.min_rel_score).
+POOL_MIN_REL = 0.15
+HOP_MIN_REL = 0.4              # new notes of a hop follow-up run: >= 0.4 x the best of that run
 READER_MIN_REL = 0.6           # rerank grade (0..3) or fused score >= 0.6 x best
-CHANNEL_MIN_REL = {"dense_chunk": 0.6, "question": 0.6, "bm25": 0.15}
-CHANNEL_DEFAULT_MIN_REL = 0.5
+# Retrieval channels do NOT cut: every candidate goes into fusion, bounded only by the
+# index fetch completing (semantic._scan_everything). `min_rel` stays an explicit per-bank override.
+CHANNEL_MIN_REL = 0.0
 FETCH_PAGE = 64                # rows per fetch (throughput; the fetch doubles until the cut is reached)
 
 

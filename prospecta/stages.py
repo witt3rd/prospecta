@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from prospecta._filters import coerce_date
-from prospecta._scorecut import (POOL_MIN_REL, READER_MIN_REL, rel_cut,
+from prospecta._scorecut import (HOP_MIN_REL, POOL_MIN_REL, READER_MIN_REL, rel_cut,
                                  RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, split_batches)
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
@@ -823,7 +823,7 @@ def read_all(reader, query: str, items: list[Item], calls: list[dict],
 
 def _hop(state, query, items, channel_config, rcfg, reranker, reader, calls, k):
     rel = float(rcfg.get("min_rel_score", READER_MIN_REL))
-    hop_rel = float(rcfg.get("hop_min_rel_score", POOL_MIN_REL))
+    hop_rel = float(rcfg.get("hop_min_rel_score", HOP_MIN_REL))
     seen = rel_cut(items, _read_score(items), rel)
     hops: dict = {"reader": reader.name, "verdict": None, "follow_ups": [],
                   "new_candidates": [], "rerank": None, "error": None,

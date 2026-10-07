@@ -6,7 +6,7 @@ unchanged). Set it with `Memory.set_recall_config(...)`.
 
 ```python
 mem.set_recall_config({
-  "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": 0.4,
+  "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": 0.15,
              "blend": {"enabled": False, "weight_rerank": 0.7, "weight_fused": 0.3, "floor": False}},
   "gate":   {"enabled": False, "threshold": 2.95},          # Jev, needs Memory(jev=...)
   "reader": {"enabled": False, "min_rel_score": 0.6, "hop_min_rel_score": 0.4},
