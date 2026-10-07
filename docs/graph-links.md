@@ -92,14 +92,14 @@ stay for the next run.
 STUB Jev with a per-call token cost model (nothing leaves the process); Postgres+pgvector
 real. Dense synthetic corpus: clusters of 226/170/130/110/100 notes (~40 percent of 1,845),
 a third of notes multi-chunk, exact duplicates, a planted causal partner every 10th note.
-Before = main at 6f0e54c. NOTE: the all-pairs figures below were measured with the note-level collapse (one pair per note pair); the chunk-level all-pairs now implemented costs more on multi-chunk notes, pending the scout's re-measure (connected figures are unchanged). Figures are modelled; the scout re-measures on the real corpus.
+Before = main at 6f0e54c. All-pairs figures are chunk-level (re-run). Figures are modelled; the scout re-measures on the real corpus.
 
 | notes | judged pairs/note: before / all-pairs / connected | calls/note: before / all-pairs / connected | cost USD: before / all-pairs / connected |
 |---|---|---|---|
-| 500  | 10.2 / 9.1 / 6.0   | 0.94 / 0.88 / 0.81 | 12.4 / 11.2 / 7.6 |
-| 1000 | 18.9 / 17.1 / 6.5  | 1.21 / 1.11 / 0.84 | 45.7 / 41.7 / 16.2 |
-| 1845 | 32.2 / 28.9 / 6.6  | 1.63 / 1.49 / 0.85 | 144.5 / 131.1 / 30.8 |
-| 3690 | 21.9 / 19.7 / 5.9  | 1.31 / 1.21 / 0.86 | 195.6 / 177.7 / 54.4 |
+| 500  | 10.2 / 10.2 / 6.0  | 0.94 / 0.93 / 0.81 | 12.4 / 12.4 / 7.6 |
+| 1000 | 18.9 / 18.9 / 6.5  | 1.21 / 1.20 / 0.84 | 45.7 / 45.6 / 16.2 |
+| 1845 | 32.2 / 32.1 / 6.6  | 1.63 / 1.62 / 0.85 | 144.5 / 144.4 / 30.8 |
+| 3690 | 21.9 / 21.9 / 5.9  | 1.31 / 1.29 / 0.86 | 195.6 / 195.5 / 54.4 |
 
 Recall (same corpus, ground truth from the generator): causal 100 percent in every mode and
 size; cluster connectivity 1.0 in every mode; semantic DIRECT pair recall (pairs of one
@@ -107,13 +107,15 @@ cluster with a link): before 0.78; all-pairs 0.84/0.78/0.78/0.78 (500/1000/1845/
 relative stop, not the cap, bounds it); connected 0.58/0.27/0.14/0.13.
 
 Scaling of all-pairs calls/note. Fixed absolute cluster sizes (above; growth past 1845
-adds unrelated notes): 0.88 / 1.11 / 1.49 / 1.21: a plateau. Worst case, every cluster
-growing with the bank (`BENCH_CLUSTERS=scaled`): 0.88 / 1.11 / 1.49 / 2.20 calls/note and
-judged pairs/note 9 / 17 / 29 / 52: NOT near-linear: per-note work grows with the cluster
-size, i.e. near-quadratic in the cluster (judging all pairs of a cluster is inherently
-so); `connected` stays flat at ~6 judged pairs/note in both. The stub's calls/note is
-below the real 6-20 because synthetic notes have few anchors; the real driver was
-chunk-level pairs (all-pairs is chunk-level again; connected is one pair per note pair).
+adds unrelated notes): 0.93 / 1.20 / 1.62 / 1.29 calls/note: a plateau. Worst case, every
+cluster growing with the bank (`BENCH_CLUSTERS=scaled`): 0.93 / 1.20 / 1.62 / 2.41 calls/note,
+judged pairs/note 10 / 19 / 32 / 58, cost USD 12.4 / 45.6 / 144.4 / 522.6, direct recall at
+3690 0.73. Calls/note grows about 2.6x over 7.4x notes in the worst case: mildly
+super-linear, not quadratic in calls/note; judged pairs/note grows with cluster size
+(judging all pairs of a cluster is inherently so); `connected` stays flat at ~6 judged
+pairs/note in both. The stub's calls/note is below the real 6-20 because synthetic notes
+have few anchors; the real driver was chunk-level pairs (all-pairs is chunk-level again;
+connected is one pair per note pair).
 
 Recall note: the benchmark's ground truth is note-level and cannot see a lost chunk-level
 link; `tests/test_graph_links.py` has a chunk-level test (a link from a note's non-first chunk):
