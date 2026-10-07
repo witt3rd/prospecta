@@ -29,10 +29,10 @@ class MapReduceLLM:
             self.reduce_prompts.append(text)
             if self.bad_reduce:
                 return "not json at all"
-            facts: dict[str, list[str]] = {}
-            for fact, note in re.findall(r"^- (.*) \[(.*)\]$", text, re.M):
-                facts.setdefault(fact.casefold().strip(), []).append(note)
-            items = [{"fact": k, "notes": v} for k, v in facts.items()]
+            groups: dict[str, list[int]] = {}
+            for n, fact in re.findall(r"^(\d+)\. (.*) \[.*\]$", text, re.M):
+                groups.setdefault(fact.casefold().strip(), []).append(int(n))
+            items = [{"fact": k, "ids": v} for k, v in groups.items()]
             return LLMResult(json.dumps({"items": items}), model="stub-sonnet",
                              tokens_in=10, tokens_out=5, cost_usd=0.002)
         self.map_prompts.append(text)
@@ -152,3 +152,87 @@ def test_excerpt_long_note_keeps_entity_paragraphs():
     text = "intro\n\n" + "filler\n\n" * 50 + "Pat is also called Pip.\n\n" + "tail\n\n" * 50
     out = excerpt(text, ["Pat"], max_chars=100)
     assert "Pip" in out and "filler" not in out and out.startswith("intro")
+
+
+# ---------------------------------------------------------------- regression: Greg's names
+
+NICKS = ["Wizard of Oz", "Gregsy"]
+PENS = ["Ann Archer", "Jay Fenwick", "Mara Quill"]
+ALL5 = NICKS + PENS
+
+
+class RealisticLLM:
+    """Behaves like the real replies: the map step extracts names of any kind only
+    when the prompt tells it to (otherwise only the word the question used);
+    some replies hold the JSON twice around a prose line; the reduce step
+    leaves singletons out of its groups."""
+
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self, messages, *, json_mode=False):
+        text = messages[-1]["content"]
+        self.n += 1
+        if "## Extracted facts" in text:
+            groups: dict[str, list[int]] = {}
+            for n, fact in re.findall(r"^(\d+)\. (.*) \[.*\]$", text, re.M):
+                groups.setdefault(fact.casefold().strip(), []).append(int(n))
+            multi = [{"fact": k, "ids": v} for k, v in groups.items() if len(v) > 1]
+            body = json.dumps({"items": multi})   # singletons are left out
+        else:
+            every = "extract EVERY name" in text
+            facts = []
+            for src, nt in re.findall(r"### \[(.*?)\]\n(.*?)(?=\n### \[|\Z)",
+                                      text.split("## Notes")[1], re.S):
+                for kind, name in re.findall(r"(nickname|pen name) (.+?)[.;]", nt):
+                    if every or kind == "nickname":
+                        facts.append({"fact": f"name {name}", "note": src})
+            body = json.dumps({"facts": facts})
+            if self.n % 2 == 0:
+                body = f"{body}\nHere is the JSON again:\n{body}"
+        return LLMResult(body, model="stub-sonnet", tokens_in=10, tokens_out=5, cost_usd=0.001)
+
+
+def test_mapreduce_greg_all_five_names_among_200_notes(fresh_db):
+    llm = RealisticLLM()
+    m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    # 9 gold notes: 3 by documents.person, 2 by an entity row, 4 only by alias text
+    gold = {
+        "g1.md": ("Greg", "Greg, nickname Wizard of Oz."),
+        "g2.md": ("Greg", "Greg's pen name Ann Archer; nickname Gregsy."),
+        "g3.md": ("Greg", "Wrote as pen name Jay Fenwick."),
+        "g4.md": ("", "Entity-linked note: nickname Wizard of Oz."),
+        "g5.md": ("", "Entity-linked note: nickname Gregsy."),
+        "g6.md": ("", "Ann Archer wrote this; pen name Mara Quill."),     # alias text only
+        "g7.md": ("", "A cast list. Ann Archer appears; nickname Wizard of Oz."),
+        "g8.md": ("", "Reading night: Mara Quill. pen name Jay Fenwick."),
+        "g9.md": ("", "Another day with the Gregsy: nickname Gregsy."),
+    }
+    for src, (person, body) in gold.items():
+        front = f"---\nperson: {person}\n---\n" if person else ""
+        m.retain(front + body, source=src, index_text=body)
+    for i in range(191):
+        m.retain(f"Plain note {i} about nothing in particular.", source=f"n{i}.md",
+                 index_text=f"plain {i}")
+    with psycopg.connect(fresh_db) as conn:
+        ids = {s_: i for i, s_ in conn.execute("SELECT id, source FROM documents WHERE bank_id='b'")}
+        eid = conn.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
+                           "VALUES ('b', 'Greg', 'greg', 'person') RETURNING id").fetchone()[0]
+        for src in ("g4.md", "g5.md"):
+            item = conn.execute("SELECT id FROM memory_items WHERE document_id = %s LIMIT 1",
+                                (ids[src],)).fetchone()[0]
+            conn.execute("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)",
+                         (item, eid))
+        for alias in ("Ann Archer", "Mara Quill", "Jay Fenwick", "Gregsy"):   # no row for Wizard of Oz
+            conn.execute("INSERT INTO memory_entity_aliases (bank_id, norm, alias, entity_id) "
+                         "VALUES ('b', %s, %s, %s)", (alias.lower(), alias, eid))
+        conn.commit()
+    assert len(ids) == 200
+    res = m.recall_mapreduce("what are Greg's nicknames?", entity="Greg", batch_size=4)
+    assert {e["fact"].casefold() for e in res.evidence} == {f"name {n}".casefold() for n in ALL5}
+    assert {c["note"] for c in res.citations} == set(gold)   # all nine gold notes read and cited
+    assert res.synth_call["notes_visited"] == 9
+    for n in ALL5:
+        assert n.casefold() in res.synthesis.casefold()
+    m.close()
