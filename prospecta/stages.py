@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from prospecta._filters import coerce_date
-from prospecta._scorecut import (HOP_MIN_REL, POOL_MIN_REL, READER_MIN_REL, rel_cut,
+from prospecta._scorecut import (HOP_MIN_REL, check_depth, pool_min_rel, POOL_MIN_REL, READER_MIN_REL, rel_cut,
                                  RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, split_batches)
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
@@ -89,8 +89,9 @@ def validate_recall_config(cfg: dict) -> None:
     if not isinstance(cfg, dict):
         raise ValueError("recall_config must be an object")
     for key in cfg:
-        if key not in ("rerank", "gate", "reader", "evidence"):
+        if key not in ("rerank", "gate", "reader", "evidence", "depth"):
             raise ValueError(f"unknown recall_config key {key!r}")
+    check_depth(cfg.get("depth"))
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
     if rr.get("stage", "sonnet_listwise") not in STAGES:
         raise ValueError(f"rerank.stage must be one of {STAGES}")
@@ -725,7 +726,7 @@ class StageDeps:
 
 def run_stages(
     state: RecallState, query: str, fused: list[FusedDoc], channel_config: list[dict],
-    recall_cfg: dict, deps: StageDeps, *, k: int = 60,
+    recall_cfg: dict, deps: StageDeps, *, k: int = 60, depth: str | None = None,
 ) -> tuple[list[FusedDoc], dict]:
     """Rerank, then (optionally) read and hop. Returns the final document
     order (all pool docs, best first) and {rerank, hops, calls, **totals}."""
@@ -733,22 +734,22 @@ def run_stages(
     trace: dict = {"rerank": None, "hops": None, "calls": calls, **totals(calls)}
     try:
         return _run_stages(state, query, fused, channel_config, recall_cfg, deps, k,
-                           calls, trace)
+                           calls, trace, depth)
     except Exception as exc:
         trace.update(rerank=None, hops=None, **totals(calls),
                      fallback_reason=f"{type(exc).__name__}: {exc}")
         return fused, trace
 
 
-def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls, trace):
+def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls, trace,
+                depth=None):
     reranker = build_reranker(recall_cfg, llm=deps.llm, jev=deps.jev, model=deps.model)
     reader_cfg = recall_cfg.get("reader") or {}
     if reranker is None and not reader_cfg.get("enabled"):
         trace.update(totals(calls))
         return fused, trace
 
-    pool = rel_cut(fused, lambda d: d.score,
-                   float((recall_cfg.get("rerank") or {}).get("min_rel_score", POOL_MIN_REL)))
+    pool = rel_cut(fused, lambda d: d.score, pool_min_rel(depth, recall_cfg))
     in_pool = {d.document_id for d in pool}
     tail = [d for d in fused if d.document_id not in in_pool]
     items = build_items(state.conn, pool)

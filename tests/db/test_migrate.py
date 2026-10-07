@@ -50,8 +50,8 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 3 in result["applied"]
     assert 4 in result["applied"]
     assert 10 in result["applied"]
-    # Highest applied is now 13 (0013_doc_date_created_on).
-    assert get_schema_version(fresh_db) == 14
+    # Highest applied is now 15 (0015_recall_depth).
+    assert get_schema_version(fresh_db) == 15
 
 
 def test_run_migrations_idempotent(fresh_db):
@@ -63,7 +63,7 @@ def test_run_migrations_idempotent(fresh_db):
     assert 3 in result["skipped"]
     assert 4 in result["skipped"]
     assert 10 in result["skipped"]
-    assert get_schema_version(fresh_db) == 14
+    assert get_schema_version(fresh_db) == 15
 
 
 def test_all_required_tables_exist(fresh_db):

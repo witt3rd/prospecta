@@ -13,6 +13,9 @@ mem.set_recall_config({
 })
 ```
 
+- **Depth** (`standard` | `deep`): the named rerank pool cut. `standard` = 0.15 x the
+  best fused score (the default; automatic per-turn recall), `deep` = 0.05 (explicit
+  recall, set/discovery questions, map-reduce). See "Recall depth" below.
 - **Sonnet rerank** (`SonnetListwise`): every fused note scoring >= `min_rel_score` x the best fused score (batched by the model window, see `limits.md`), one best chunk (in
   full, never clipped) per note under a header of note name, date and person; the model replies
   JSON `{grades, ranking}`; order = ranking, then grade, then fused order. Any
@@ -54,3 +57,34 @@ mem.set_recall_config({
 
 The model is `Memory(rerank_llm=..., rerank_model=...)`, falling back to `llm`;
 the intended one is `anthropic/claude-sonnet-5.5` through OpenRouter.
+
+## Recall depth
+
+Two depths set the rerank pool cut (the size of the reranker's input):
+
+| depth | pool cut (x best fused score) | use |
+|---|---|---|
+| `standard` (default) | 0.15 | automatic per-turn recall |
+| `deep` | 0.05 | explicit recall, set/discovery questions, map-reduce |
+
+The parameter is named exactly **`depth`**, with the values `"standard"` and `"deep"`
+(anything else raises `ValueError`; `None`/omitted = not set). Precedence, first that applies:
+
+1. the per-call `depth`;
+2. an explicit `recall_config.rerank.min_rel_score` (a raw cut, kept for back-compat);
+3. the bank default `recall_config.depth` (`mem.set_recall_config({"depth": "deep", ...})`);
+4. `standard`.
+
+Where it is accepted (providers pass it straight through):
+
+- `Memory.recall(queries, ..., depth="deep")`, `Memory.search(text, ..., depth="deep")`,
+  `Memory.recall_synth(message, ..., depth="deep")`, `Memory.recall_mapreduce(message, ..., depth=...)`.
+  `recall_synth(grounded=True, scope=[...])` (a set question) defaults to `deep`, and
+  `recall_mapreduce` defaults to `deep`, unless `depth` is given. (Prospecta has no MCP/HTTP
+  surface; the Memory API is the surface.)
+- CLI: `prospecta search QUERY --depth {standard,deep}` and
+  `prospecta eval QUESTIONS.md --depth {standard,deep}`.
+- `prospecta eval` records the depth used: `report["depth"]` in `--json`, and the report line
+  `cuts: ... rerank pool >= 0.05 x best fused score (depth: deep)`.
+- Trace: `recall_events.depth` (migration 0015; NULL on legacy rows) holds the depth of each
+  recall, including shadow-pair events.

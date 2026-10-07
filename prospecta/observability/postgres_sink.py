@@ -145,6 +145,7 @@ class PostgresSink:
                 tokens_out=p.get("tokens_out"),
                 n_llm_calls=p.get("n_llm_calls"),
                 citations=p.get("citations"),
+                depth=p.get("depth"),
             )
             conn.commit()
 

@@ -71,6 +71,7 @@ def _channel_trace_payload(traces: "list[dict]") -> dict:
         channels.extend({**c, "query_index": qi} for c in t["channels"])
         candidates.extend({**c, "query_index": qi} for c in t["candidates"])
     out = {
+        "depth": traces[0].get("depth"),
         "plan": {"queries": [t["plan"] for t in traces]},
         "channels": channels,
         "fusion": {**traces[0]["fusion"], "per_query": [t["fusion"] for t in traces]},
@@ -444,8 +445,13 @@ class Memory:
         mode: "Literal['hybrid','semantic','lexical']" = "hybrid",
         metadata_filter: dict | None = None,
         rrf_k: int = 60,
+        depth: "Literal['standard','deep'] | None" = None,
     ) -> "list[RecalledMemory]":
         """Run retrieval for multiple queries; return FLAT list[RecalledMemory].
+
+        `depth` ('standard' | 'deep'; None = the bank's recall_config.depth,
+        else 'standard') sets the rerank pool cut: 0.15 vs 0.05 x the best fused
+        score. It is recorded in recall_events.depth.
 
         Each query runs its own search(); results concatenated preserving
         query order and intra-query rank. Duplicate memory_item_ids across
@@ -474,6 +480,7 @@ class Memory:
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
                 _trace=traces,
+                depth=depth,
             )
             flat.extend(results)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
@@ -501,7 +508,7 @@ class Memory:
             run_shadow_recall(
                 self, coerced, flat, mode=mode, limit=limit,
                 metadata_filter=metadata_filter, rrf_k=rrf_k,
-                primary_duration_ms=duration_ms,
+                primary_duration_ms=duration_ms, depth=depth,
             )
 
         return flat
@@ -586,6 +593,7 @@ class Memory:
         grounded: bool = False,
         scope: "list[str] | None" = None,
         evidence_top: int | None = None,
+        depth: "Literal['standard','deep'] | None" = None,
     ) -> RAGResult:
         """Chain: formulate_queries → recall → synthesize. Returns RAGResult.
 
@@ -606,10 +614,17 @@ class Memory:
         (the filter set); `evidence_top` None keeps the notes scoring at least
         half the top score, and a set question uses the whole scope set of any
         size whatever the top.
+
+        `depth` as in recall(); None defaults to 'deep' for a set question (an
+        explicit `scope`) and otherwise to the bank's default depth.
         """
         import time as _time
 
         from prospecta import _rag
+        from prospecta._scorecut import check_depth
+        check_depth(depth)
+        if depth is None and grounded and scope:
+            depth = "deep"
 
         if self._llm is None:
             raise RuntimeError(
@@ -642,6 +657,7 @@ class Memory:
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
                 _trace=traces,
+                depth=depth,
             )
             queries_to_results[q.text] = results
             flat_results.extend(results)
@@ -734,6 +750,7 @@ class Memory:
         metadata_filter: dict | None = None,
         batch_size: int | None = None,
         on_progress=None,
+        depth: "Literal['standard','deep'] | None" = None,
     ) -> RAGResult:
         """Map-reduce recall for SET / discovery questions (``what are X's
         nicknames``): every note tied to `entity` (documents.person, the entity
@@ -742,7 +759,11 @@ class Memory:
         merged into one deduplicated cited list (RAGResult.synthesis,
         .citations). Completeness over speed. Cost, notes visited and facts
         found are recorded per batch in recall_events.plan (mode 'mapreduce').
+        Map-reduce reads the whole entity set (no rerank pool), so `depth`
+        defaults to 'deep' and is recorded in recall_events.depth.
         """
+        from prospecta._scorecut import check_depth
+        depth = check_depth(depth) or "deep"
         import time as _time
 
         from prospecta import _mapreduce
@@ -788,6 +809,7 @@ class Memory:
                 "synthesis": res.synthesis,
                 "citations": res.citations,
                 "plan": res.plan,
+                "depth": depth,
                 **tot,
             })
         except Exception:  # pragma: no cover

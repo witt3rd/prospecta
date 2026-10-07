@@ -18,12 +18,39 @@ CHARS_PER_TOKEN = 4
 # Pool cut = the size of the RERANK input only (quality/cost knob): fused score >= 0.15 x
 # best fused (the scout's knee); configurable down to 0.05 (recall_config.rerank.min_rel_score).
 POOL_MIN_REL = 0.15
+# Recall depths: the named rerank-pool cut. `standard` is the default (automatic per-turn
+# recall); `deep` is for explicit recall, set/discovery questions and map-reduce.
+DEPTHS = {"standard": POOL_MIN_REL, "deep": 0.05}
+DEFAULT_DEPTH = "standard"
 HOP_MIN_REL = 0.4              # new notes of a hop follow-up run: >= 0.4 x the best of that run
 READER_MIN_REL = 0.6           # rerank grade (0..3) or fused score >= 0.6 x best
 # Retrieval channels do NOT cut: every candidate goes into fusion, bounded only by the
 # index fetch completing (semantic._scan_everything). `min_rel` stays an explicit per-bank override.
 CHANNEL_MIN_REL = 0.0
 FETCH_PAGE = 64                # rows per fetch (throughput; the fetch doubles until the cut is reached)
+
+
+def check_depth(depth: str | None) -> str | None:
+    """None (unset) or a valid depth name; anything else is a ValueError."""
+    if depth is not None and depth not in DEPTHS:
+        raise ValueError(f"depth must be one of {sorted(DEPTHS)}, got {depth!r}")
+    return depth
+
+
+def resolve_depth(depth: str | None, recall_cfg: dict | None) -> str:
+    """Per-call depth, else the bank's recall_config.depth, else standard."""
+    return check_depth(depth) or check_depth((recall_cfg or {}).get("depth")) or DEFAULT_DEPTH
+
+
+def pool_min_rel(depth: str | None, recall_cfg: dict | None) -> float:
+    """Rerank pool cut: an explicit per-call depth wins, then an explicit
+    recall_config.rerank.min_rel_score, then the bank's default depth."""
+    if depth is not None:
+        return DEPTHS[check_depth(depth)]
+    explicit = ((recall_cfg or {}).get("rerank") or {}).get("min_rel_score")
+    if explicit is not None:
+        return float(explicit)
+    return DEPTHS[resolve_depth(None, recall_cfg)]
 
 
 def rel_cut(items: Sequence[T], score: Callable[[T], float], rel: float) -> list[T]:

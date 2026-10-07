@@ -47,6 +47,7 @@ def run_shadow_recall(
     metadata_filter: dict | None,
     rrf_k: int,
     primary_duration_ms: int,
+    depth: str | None = None,
 ) -> None:
     """Run the shadow recall and store both sides in recall_events. Never raises."""
     from prospecta._tracer import NoOpTracer
@@ -68,6 +69,7 @@ def run_shadow_recall(
                 flat.extend(shadow_mem.search(
                     q.text, mode=mode, limit=limit,
                     metadata_filter=metadata_filter, rrf_k=rrf_k,
+                    depth=depth,
                 ))
         finally:
             shadow_mem.close()
@@ -103,6 +105,7 @@ def run_shadow_recall(
                 }},
                 "results": _serialize_recall_results(results),
                 "synthesis": None,
+                "depth": depth,
             })
     except Exception:
         logger.exception("could not store shadow recall events")

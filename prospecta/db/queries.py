@@ -354,6 +354,7 @@ def append_recall_event(
     tokens_out: int | None = None,
     n_llm_calls: int | None = None,
     citations: list[dict] | None = None,
+    depth: str | None = None,
 ) -> int:
     """INSERT a row into recall_events (and its recall_event_candidates).
 
@@ -377,14 +378,14 @@ def append_recall_event(
             INSERT INTO recall_events
                 (bank_id, queries, mode, n_results, duration_ms, trace,
                  results, synthesis, plan, channels, fusion, rerank, hops,
-                 cost_usd, tokens_in, tokens_out, n_llm_calls, citations)
+                 cost_usd, tokens_in, tokens_out, n_llm_calls, citations, depth)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
                  %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
                  %(results)s::jsonb, %(synthesis)s, %(plan)s::jsonb,
                  %(channels)s::jsonb, %(fusion)s::jsonb, %(rerank)s::jsonb,
                  %(hops)s::jsonb, %(cost_usd)s, %(tokens_in)s,
-                 %(tokens_out)s, %(n_llm_calls)s, %(citations)s::jsonb)
+                 %(tokens_out)s, %(n_llm_calls)s, %(citations)s::jsonb, %(depth)s)
             RETURNING id
             """,
             {
@@ -406,6 +407,7 @@ def append_recall_event(
                 "tokens_out": tokens_out,
                 "n_llm_calls": n_llm_calls,
                 "citations": _dumps(citations),
+                "depth": depth,
             },
         )
         event_id = cur.fetchone()[0]

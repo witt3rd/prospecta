@@ -38,7 +38,7 @@ from pathlib import Path
 from prospecta._template import render_prompt
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.channels.registry import REGISTRY
-from prospecta._scorecut import CHANNEL_MIN_REL, POOL_MIN_REL
+from prospecta._scorecut import CHANNEL_MIN_REL
 from prospecta.stages import parse_json_object, read_recall_config
 
 MARGIN = 0.03
@@ -252,7 +252,7 @@ def _calls_by_stage(calls: list[dict]) -> dict:
 
 
 def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
-             *, pool: int | None = None, rrf_k: int = 60) -> tuple[list[str], dict]:
+             *, pool: int | None = None, rrf_k: int = 60, depth: str | None = None) -> tuple[list[str], dict]:
     """One recall under an explicit config (nothing is written to the bank).
     Returns (note names best first, {stage: {n, latency_ms, cost_usd, ...}})."""
     from prospecta._index import _search_channels
@@ -263,7 +263,8 @@ def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
     # the production path: filter extraction, channels, stages, hop, scope promotion
     recalled = _search_channels(
         memory, query, memory.default_bank_id, channel_config, limit=len_all if pool is None else pool,
-        metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {})
+        metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {},
+        depth=depth)
     tr = trace[0]
     for c in tr["channels"]:
         stages[f"channel:{c['name']}"] = {
@@ -289,11 +290,12 @@ def _add_stages(total: dict, one: dict) -> None:
 
 
 def run_variant(memory, questions: list[Question], channel_config: list[dict],
-                recall_cfg: dict, *, pool: int | None = None) -> dict:
+                recall_cfg: dict, *, pool: int | None = None,
+                depth: str | None = None) -> dict:
     per_q: list[dict] = []
     stages: dict[str, dict] = {}
     for q in questions:
-        ranked, st = retrieve(memory, q.text, channel_config, recall_cfg, pool=pool)
+        ranked, st = retrieve(memory, q.text, channel_config, recall_cfg, pool=pool, depth=depth)
         _add_stages(stages, st)
         row = {"id": q.id, "cls": q.cls, "n_gold": len(q.gold),
                "gold": score_ranking(ranked, q.gold), "top": ranked[:TOP]}
@@ -364,10 +366,15 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
 
 def run_eval(memory, questions: list[Question], *, ablate: bool = False,
              synth: bool = False, judge: bool = False, pool: int | None = None,
-             rerank_blend: bool | None = None, scope_promote: bool | None = None) -> dict:
+             rerank_blend: bool | None = None, scope_promote: bool | None = None,
+             depth: str | None = None) -> dict:
     """Score the bank as configured; optionally ablate and synthesise.
     `rerank_blend` / `scope_promote` (None = keep config) force the rerank blend
-    and the scope-promotion re-sort on or off for this run."""
+    and the scope-promotion re-sort on or off for this run. `depth` ('standard' |
+    'deep'; None = the bank's recall_config.depth, else standard) sets the rerank
+    pool cut; the report records the depth used."""
+    from prospecta._scorecut import check_depth, pool_min_rel, resolve_depth
+    check_depth(depth)
     with memory._pool.connection() as conn:
         from prospecta.channels import read_channel_config
         channel_config = read_channel_config(conn, memory.default_bank_id)
@@ -389,13 +396,14 @@ def run_eval(memory, questions: list[Question], *, ablate: bool = False,
         "bank": memory.default_bank_id, "n_questions": len(questions),
         "channel_config": channel_config, "recall_config": recall_cfg,
         "legacy_bank_scored_with_defaults": legacy, "margin": MARGIN,
+        "depth": resolve_depth(depth, recall_cfg),
     }
-    full = run_variant(memory, questions, channel_config, recall_cfg, pool=pool)
+    full = run_variant(memory, questions, channel_config, recall_cfg, pool=pool, depth=depth)
     report["full"] = full
     if ablate:
         report["ablations"] = []
         for v in ablation_variants(channel_config, recall_cfg):
-            res = run_variant(memory, questions, v["channels"], v["stages"], pool=pool)
+            res = run_variant(memory, questions, v["channels"], v["stages"], pool=pool, depth=depth)
             vd = verdict(full["summary"], res["summary"], v["kind"])
             report["ablations"].append({
                 "name": v["name"], "kind": v["kind"], "target": v["target"],
@@ -424,11 +432,13 @@ def format_report(r: dict) -> str:
     for name, s in r["full"]["stages"].items():
         if name.startswith("channel:") and s.get("errors"):
             L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
-    rr = (r.get("recall_config") or {}).get("rerank") or {}
+    from prospecta._scorecut import pool_min_rel
     chans = {e["name"]: (e.get("params") or {}).get("min_rel", CHANNEL_MIN_REL)
              for e in r.get("channel_config") or [] if e["name"] in ("dense_chunk", "question", "bm25")}
     L.append("cuts: channels " + (", ".join(f"{n} {v}" for n, v in chans.items()) or "none")
-             + f" (0 = no cut); rerank pool >= {rr.get('min_rel_score', POOL_MIN_REL)} x best fused score")
+             + f" (0 = no cut); rerank pool >= "
+             f"{pool_min_rel(r.get('depth'), r.get('recall_config'))} x best fused score "
+             f"(depth: {r.get('depth', 'standard')})")
     L.append(f"full: {_fmt(r['full']['summary'])}")
     for c, s in r["full"]["summary"]["by_class"].items():
         L.append(f"  {c} (n={s['n']}): hit@1 {s['hit1']:.2f}  hit@10 {s['hit10']:.2f}  "
