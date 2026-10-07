@@ -2,6 +2,8 @@
 cost and latency per stage, synthesis + judge. LLM and embedder are stubs."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import json
 import re
 from types import SimpleNamespace
@@ -145,7 +147,7 @@ def mem(fresh_db):
     llm = EvalLLM()
     m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     for src, text in NOTES.items():
         m.retain(text, source=src, index_text=text)
     with psycopg.connect(fresh_db) as conn:
@@ -162,7 +164,7 @@ def mem(fresh_db):
 
 def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     qs = ev.parse_questions(QUESTIONS_MD)
-    base, _ = ev.retrieve(mem, qs[0].text, DEFAULT_CHANNEL_CONFIG, {})
+    base, _ = ev.retrieve(mem, qs[0].text, no_cut(DEFAULT_CHANNEL_CONFIG), {})
     assert base[0] == "alpha.md"
     # the reversing reranker moves the worst fused note to the top: make it the gold
     worst = base[-1]
@@ -251,7 +253,7 @@ def test_parse_questions_md_qblocks():
 
 
 def test_eval_runs_production_path_and_reports_channel_errors(mem):
-    _, st = ev.retrieve(mem, "what did alpha say", DEFAULT_CHANNEL_CONFIG, {})
+    _, st = ev.retrieve(mem, "what did alpha say", no_cut(DEFAULT_CHANNEL_CONFIG), {})
     assert "channel:meta" in st
     bad = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
     bad["full"]["stages"]["channel:dense_chunk"].update(errors=2, last_error="boom: dim")

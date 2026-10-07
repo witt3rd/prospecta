@@ -38,7 +38,7 @@ class MetadataScope:
     name = NAME
     kind = "filter"
 
-    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int) -> list[Candidate]:
+    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         f = plan.filters
         if not (f.people or f.date_from or f.date_to):
             return []
@@ -54,7 +54,7 @@ class MetadataScope:
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         rows.sort(key=lambda r: (-float(r["sem_score"]), r["source"] or "", str(r["document_id"])))
         out = []
-        for r in rows[:limit]:
+        for r in rows:   # the whole filter set; scope is not a count
             sem = float(r["sem_score"])
             out.append(Candidate(
                 document_id=str(r["document_id"]), item_id=str(r["item_id"]),

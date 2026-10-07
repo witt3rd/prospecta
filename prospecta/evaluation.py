@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -250,16 +251,17 @@ def _calls_by_stage(calls: list[dict]) -> dict:
 
 
 def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
-             *, pool: int = 30, rrf_k: int = 60) -> tuple[list[str], dict]:
+             *, pool: int | None = None, rrf_k: int = 60) -> tuple[list[str], dict]:
     """One recall under an explicit config (nothing is written to the bank).
     Returns (note names best first, {stage: {n, latency_ms, cost_usd, ...}})."""
     from prospecta._index import _search_channels
+    len_all = sys.maxsize   # the whole score-selected pool is scored; a count only if asked
     stages: dict[str, dict] = {}
     t0 = time.monotonic()
     trace: list = []
     # the production path: filter extraction, channels, stages, hop, scope promotion
     recalled = _search_channels(
-        memory, query, memory.default_bank_id, channel_config, limit=pool,
+        memory, query, memory.default_bank_id, channel_config, limit=len_all if pool is None else pool,
         metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {})
     tr = trace[0]
     for c in tr["channels"]:
@@ -286,7 +288,7 @@ def _add_stages(total: dict, one: dict) -> None:
 
 
 def run_variant(memory, questions: list[Question], channel_config: list[dict],
-                recall_cfg: dict, *, pool: int = 30) -> dict:
+                recall_cfg: dict, *, pool: int | None = None) -> dict:
     per_q: list[dict] = []
     stages: dict[str, dict] = {}
     for q in questions:
@@ -360,7 +362,7 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
 
 
 def run_eval(memory, questions: list[Question], *, ablate: bool = False,
-             synth: bool = False, judge: bool = False, pool: int = 30) -> dict:
+             synth: bool = False, judge: bool = False, pool: int | None = None) -> dict:
     """Score the bank as configured; optionally ablate and synthesise."""
     with memory._pool.connection() as conn:
         from prospecta.channels import read_channel_config

@@ -140,7 +140,7 @@ class GraphExpand:
         best = top[0][1]
         return [d for d, _ in top], [s / best for _, s in top]
 
-    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int) -> list[Candidate]:
+    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         p = self.params
         docs, ws = self.seeds(state, int(p.get("seeds", DEFAULT_SEEDS)))
         if not docs:
@@ -174,6 +174,6 @@ class GraphExpand:
                         "via": list(r["via"]), "content": r["content"],
                         "metadata": r.get("metadata") or {}},
             ))
-            if len(out) >= limit:
+            if limit is not None and len(out) >= limit:
                 break
         return out

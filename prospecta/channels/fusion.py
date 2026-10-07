@@ -22,11 +22,12 @@ def fuse(
     weights: dict[str, float],
     *,
     k: int = 60,
-    pool: int = 30,
+    pool: int | None = None,
 ) -> list[FusedDoc]:
     """Fuse per-channel candidate lists. Channels with weight 0 (or absent
     from `weights`) contribute nothing. A document appearing twice in one
-    channel counts once, at its best (lowest) rank."""
+    channel counts once, at its best (lowest) rank. `pool` None (default)
+    returns every fused document; the score cut is the caller's (stages)."""
     acc: dict[str, dict] = {}
     for channel in sorted(lists):
         w = float(weights.get(channel, 0.0))
@@ -54,4 +55,4 @@ def fuse(
         for doc, d in acc.items() if d["score"] > 0
     ]
     fused.sort(key=lambda f: (-f.score, f.source, f.document_id))
-    return fused[:pool]
+    return fused if pool is None else fused[:pool]

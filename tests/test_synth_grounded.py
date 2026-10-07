@@ -2,6 +2,8 @@
 The LLM is a stub; evidence is checked in the prompt it receives."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import json
 
 import psycopg
@@ -41,7 +43,7 @@ def mem(fresh_db):
     llm = SynthLLM()
     m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     for src, chunks in NOTES.items():
         m.retain("\n".join(chunks), source=src, index_text="\n".join(chunks))
     with psycopg.connect(fresh_db) as conn:
@@ -171,7 +173,7 @@ def _bare(answer="Cats [alpha.md]"):
 def _seeded(fresh_db, **kw):
     m = Memory(database_url=fresh_db, bank_id="b", embed=stub_embed, **kw)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     m.retain("cat sat", source="alpha.md", index_text="cat sat")
     return m
 

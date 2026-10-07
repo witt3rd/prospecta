@@ -91,3 +91,15 @@ def restore_module_patches(mem: "Memory") -> None:
             delattr(mem, "_test_orig_generate_index_text")
         except AttributeError:
             pass
+
+
+def no_cut(config: list[dict]) -> list[dict]:
+    """A channel config whose recall channels keep every candidate (min_rel 0):
+    for tests on tiny stub-embedder banks where cosines are not meaningful."""
+    out = []
+    for e in config:
+        e = dict(e)
+        if e["name"] in ("dense_chunk", "question", "bm25"):
+            e["params"] = {**(e.get("params") or {}), "min_rel": 0}
+        out.append(e)
+    return out

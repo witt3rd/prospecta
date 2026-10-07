@@ -18,12 +18,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from prospecta._filters import coerce_date
+from prospecta._scorecut import (POOL_MIN_REL, READER_MIN_REL, rel_cut,
+                                 RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, split_batches)
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
 from prospecta.channels.recall import run_channels
 
-RERANK_POOL = 30
+BATCH_ATTEMPTS = 2             # a failed batch is retried once, then surfaced
 JEV_BATCH = 15                 # candidates per Jev request (Spire's RANK_POOL is 16)
 JEV_MAX_BATCH = 16
 JEV_INPUT_BYTES = 60_000
@@ -72,12 +74,12 @@ STAGES = ("sonnet_listwise", "jev_score")
 BLEND_DEFAULTS = {"weight_rerank": 0.7, "weight_fused": 0.3, "keep": 3, "within": 10}
 
 DEFAULT_RECALL_CONFIG: dict = {
-    "rerank": {"enabled": True, "stage": "sonnet_listwise", "pool": RERANK_POOL,
+    "rerank": {"enabled": True, "stage": "sonnet_listwise", "min_rel_score": POOL_MIN_REL,
                "blend": {"enabled": True, "weight_rerank": 0.7, "weight_fused": 0.3,
                          "floor": False, "keep": 3, "within": 10}},
     "gate": {"enabled": False, "threshold": JEV_GATE_THRESHOLD},
-    "reader": {"enabled": False, "top": 8, "join_top": 15,
-               "max_follow_ups": 2, "max_new": 10},
+    "reader": {"enabled": False, "min_rel_score": READER_MIN_REL,
+               "max_follow_ups": 2},
 }
 
 
@@ -113,13 +115,15 @@ def validate_recall_config(cfg: dict) -> None:
             raise ValueError(f"blend.{name} must be an integer >= 1")
     if int(bl.get("keep", BLEND_DEFAULTS["keep"])) > int(bl.get("within", BLEND_DEFAULTS["within"])):
         raise ValueError("blend.keep must be <= blend.within")
-    for section, name, lo in (
-        (rr, "pool", 1), (rd, "top", 1), (rd, "join_top", 1),
-        (rd, "max_follow_ups", 1), (rd, "max_new", 1),
-    ):
+    for section, name in ((rr, "min_rel_score"), (rd, "min_rel_score"), (rd, "hop_min_rel_score")):
         v = section.get(name)
-        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < lo):
-            raise ValueError(f"{name} must be an integer >= {lo}")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                              or not 0 <= v <= 1):
+            raise ValueError(f"{name} must be a number in [0, 1]")
+    for gone in ("pool", "top", "join_top", "max_new", "max_follow_ups"):
+        if gone in rr or gone in rd:
+            raise ValueError(f"{gone!r} was a count and is gone: pools are score-based "
+                             "(rerank/reader min_rel_score, see docs/limits.md)")
     if rd.get("type", "sonnet") not in ("sonnet", "jev"):
         raise ValueError("reader.type must be 'sonnet' or 'jev'")
     ev = cfg.get("evidence") or {}
@@ -285,10 +289,12 @@ def _order_by(items: list[Item], primary: list[int], grades: dict[str, float]) -
 class SonnetListwise:
     name = "sonnet_listwise"
 
-    def __init__(self, llm, model: str | None = SONNET_MODEL):
-        self.llm, self.model = llm, model
+    def __init__(self, llm, model: str | None = SONNET_MODEL,
+                 context_tokens: int = SONNET_CONTEXT_TOKENS):
+        self.llm, self.model, self.context_tokens = llm, model, context_tokens
 
-    def rerank(self, query: str, items: list[Item], calls: list[dict]) -> Outcome:
+    def _batch(self, query: str, items: list[Item], calls: list[dict]) -> tuple[list[int], dict[str, float]]:
+        """One listwise call over `items`: (ranking as indexes, grades by document)."""
         cands = "\n\n".join(f"[{i}] {it.header}\n{it.evidence}"
                             for i, it in enumerate(items, start=1))
         prompt = render_prompt("rerank-listwise", {"query": query, "candidates": cands})
@@ -313,10 +319,44 @@ class SonnetListwise:
                 continue
         if not ranking and not grades:
             raise ValueError("reply carries neither a usable ranking nor grades")
-        order = _order_by(items, ranking, grades)
+        return ranking, grades
+
+    def _batch_retry(self, query, items, calls):
+        last: Exception | None = None
+        for _ in range(BATCH_ATTEMPTS):
+            try:
+                return self._batch(query, items, calls)
+            except Exception as exc:
+                last = exc
+        logger.warning("rerank batch of %d notes failed %d times (%s: %s); the fused order "
+                       "stands for the whole pool. Query: %s. Notes: %s", len(items),
+                       BATCH_ATTEMPTS, type(last).__name__, last, query,
+                       [it.doc.document_id for it in items])
+        raise last  # type: ignore[misc]
+
+    def rerank(self, query: str, items: list[Item], calls: list[dict]) -> Outcome:
+        """The whole qualifying pool goes to the model. Only the model's context
+        window (SONNET_CONTEXT_TOKENS) forces a split: then each batch is graded
+        (map) and the grades merge (reduce) into one order, grade first, then
+        the fused order. A batch that fails twice fails the stage loudly; the
+        fused order then stands (nothing is dropped)."""
+        batches = split_batches(items, lambda it: it.header + it.evidence,
+                                self.context_tokens - RESERVED_TOKENS)
+        if len(batches) == 1:
+            ranking, grades = self._batch_retry(query, items, calls)
+            order = _order_by(items, ranking, grades)
+        else:
+            ranking, grades, off = [], {}, 0
+            for b in batches:
+                r, g = self._batch_retry(query, b, calls)
+                ranking += [off + i for i in r]
+                grades.update(g)
+                off += len(b)
+            order = _order_by(items, [], grades)
         return Outcome(order=order, grades=grades,
                        record={"stage": self.name, "model": self.model,
-                               "n_ranked": len(ranking), "n_graded": len(grades)})
+                               "n_ranked": len(ranking), "n_graded": len(grades),
+                               "batches": len(batches)})
 
 
 # ------------------------------------------------------------------------ Jev
@@ -577,17 +617,17 @@ class SonnetReader:
     def __init__(self, llm, model: str | None = SONNET_MODEL):
         self.llm, self.model = llm, model
 
-    def read(self, query: str, items: list[Item], max_follow_ups: int,
+    def read(self, query: str, items: list[Item], max_follow_ups: int | None,
              calls: list[dict]) -> tuple[bool, list[str]]:
         ex = "\n\n".join(f"[{i}] {it.header}\n{it.evidence}"
                          for i, it in enumerate(items, start=1))
         prompt = render_prompt("read-sufficiency", {
-            "query": query, "excerpts": ex, "max_follow_ups": max_follow_ups})
+            "query": query, "excerpts": ex})
         raw = call_llm(self.llm, [{"role": "user", "content": prompt}],
                        purpose="reader_sufficiency", calls=calls, model=self.model)
         obj = parse_json_object(raw)
         fu = [q.strip() for q in (obj.get("follow_ups") or [])
-              if isinstance(q, str) and q.strip()][:max_follow_ups]
+              if isinstance(q, str) and q.strip()]
         sufficient = bool(obj.get("sufficient", not fu))
         if sufficient:
             fu = []
@@ -614,12 +654,13 @@ class JevReader:
     bridge to the second fact). On any failure the hop is skipped (the caller
     records the error)."""
     name = "jev_reader"
+    batch_tokens = (JEV_INPUT_BYTES - 2_000) // (len(_STOP_QUESTIONS) * CHARS_PER_TOKEN)
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
                  timeout: float = JEV_TIMEOUT_S):
         self.transport, self.model, self.timeout = transport, model, timeout
 
-    def read(self, query: str, items: list[Item], max_follow_ups: int,
+    def read(self, query: str, items: list[Item], max_follow_ups: int | None,
              calls: list[dict]) -> tuple[bool, list[str]]:
         text = "\n\n".join(f"[{i}] {it.header}\n{it.evidence}"
                            for i, it in enumerate(items, start=1))
@@ -662,7 +703,7 @@ class JevReader:
         if val["evidence_sufficient"] >= JEV_SUFFICIENT or not items:
             return True, []
         if max(val["continue_useful"], val["missing_evidence"]) >= JEV_CONTINUE:
-            return False, [items[0].evidence][:max_follow_ups]
+            return False, [items[0].evidence]
         return True, []
 
 
@@ -697,8 +738,10 @@ def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls,
         trace.update(totals(calls))
         return fused, trace
 
-    pool_n = int((recall_cfg.get("rerank") or {}).get("pool", RERANK_POOL))
-    pool, tail = fused[:pool_n], fused[pool_n:]
+    pool = rel_cut(fused, lambda d: d.score,
+                   float((recall_cfg.get("rerank") or {}).get("min_rel_score", POOL_MIN_REL)))
+    in_pool = {d.document_id for d in pool}
+    tail = [d for d in fused if d.document_id not in in_pool]
     items = build_items(state.conn, pool)
     rerank_rec = None
     if reranker is not None:
@@ -721,7 +764,8 @@ def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls,
         trace["hops"] = hops
 
     trace.update(totals(calls))
-    return [it.doc for it in items] + tail, trace
+    got = {it.doc.document_id for it in items}   # the hop may have pulled tail notes in
+    return [it.doc for it in items] + [d for d in tail if d.document_id not in got], trace
 
 
 def _with_scores(doc: FusedDoc, out: Outcome) -> FusedDoc:
@@ -733,15 +777,50 @@ def _with_scores(doc: FusedDoc, out: Outcome) -> FusedDoc:
     return dataclasses.replace(doc, scores={**doc.scores, **extra}) if extra else doc
 
 
+def _read_score(items: list[Item]) -> Callable[[Item], float]:
+    """The reader's relevance score: the reranker's grade when the pool was
+    graded (a note without one counts 0), else the fused score."""
+    graded = any("rerank" in it.doc.scores for it in items)
+    if graded:
+        return lambda it: float(it.doc.scores.get("rerank", 0.0))
+    return lambda it: it.doc.score
+
+
+def read_all(reader, query: str, items: list[Item], calls: list[dict],
+             context_tokens: int = SONNET_CONTEXT_TOKENS) -> tuple[bool, list[str]]:
+    """The reader sees every qualifying note. Only the model's window forces a
+    split: then each batch is read (map) and the verdicts merge (reduce):
+    sufficient only if every batch is, follow-ups are the union."""
+    budget = getattr(reader, "batch_tokens", context_tokens - RESERVED_TOKENS)
+    batches = split_batches(items, lambda it: it.header + it.evidence, budget) or [[]]
+    sufficient, fus = True, []
+    for b in batches:
+        last: Exception | None = None
+        for _ in range(BATCH_ATTEMPTS):
+            try:
+                ok, fu = reader.read(query, b, None, calls)
+                break
+            except Exception as exc:
+                last = exc
+        else:
+            logger.warning("reader batch of %d notes failed %d times (%s: %s). Query: %s. "
+                           "Notes: %s", len(b), BATCH_ATTEMPTS, type(last).__name__, last,
+                           query, [it.doc.document_id for it in b])
+            raise last  # type: ignore[misc]
+        sufficient = sufficient and ok
+        fus += [q for q in fu if q not in fus]
+    return sufficient, fus
+
+
 def _hop(state, query, items, channel_config, rcfg, reranker, reader, calls, k):
-    top_n = int(rcfg.get("top", 8))
-    join_top = int(rcfg.get("join_top", 15))
-    max_fu = int(rcfg.get("max_follow_ups", 2))
-    max_new = int(rcfg.get("max_new", 10))
+    rel = float(rcfg.get("min_rel_score", READER_MIN_REL))
+    hop_rel = float(rcfg.get("hop_min_rel_score", POOL_MIN_REL))
+    seen = rel_cut(items, _read_score(items), rel)
     hops: dict = {"reader": reader.name, "verdict": None, "follow_ups": [],
-                  "new_candidates": [], "rerank": None, "error": None}
+                  "new_candidates": [], "rerank": None, "error": None,
+                  "read_notes": len(seen)}
     try:
-        sufficient, follow_ups = reader.read(query, items[:top_n], max_fu, calls)
+        sufficient, follow_ups = read_all(reader, query, seen, calls)
     except Exception as exc:
         hops["verdict"] = "error"
         hops["error"] = f"{type(exc).__name__}: {exc}"
@@ -756,33 +835,32 @@ def _hop(state, query, items, channel_config, rcfg, reranker, reader, calls, k):
     main_lists = state.channel_lists   # run_channels overwrites it; scope promotion needs the main run's meta list
     for fq in follow_ups:   # cheap channels only; one failed follow-up skips only itself
         try:
-            fused, tr = run_channels(state, QueryPlan(text=fq), cheap, k=k, pool=max_new + join_top)
-            lists.append(fused)
+            fused, tr = run_channels(state, QueryPlan(text=fq), cheap, k=k)
+            lists.append(rel_cut(fused, lambda d: d.score, hop_rel))
             for c in tr["channels"]:
                 if c["error"]:
                     hops["error"] = f"{c['name']}: {c['error']}"
         except Exception as exc:
             hops["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("follow-up search %r failed (%s: %s); its notes are not added",
+                           fq, type(exc).__name__, exc)
     state.channel_lists = main_lists
-    keep = {it.doc.document_id for it in items[:join_top]}
+    have = {it.doc.document_id for it in items}
     new: list[FusedDoc] = []
     for rank in range(max((len(l) for l in lists), default=0)):   # round-robin by rank
         for l in lists:
-            if rank < len(l) and len(new) < max_new:
+            if rank < len(l):
                 d = l[rank]
-                if d.document_id not in keep and all(d.document_id != n.document_id for n in new):
+                if d.document_id not in have and all(d.document_id != n.document_id for n in new):
                     new.append(d)
     hops["new_candidates"] = [d.document_id for d in new]
     if not new:
         return items, hops
 
-    head = items[:join_top]
-    joined = head + build_items(state.conn, new)
-    joined_ids = {it.doc.document_id for it in joined}
-    rest = [it for it in items[join_top:] if it.doc.document_id not in joined_ids]
+    joined = items + build_items(state.conn, new)
     if reranker is not None:
         joined, out, rec = run_reranker(reranker, query, joined, calls)
         if out is not None:
             joined = [dataclasses.replace(it, doc=_with_scores(it.doc, out)) for it in joined]
         hops["rerank"] = rec
-    return joined + rest, hops
+    return joined, hops

@@ -2,6 +2,8 @@
 (migrations 0007 + 0008)."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import psycopg
 import pytest
 
@@ -111,7 +113,7 @@ def test_default_config_is_empty_and_recall_stays_legacy(mem):
 
 
 def test_channel_recall_fuses_documents_and_scores_per_channel(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     res = mem.search("cat sat warm mat window", limit=5)
     assert [r.source for r in res][0] == "cat.md"
     assert len({r.document_id for r in res}) == len(res)  # document level
@@ -125,13 +127,13 @@ def test_channel_recall_fuses_documents_and_scores_per_channel(mem):
 def test_set_channel_config_validates_and_resets(mem):
     with pytest.raises(ValueError):
         mem.set_channel_config([{"name": "bogus"}])
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem.set_channel_config([])
     assert set(mem.search("cat")[0].scores) == {"semantic", "lexical", "lexical_body", "rrf"}
 
 
 def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem.recall(["cat sat warm mat window"], limit=5)
     with psycopg.connect(mem.database_url) as conn:
         ev_id, plan, channels, fusion = conn.execute(
@@ -168,7 +170,7 @@ def test_legacy_recall_leaves_trace_columns_null(mem):
 
 def test_failing_channel_is_recorded_and_others_still_fuse(mem, monkeypatch):
     from prospecta.channels import semantic
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     monkeypatch.setattr(semantic.AnticipatedQuestions, "_sql", "SELECT broken FROM nowhere")
     mem.recall(["cat sat warm mat window"], limit=5)
     with psycopg.connect(mem.database_url) as conn:
