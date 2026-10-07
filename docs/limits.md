@@ -56,6 +56,20 @@ exceeds it is split into consecutive batches and map-reduced, never truncated:
   design's RRF arithmetic (single-channel rank 30 ~0.6 of a top note) and tuned only on synthetic
   data: still to be tuned on the real 120 questions + the Greg question against a real bank.
   `min_rel 0` means no cut.
+- **Thresholds are unmeasured starting defaults chosen by the author**: pool 0.4 of the best
+  fused RRF score, channel cuts 0.6 cosine / 0.15 BM25, reader 0.6, hop 0.4. Config keys:
+  channel param `min_rel`; `recall_config.rerank.min_rel_score`, `recall_config.reader.min_rel_score`,
+  `recall_config.reader.hop_min_rel_score`. The rung-caretaker scout tunes them on roger with the
+  real question set. `max_follow_ups` no longer applies (the cut is score-based).
+- **Reranker cost on the synthetic bank goes down**: the pool (fused notes >= 0.4 x best) was 6-27
+  notes over 8 probe queries (mean ~14) against the old fixed 30. On a real bank, where scores
+  are flatter, it may be larger: that is what the tuning on real data decides.
+- **Semantic channels never stop at an index's reach**: an HNSW scan returns about `ef_search`
+  (40) rows, so a short page would look like an exhausted source. Each page fetch runs in its
+  own transaction with `hnsw.iterative_scan = relaxed_order` (pgvector >= 0.8) or, on older
+  pgvector, with index scans off (exact), logging one warning. BM25 backends (pg_search
+  `LIMIT n`, in-process ranking of every match) return exactly `n` rows when more exist, so a
+  short page is true exhaustion there.
 - `prospecta eval` no longer slices to 30 (`pool=None` scores the whole selected pool).
 
 Synthetic before/after (`/tmp/e11eval.py`: 320 notes, 8 set questions, stub embedder, no LLM):

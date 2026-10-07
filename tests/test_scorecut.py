@@ -95,7 +95,48 @@ def test_jev_reader_requests_stay_under_its_byte_limit():
     items = []
     for i in range(20):
         it = _item(i)
-        it.evidence = "e" * 8_000
-        items.append(it)
+        items.append(Item(doc=it.doc, header=it.header, evidence="e" * 8_000))
     ok, _ = read_all(JevReader(transport), "q", items, [])
     assert ok and len(sizes) > 1 and max(sizes) <= JEV_INPUT_BYTES
+
+
+def test_semantic_channel_reaches_qualifying_items_beyond_hnsw_ef_search(fresh_db):
+    import psycopg
+    from prospecta.channels.base import QueryPlan, RecallState
+    from prospecta.channels.semantic import DenseChunks, _scan_everything
+    from prospecta.db.queries import ensure_kind_hnsw_indexes
+    from prospecta.memory import Memory
+    from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
+
+    m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    total = 150
+    with psycopg.connect(fresh_db, autocommit=True) as conn:
+        ensure_kind_hnsw_indexes(conn, "b", EMBED_DIM)
+        for i in range(total):
+            vec = [1.0, 0.001 * i] + [0.0] * (EMBED_DIM - 2)
+            lit = "[" + ",".join(map(str, vec)) + "]"
+            doc = conn.execute(
+                "INSERT INTO documents (bank_id, source, content_hash, original_text) "
+                "VALUES ('b', %s, %s, 't') RETURNING id", (f"n{i}.md", f"h{i}")).fetchone()[0]
+            conn.execute(
+                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
+                " embedding, kind, ordinal, char_start, char_end) "
+                "VALUES ('b', %s, 'c', 'c', %s::vector, 'chunk', 0, 0, 1)", (doc, lit))
+    q = [1.0] + [0.0] * (EMBED_DIM - 1)
+    with psycopg.connect(fresh_db) as conn:
+        conn.execute("SET enable_seqscan = off")
+        state = RecallState(conn=conn, bank_id="b", embed=lambda texts: [q for _ in texts])
+        got = DenseChunks(min_rel=0.5).retrieve(QueryPlan(text="x"), state)
+    sql = ("SELECT id FROM memory_items WHERE bank_id = 'b' AND kind = 'chunk' "
+           "ORDER BY embedding::vector(%d) <=> %%s::vector LIMIT 100" % EMBED_DIM)
+    lit = "[" + ",".join(map(str, q)) + "]"
+    with psycopg.connect(fresh_db) as conn:
+        conn.execute("SET enable_seqscan = off")
+        assert len(conn.execute(sql, (lit,)).fetchall()) == 40
+        conn.rollback()
+        with conn.transaction(), conn.cursor() as cur:
+            _scan_everything(cur)
+            assert len(cur.execute(sql, (lit,)).fetchall()) == 100
+    m.close()
+    assert len(got) == total
