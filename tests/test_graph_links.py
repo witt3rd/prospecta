@@ -493,3 +493,51 @@ def test_graph_seeds_are_every_pool_document_within_the_relative_score(mem):
     assert {c.source for c in out} == {f"T{i}" for i in range(12)}   # old seeds=10 would miss two
     # a seed below seed_min_rel x the best is not a seed
     assert len(expand(mem, ids, [f"S{i}" for i in range(12)], node_min_rel=0, seed_min_rel=0.99)) == 1
+
+
+def test_neighbours_until_drop_relative_score_and_marginal_stop():
+    from prospecta._linker import neighbours_until_drop
+    scores = [0.95, 0.94, 0.93, 0.80, 0.79, 0.78]   # a marginal drop after the third
+    fetched = []
+
+    def fetch(n):
+        fetched.append(n)
+        return [{"cos": s} for s in scores[:n]]
+    got, examined = neighbours_until_drop(fetch, lambda r: r["cos"], 0.9, page=4)
+    assert [r["cos"] for r in got] == [0.95, 0.94, 0.93] and examined == 4 and fetched == [4]
+    # a flat tail has no drop: the fetch grows until the source is exhausted, nothing is left behind
+    flat = [{"cos": 0.9 - i * 0.001} for i in range(10)]
+    got, _ = neighbours_until_drop(lambda n: flat[:n], lambda r: r["cos"], 0.9, page=4)
+    assert len(got) == 10
+
+
+def test_linker_state_records_cost_and_candidates_per_document(mem):
+    for i, t in enumerate(["cats purr softly", "cats purr softly today", "tax law"]):
+        mem.retain(t, source=f"s{i}", index_text=t)
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" and "cats" in cand + query else 0)
+    mem._linker = Linker(judge=JevRelationJudge(jev))
+    stats = mem.link_document(docs(mem)["s0"])
+    assert stats["candidates_examined"] >= 1 and stats["candidates_judged"] >= 1
+    assert stats["n_llm_calls"] >= 1 and stats["cost_usd"] > 0
+    with conn_of(mem) as c:
+        st = c.execute("SELECT stats FROM memory_link_state WHERE document_id=%s",
+                       (docs(mem)["s0"],)).fetchone()[0]
+    assert st["cost_usd"] == stats["cost_usd"] and st["candidates_judged"] == stats["candidates_judged"]
+
+
+def test_linker_judge_failure_is_retried_before_it_is_surfaced(mem, monkeypatch):
+    import prospecta._linker as L
+    monkeypatch.setattr(L, "JUDGE_BACKOFF_S", 0)
+    mem.retain("cats purr softly", source="a", index_text="cats purr softly")
+    mem.retain("cats purr softly today", source="b", index_text="cats purr softly today")
+    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+    real, fails = jev.__call__, [2]
+
+    def flaky(request, timeout):
+        if fails[0]:
+            fails[0] -= 1
+            raise RuntimeError("blip")
+        return real(request, timeout)
+    mem._linker = Linker(judge=JevRelationJudge(flaky))
+    stats = mem.link_document(docs(mem)["a"])
+    assert stats["errors"] == [] and {l[4] for l in links(mem) if l[2] == "SEMANTIC"} == {"jev"}

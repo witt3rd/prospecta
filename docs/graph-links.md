@@ -24,7 +24,7 @@ up again by `link_pending`. Per document:
   is held by the person; mentions already extracted under an alias move onto the person.
   `Linker.backfill_aliases(conn, bank_id, limit, after)` is the resumable backfill by document id
   (progress in `memory_alias_state`; errors recorded and skipped).
-- Semantic links: every pgvector neighbour per anchor item with cosine >= `neighbour_min_rel` (0.6) x the nearest (see `limits.md`). With a
+- Semantic links: every pgvector neighbour per anchor item with cosine >= `neighbour_min_rel` (0.9) x the nearest, ending at the first marginal drop > (1 - `neighbour_min_rel`) x the nearest (see `limits.md`). With a
   `JevRelationJudge(transport)` Jev answers `semantic`, `causes`, `caused_by` as System
   One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`); without one, or if
   Jev fails, neighbours with cosine >= 0.75 become `RELATED_TO` (`origin='pgvector'`).
