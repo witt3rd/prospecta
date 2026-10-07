@@ -5,10 +5,17 @@ Stub Jev counts calls and PRICES them with a per-call token model: calls, tokens
 and cost are a MODEL of the real service (nothing leaves the process), the
 neighbour selection, batching and pair cache are the real code under test.
 
+Batching: default is the verified 16 questions per call (about 5 candidates x 3
+relations); BENCH_MAX_QUESTIONS=48 BENCH_RELATIONS_PER_CALL=1 models 16 candidates
+per call, valid ONLY once 48 questions per call is verified on the live wire.
+
 Run it once per code version (the label is only printed): the same script runs
 against current main (checkout elsewhere, PYTHONPATH=<dir>) and against this branch.
 
-Measured (stub model, fixed clusters; calls per note at 500/1000/1845/3690 notes):
+Measured with BENCH_MAX_QUESTIONS=48 BENCH_RELATIONS_PER_CALL=1 (16 candidates per call; unverified
+on the live wire). The default (16 questions per call, ~5 candidates) needs up to ~3x the calls
+per note on large candidate sets; re-run the script without the switches for its figures.
+(stub model, fixed clusters; calls per note at 500/1000/1845/3690 notes):
   main   (PR 43):  5.52 / 8.60 / 5.74 / 4.36   cost 12.0 / 38.8 / 46.5 / 68.9 USD
   batched+pair-cache+floor 0.5:  1.46 / 2.11 / 1.64 / 1.39   cost 7.2 / 24.3 / 30.8 / 49.3 USD
 Past the cluster plateau (1845 -> 3690) the extra notes cost ~1.15 calls each: linear.
@@ -135,7 +142,9 @@ def run(base_url: str, n: int, mode: str):
             m.retain(t, source=f"s{i}", index_text=t, metadata={   # one note a day, as a diary
                 "created": (datetime.date(2020, 1, 1) + datetime.timedelta(days=i // 2)).isoformat()})
         t_retain = time.monotonic() - t0
-        m._linker = Linker(judge=JevRelationJudge(jev))
+        m._linker = Linker(judge=JevRelationJudge(
+            jev, max_questions=int(os.environ.get("BENCH_MAX_QUESTIONS", "16")),
+            relations_per_call=os.environ.get("BENCH_RELATIONS_PER_CALL") == "1"))
         t1 = time.monotonic()
         with psycopg.connect(url) as c:
             ids = [r[0] for r in c.execute("SELECT id::text FROM documents ORDER BY created_at, id")]
