@@ -337,10 +337,21 @@ def test_mapreduce_keeps_every_entity_linked_note_despite_weak_text_hits(fresh_d
     m.close()
 
 
-def test_mapreduce_has_no_private_folding():
-    import inspect
-    from prospecta import _mapreduce, _entities
-    assert not hasattr(_mapreduce, "_norm_name")
-    assert _mapreduce.fold_path is _entities.fold_path
-    assert "unicodedata" not in inspect.getsource(_mapreduce)
-    assert _entities.fold_path("A\\Mr.  Nelson.MD") == "a/mr nelson"
+def test_mapreduce_citations_resolve_through_shared_fold(fresh_db):
+    class Sloppy(MapReduceLLM):
+        def __call__(self, messages, *, json_mode=False):
+            r = super().__call__(messages, json_mode=json_mode)
+            if isinstance(r, LLMResult):
+                r = LLMResult(r.text.replace("People/Mr. Nelson.md", "people\\\\mr.  NELSON.MD"),
+                              model=r.model, tokens_in=r.tokens_in, tokens_out=r.tokens_out,
+                              cost_usd=r.cost_usd)
+            return r
+
+    m = Memory(database_url=fresh_db, bank_id="b", llm=Sloppy(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    body = "Pat, also called Pip."
+    m.retain("---\nperson: Pat\n---\n" + body, source="People/Mr. Nelson.md", index_text=body)
+    res = m.recall_mapreduce("nicknames?", entity="Pat")
+    cites = [c for e in res.evidence for c in e["citations"]]
+    assert cites and all(c["known"] and c["note"] == "People/Mr. Nelson.md" for c in cites)
+    m.close()
