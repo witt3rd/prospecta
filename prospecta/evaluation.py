@@ -397,6 +397,7 @@ def run_eval(memory, questions: list[Question], *, ablate: bool = False,
         "channel_config": channel_config, "recall_config": recall_cfg,
         "legacy_bank_scored_with_defaults": legacy, "margin": MARGIN,
         "depth": resolve_depth(depth, recall_cfg),
+        "rerank_min_rel": pool_min_rel(depth, recall_cfg),
     }
     full = run_variant(memory, questions, channel_config, recall_cfg, pool=pool, depth=depth)
     report["full"] = full
@@ -432,12 +433,11 @@ def format_report(r: dict) -> str:
     for name, s in r["full"]["stages"].items():
         if name.startswith("channel:") and s.get("errors"):
             L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
-    from prospecta._scorecut import pool_min_rel
     chans = {e["name"]: (e.get("params") or {}).get("min_rel", CHANNEL_MIN_REL)
              for e in r.get("channel_config") or [] if e["name"] in ("dense_chunk", "question", "bm25")}
     L.append("cuts: channels " + (", ".join(f"{n} {v}" for n, v in chans.items()) or "none")
              + f" (0 = no cut); rerank pool >= "
-             f"{pool_min_rel(r.get('depth'), r.get('recall_config'))} x best fused score "
+             f"{r.get('rerank_min_rel')} x best fused score "
              f"(depth: {r.get('depth', 'standard')})")
     L.append(f"full: {_fmt(r['full']['summary'])}")
     for c, s in r["full"]["summary"]["by_class"].items():
