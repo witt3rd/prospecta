@@ -357,34 +357,130 @@ class Linker:
         raw = call_llm(self.llm, [{"role": "user", "content": prompt}],
                        purpose="extract_entities", calls=calls, model=self.model)
         found = parse_entities(raw)
+        aliases = parse_aliases(raw)
+        touched: set[str] = set()
         if found:
             with conn.cursor() as cur:
                 for name, etype in sorted(found, key=lambda e: (normalise(e[0]), e[1])):
                     norm = normalise(name)
+                    for canon, als in aliases:   # persons first: aliases resolve to them
+                        if normalise(canon) == norm and etype == "person":
+                            self._add_aliases(cur, bank_id, name, norm, als, touched, stats)
+                    eid = self._alias_target(cur, bank_id, norm) if etype == "person" else None
+                    if eid is not None:   # a known alias of a person: the person's mentions
+                        self._attach(cur, anchors, eid, norm)
+                        stats["entities"] += 1
+                        continue
                     cur.execute(
                         "INSERT INTO memory_entities (bank_id, name, norm, etype) "
                         "VALUES (%s, %s, %s, %s) ON CONFLICT (bank_id, norm, etype) "
                         "DO UPDATE SET name = memory_entities.name RETURNING id",
                         (bank_id, name, norm, etype))
                     eid = cur.fetchone()[0]
-                    hits = 0
-                    for a in anchors:   # the items whose text names it
-                        n = len(re.findall(re.escape(norm), normalise(
-                            a["original_chunk"] or a["content"])))
-                        if n:
-                            hits += 1
-                            cur.execute(
-                                "INSERT INTO memory_item_entities (item_id, entity_id, n) "
-                                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                                (a["id"], eid, n))
-                    if not hits:   # named in the note, not in a single chunk: first anchor
-                        cur.execute(
-                            "INSERT INTO memory_item_entities (item_id, entity_id, n) "
-                            "VALUES (%s, %s, 1) ON CONFLICT DO NOTHING", (anchors[0]["id"], eid))
+                    self._attach(cur, anchors, eid, norm)
                     stats["entities"] += 1
         with conn.cursor() as cur:
-            cur.execute(_SHARED_ENTITY, {"bank": bank_id, "doc": doc, "cap": self.entity_hub})
-            stats["entity_links"] = cur.rowcount
+            touched.add(doc)
+            stats["entity_links"] = 0
+            for d in sorted(touched):   # this note, and notes whose mentions an alias moved
+                cur.execute(_SHARED_ENTITY, {"bank": bank_id, "doc": d, "cap": self.entity_hub})
+                stats["entity_links"] += cur.rowcount
+            cur.execute(
+                "INSERT INTO memory_alias_state (document_id, bank_id, status, stats) "
+                "VALUES (%s, %s, 'done', %s::jsonb) ON CONFLICT (document_id) DO UPDATE "
+                "SET status = 'done', stats = EXCLUDED.stats, error = NULL, done_at = now()",
+                (doc, bank_id, json.dumps({"aliases": stats.get("aliases", 0)})))
+
+    @staticmethod
+    def _attach(cur, anchors, eid, norm):
+        hits = 0
+        for a in anchors:   # the items whose text names it
+            n = len(re.findall(re.escape(norm), normalise(
+                a["original_chunk"] or a["content"])))
+            if n:
+                hits += 1
+                cur.execute(
+                    "INSERT INTO memory_item_entities (item_id, entity_id, n) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (item_id, entity_id) "
+                    "DO UPDATE SET n = GREATEST(memory_item_entities.n, EXCLUDED.n)",
+                    (a["id"], eid, n))
+        if not hits:   # named in the note, not in a single chunk: first anchor
+            cur.execute(
+                "INSERT INTO memory_item_entities (item_id, entity_id, n) "
+                "VALUES (%s, %s, 1) ON CONFLICT DO NOTHING", (anchors[0]["id"], eid))
+
+    @staticmethod
+    def _alias_target(cur, bank_id, norm):
+        cur.execute("SELECT entity_id FROM memory_entity_aliases WHERE bank_id = %s AND norm = %s",
+                    (bank_id, norm))
+        r = cur.fetchone()
+        return r[0] if r else None
+
+    def _add_aliases(self, cur, bank_id, name, norm, alias_names, touched, stats):
+        """Record alias rows resolving to the person `name`, and move onto the
+        person the mentions of any entity already extracted under an alias."""
+        cur.execute(
+            "INSERT INTO memory_entities (bank_id, name, norm, etype) "
+            "VALUES (%s, %s, %s, 'person') ON CONFLICT (bank_id, norm, etype) "
+            "DO UPDATE SET name = memory_entities.name RETURNING id", (bank_id, name, norm))
+        canon = cur.fetchone()[0]
+        for alias in sorted(set(alias_names), key=normalise):
+            an = normalise(alias)
+            if an == norm or self._alias_target(cur, bank_id, an) not in (None, canon):
+                continue
+            cur.execute(
+                "INSERT INTO memory_entity_aliases (bank_id, norm, alias, entity_id) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (bank_id, an, alias, canon))
+            stats["aliases"] = stats.get("aliases", 0) + cur.rowcount
+            cur.execute(   # an entity already extracted under the alias becomes the person
+                "SELECT id FROM memory_entities WHERE bank_id = %s AND norm = %s "
+                "AND etype = 'person' AND id <> %s", (bank_id, an, canon))
+            for (old,) in cur.fetchall():
+                cur.execute("SELECT m.item_id, i.document_id::text FROM memory_item_entities m "
+                            "JOIN memory_items i ON i.id = m.item_id WHERE m.entity_id = %s", (old,))
+                for _, d in cur.fetchall():
+                    touched.add(d)
+                cur.execute(
+                    "INSERT INTO memory_item_entities (item_id, entity_id, n) "
+                    "SELECT item_id, %s, n FROM memory_item_entities WHERE entity_id = %s "
+                    "ON CONFLICT (item_id, entity_id) DO UPDATE "
+                    "SET n = memory_item_entities.n + EXCLUDED.n", (canon, old))
+                cur.execute("DELETE FROM memory_item_entities WHERE entity_id = %s", (old,))
+
+    def backfill_aliases(self, conn, bank_id: str, limit: int = 100,
+                         after: str | None = None) -> tuple[int, str | None]:
+        """Resumable alias backfill: documents with items and no done alias
+        state, by document id after `after`. Returns (processed, last id);
+        pass the last id back to resume. Errors are recorded and skipped."""
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT d.id::text FROM documents d WHERE d.bank_id = %s "
+                "AND (%s::uuid IS NULL OR d.id > %s::uuid) "
+                "AND NOT EXISTS (SELECT 1 FROM memory_alias_state s "
+                "                WHERE s.document_id = d.id AND s.status = 'done') "
+                "AND EXISTS (SELECT 1 FROM memory_items m WHERE m.document_id = d.id) "
+                "ORDER BY d.id LIMIT %s", (bank_id, after, after, limit))
+            ids = [r[0] for r in cur.fetchall()]
+        last = after
+        for doc in ids:
+            last = doc
+            with conn.cursor() as cur:
+                cur.execute(_ANCHORS, {"doc": doc})
+                anchors = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
+            try:
+                self._retrying(conn, "aliases", lambda: self._run_step(
+                    self._entities, conn, bank_id, doc, anchors, {"entities": 0}, []))
+            except Exception as exc:
+                conn.rollback()
+                logger.error("alias backfill failed for %s (recorded): %s", doc, exc)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO memory_alias_state (document_id, bank_id, status, error) "
+                        "VALUES (%s, %s, 'error', %s) ON CONFLICT (document_id) DO UPDATE "
+                        "SET status = 'error', error = EXCLUDED.error, done_at = now()",
+                        (doc, bank_id, f"{type(exc).__name__}: {exc}"))
+                conn.commit()
+        return len(ids), last
 
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
         for a in anchors:
@@ -446,6 +542,24 @@ def parse_entities(raw: str) -> list[tuple[str, str]]:
         if name and key not in seen:
             seen.add(key)
             out.append((name, etype))
+    return out
+
+
+def parse_aliases(raw: str) -> list[tuple[str, list[str]]]:
+    """(person name, aliases) for every person entity that lists aliases."""
+    obj = parse_json_object(raw)
+    out: list[tuple[str, list[str]]] = []
+    for e in obj.get("entities") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("name"), str):
+            continue
+        if str(e.get("type", "")).strip().lower() != "person":
+            continue
+        als = e.get("aliases")
+        if isinstance(als, str):
+            als = [als]
+        als = [a.strip() for a in als or [] if isinstance(a, str) and a.strip()]
+        if als:
+            out.append((e["name"].strip(), als))
     return out
 
 

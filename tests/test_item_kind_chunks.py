@@ -181,7 +181,7 @@ def _kinds(url):
 def test_migration_on_populated_table(populated_v3):
     url = populated_v3
     res = migrate.run_migrations(url)
-    assert res["applied"] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert res["applied"] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     assert _kinds(url) == [("chunk", 7, 0, 69), ("question", 3, None, None)]
     with psycopg.connect(url) as c:
         # column defaults are constants; existing row data untouched
@@ -219,7 +219,7 @@ def test_finish_0004_runs_after_crash_post_commit(populated_v3):
     _apply_upto(url, 4, start=4)
     assert _kinds(url) == [("question", 10, None, None)]
     res = migrate.run_migrations(url)
-    assert res["applied"] == [5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert res["applied"] == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     assert _kinds(url) == [("chunk", 7, 0, 69), ("question", 3, None, None)]
     with psycopg.connect(url) as c:
         names = {r[0] for r in c.execute(
