@@ -53,6 +53,17 @@ so `all-pairs` is the default knowingly and `connected` is the explicit cheaper 
   the pair cache (keyed by the text-hash pair), links written between the judged chunks. 96
   questions per call, the pair cache and the similarity floor keep it affordable. No
   per-note collapse, no top-K, no mutual test.
+- Per-anchor bound (all-pairs, `judge_floor_frac`, default 0.25, env `PROSPECTA_JUDGE_FLOOR_FRAC`, 0 = off): a RELATIVE floor, not a count cap. For each anchor the candidates' cosines give a floor `median + frac x (best - median)`; a candidate below it is not judged (the `judge_nearest` best always are; cached pairs are still read back). In a dense cluster the median sits near the best, so the floor rises and only distinctly related pairs are judged; in a sparse region it falls. Skipped pairs are counted in the state stats (`candidates_below_floor`), never dropped silently; a judge failure still errors the document for retry. `link_completeness`, the pair cache, `link_pass` resumability and the background pass are unchanged.
+
+  Benchmark (`BENCH_HUB=1500 BENCH_FLOOR_FRAC=<f> scripts/bench_linker.py 1845`: Greg-style 226-note cluster + 4 more dense clusters, a hub note with 1,500 graded near neighbours, STUB judge with a token cost model, Sonnet-class prices; not live). Ground truth: cluster members are semantically related, every 10th note has a planted causal partner:
+
+  | | pairs judged | calls | worst doc judged / calls | per note judged / calls | planted causal recall | semantic pair direct recall | cluster connectivity |
+  |---|---|---|---|---|---|---|---|
+  | before (all-pairs, f=0) | 736,387 | 24,007 | 1,996 / 64 | 399.1 / 13.0 | 171/185 | 0.943 | 1.000 |
+  | after, f=0.25 (default) | 194,580 | 7,167 | 511 / 17 | 105.5 / 3.9 | 174/185 | 0.476 | 0.9996 |
+  | f=0.5 (tighter) | 63,137 | 3,058 | 197 / 8 | 34.2 / 1.7 | 170/185 | 0.193 | 0.998 |
+
+  The cost: direct pairwise SEMANTIC links inside a cluster fall (they are redundant: members stay connected through the distinctly related pairs, connectivity ~1.0); typed (causal) links are kept.
 - `connected`: the reduced-pairs rule, and ONLY here the per-note collapse (the first anchor of
   each note represents it: one pair per note pair, A->B and B->A one pair; links between a
   note's other chunks and other notes are NOT judged): at most `judge_top_k` (32 = one call) neighbours per

@@ -671,7 +671,8 @@ def test_only_mutual_or_nearest_pairs_are_judged_and_cache_survives_reruns(fresh
         m.retain(f"{k} body text", source=k, index_text=f"{k} q")
     jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
     m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
-                       judge_top_k=1, judge_nearest=0, link_completeness="connected")
+                       judge_top_k=1, judge_nearest=0, link_completeness="connected",
+                       judge_floor_frac=0)
     stats = [m.link_document(d) for d in docs(m).values()]
     pairs = {frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"}
     assert pairs == {frozenset("AB")}   # C -> B is not mutual (B's top-1 is A): not judged
@@ -713,7 +714,8 @@ def test_link_completeness_setting_per_bank_and_per_linker(fresh_db):
             m.retain(f"{k} body text", source=k, index_text=f"{k} q")
         jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
         m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
-                           judge_top_k=1, judge_nearest=0, link_completeness=field)
+                           judge_top_k=1, judge_nearest=0, link_completeness=field,
+                           judge_floor_frac=0)
         for d in docs(m).values():
             m.link_document(d)
         n = len({frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"})
@@ -735,7 +737,8 @@ def test_link_pass_upgrades_connected_to_all_pairs_resumably(fresh_db):
         m.retain(f"{k} body text", source=k, index_text=f"{k} q")
     jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
     m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.0, neighbour_min_rel=0.0,
-                       judge_top_k=1, judge_nearest=0, link_completeness="connected")
+                       judge_top_k=1, judge_nearest=0, link_completeness="connected",
+                       judge_floor_frac=0)
     for d in docs(m).values():
         m.link_document(d)
     pairs = lambda: {frozenset((x, y)) for x, y, lt, st, o, c in links(m) if o == "jev"}
@@ -784,3 +787,47 @@ def test_chunk_level_link_from_a_non_first_chunk_all_pairs_vs_connected(fresh_db
         return n
     assert run("all-pairs") > 0     # the second chunk of x links to y
     assert run("connected") == 0    # the note-level representative (first chunk) never meets y
+
+
+def test_anchor_floor_scales_with_the_neighbour_distribution():
+    lk = Linker(judge_floor_frac=0.5)
+    dense = [{"cos": c} for c in (0.95, 0.94, 0.93, 0.92, 0.91)]
+    sparse = [{"cos": c} for c in (0.95, 0.8, 0.7, 0.6, 0.5)]
+    assert lk.anchor_floor(dense) > 0.92 and lk.anchor_floor(sparse) < 0.85   # rises in a cluster, falls in the open
+    assert lk.anchor_floor(dense) > lk.anchor_floor(sparse)
+    assert Linker(judge_floor_frac=0).anchor_floor(dense) == float("-inf")   # off: every qualifying pair
+    assert lk.anchor_floor(dense[:1]) == float("-inf")
+
+
+def test_all_pairs_floor_skips_marginal_pairs_loudly_and_keeps_the_nearest(fresh_db):
+    n = 12
+    vec = {f"N{i}": [1, 0.02 * i, 0, 0] for i in range(n)}   # one dense cluster, graded
+
+    def embed(ts):
+        return [[x / sum(y * y for y in vec[t.split()[0]]) ** 0.5 for x in vec[t.split()[0]]] for t in ts]
+    m = Memory(database_url=fresh_db, bank_id="fl", llm=None, embed=embed)
+    m.create_bank("fl", embedding_dim=4)
+    for k in vec:
+        m.retain(f"{k} body text", source=k, index_text=f"{k} q")
+    asked = []
+
+    def score(rel, cand, query):
+        asked.append(1)
+        return 3 if rel == "semantic" else 0
+
+    def total(frac):
+        asked.clear()
+        with psycopg.connect(fresh_db) as c:
+            c.execute("DELETE FROM memory_link_pairs")
+            c.execute("DELETE FROM memory_link_state")
+            c.commit()
+        m._linker = Linker(judge=JevRelationJudge(JevStub(score)), neighbour_min_cos=0.0,
+                           neighbour_min_rel=0.0, judge_floor_frac=frac, link_completeness="all-pairs")
+        below = 0
+        for d in docs(m).values():
+            below += m.link_document(d).get("candidates_below_floor", 0)
+        return len(asked), below
+    full, none_below = total(0)
+    bounded, below = total(0.5)
+    assert none_below == 0 and below > 0 and bounded < full   # fewer questions, the skipped pairs counted
+    m.close()

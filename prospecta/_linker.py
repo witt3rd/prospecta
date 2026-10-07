@@ -55,6 +55,7 @@ HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fe
 NEIGHBOUR_PAGE = 16        # rows per HNSW fetch (throughput; doubles until the stop rule is decided)
 JUDGE_TOP_K = 32           # neighbour notes judged per note: one call at 96 questions (32 x 3 relations)
 JUDGE_NEAREST = 3          # a note's nearest neighbours are judged even when not mutual
+JUDGE_FLOOR_FRAC = 0.25    # all-pairs: judge a candidate above median + frac x (best - median) of the anchor's neighbours; 0 = off
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 TEMPORAL_DAYS = 3
@@ -369,6 +370,7 @@ class Linker:
     vector_floor: float = VECTOR_FLOOR
     judge_top_k: int = JUDGE_TOP_K          # a note judges at most its top-K neighbour notes ...
     judge_nearest: int = JUDGE_NEAREST      # ... always its nearest few, the rest only if mutual
+    judge_floor_frac: float = JUDGE_FLOOR_FRAC   # all-pairs relative floor (see anchor_floor); 0 judges every qualifying pair
     link_completeness: str | None = None    # 'all-pairs' | 'connected'; None = the bank's recall_config, else 'all-pairs'
     asynchronous: bool = True      # Memory runs it on a worker thread after retain
 
@@ -722,8 +724,20 @@ class Linker:
             raise ValueError(f"link_completeness must be 'connected' or 'all-pairs', got {mode!r}")
         return mode
 
+    def anchor_floor(self, cands) -> float:
+        """The per-anchor similarity floor of the all-pairs pass, relative to the
+        anchor's own neighbour distribution (no count cap): median + judge_floor_frac
+        x (best - median) of the candidates' cosines. In a dense cluster the median
+        is close to the best, so the floor sits high and only distinctly related
+        pairs are judged; in a sparse region the spread is wide and the floor falls."""
+        if self.judge_floor_frac <= 0 or len(cands) < 2:
+            return float("-inf")
+        cos = sorted(float(c["cos"]) for c in cands)
+        median = cos[len(cos) // 2]
+        return median + self.judge_floor_frac * (cos[-1] - median)
+
     def _judged_edges(self, conn, bank_id, me, cands, kind, dim, stats, calls,
-                      all_pairs=False):
+                      all_pairs=False, floor=float("-inf")):
         """Relation edges (src, dst, link_type, subtype, confidence) between the
         representative item `me` and each candidate representative in `cands`
         (best first).
@@ -742,6 +756,9 @@ class Linker:
         With all_pairs (link_completeness = 'all-pairs', the default) every qualifying
         candidate is judged: no top-K cap, no mutual test (duplicates and the cache still
         apply). 'connected' is the cheaper explicit setting.
+        With all_pairs, `floor` (anchor_floor) skips judging a candidate whose cosine is
+        below it, except the `judge_nearest` best; counted in candidates_below_floor,
+        never silent. Cached pairs are still read back (free).
         The rest are judged in batched calls; each judgment is stored once."""
         th_me = self.text_hash(self._text(me))
         edges: list[tuple] = []
@@ -768,6 +785,8 @@ class Linker:
                 edges += [(me["id"], c["id"], lt, st, float(cf), rank, (bool(fw) == me_lo))
                           for lt, st, cf, fw in cached[h]]
                 stats["candidates_cached"] = stats.get("candidates_cached", 0) + 1
+            elif all_pairs and rank >= self.judge_nearest and float(c["cos"]) < floor:
+                stats["candidates_below_floor"] = stats.get("candidates_below_floor", 0) + 1
             elif all_pairs or rank < self.judge_nearest or self._mutual(
                     conn, bank_id, kind, dim, me["document_id"], c):
                 todo.append(p)
@@ -839,7 +858,8 @@ class Linker:
                     for a, cands in per_anchor:
                         me = dict(a, document_id=doc)
                         groups.append((me, cands, self._judged_edges(
-                            conn, bank_id, me, cands, kind, dim, stats, calls, all_pairs=True)))
+                            conn, bank_id, me, cands, kind, dim, stats, calls, all_pairs=True,
+                            floor=self.anchor_floor(cands))))
                 else:   # 'connected': one representative pair per note, the top judge_top_k notes
                     reps = self._doc_reps(conn, [d for d, _ in ranked], kind)
                     me = dict(anchors[0], document_id=doc)
