@@ -16,7 +16,9 @@ physical window, not a clip; **tuning** = a constant of an algorithm, not a cap;
 | Evidence clip for the reranker (`EVIDENCE_CHARS`, 1000) | `stages.py` | **removed** | the best chunk goes in full; a chunk is already bounded by chunking | was ours |
 | Jev passage clip (`JEV_PASSAGE_CHARS`, 2400) | `stages.py`, `_linker.py` | **removed** | replaced by `fit_passage`: cut only if one passage cannot fit a request (below), with a full-text warning | was ours |
 | Jev request size | `stages.py` `JEV_INPUT_BYTES` | 60,000 B | Jev provider request limit; items are split across requests, a lone passage over `JEV_PASSAGE_MAX_BYTES` is cut with a warning | physical |
-| Jev candidates per request | `JEV_BATCH` / `JEV_MAX_BATCH` | 15 / 16 | Jev accepts at most 16 candidates per request; larger pools use several requests (the Linker batches by `JEV_MAX_BATCH` candidates, all relation questions each, within `JEV_INPUT_BYTES`) | physical |
+| Jev candidates per request (reranker) | `JEV_BATCH` / `JEV_MAX_BATCH` | 15 / 16 | the reranker sends at most 16 candidates per request; larger pools use several requests | physical |
+| Linker Jev questions per request | `JevRelationJudge(max_questions_per_call=JEV_MAX_QUESTIONS_PER_CALL, relations_per_call=True)` | 96 | verified live: 48, 96, 150, 300 questions answered; the cap is a config, larger sets split | ours-config |
+| Linker Jev input tokens per request | `JevRelationJudge(max_input_tokens=JEV_MAX_INPUT_TOKENS)` | 45,000 (est. 4 chars/token) | verified live: 56.6k tokens ok, 300 questions x 1,000 chars (419 KB) fails HTTP 400 `max_tokens_exceeded`; requests split by the estimate, never drop or cut a candidate; a 400 halves and retries | physical |
 | Jev timeout | `JEV_TIMEOUT_S` | 10 s | latency bound on an optional stage; failure keeps the fused order | ours-config (constructor arg) |
 | Fallback chunk (`_matching_chunk`) | `_retain.py` | **removed clip** | the text is returned whole when a note has no chunk items | was ours |
 | Graph hop clamp (`MAX_HOPS` min) | `channels/graph.py` | **removed clamp**; default 2 | `max_hops` is a walk-depth param; default stays 2 | ours-config |

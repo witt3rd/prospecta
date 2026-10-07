@@ -36,7 +36,7 @@ import psycopg.errors
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
-    JEV_MAX_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
+    CHARS_PER_TOKEN, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
     JevTransport, call_llm, parse_json_object, totals,
 )
 
@@ -47,6 +47,8 @@ NEIGHBOUR_MIN_REL = 0.9    # candidates per anchor: neighbours with cosine >= 0.
                            # compressed (0.5..0.9), so 0.6 admitted nearly every note: the import was quadratic.
 NEIGHBOUR_MIN_COS = 0.5    # absolute floor: a neighbour below this cosine is never judged, whatever the relative stop
                            # says (cosines of unrelated notes sit at 0.2..0.4; related ones above 0.5). Configurable.
+JEV_MAX_QUESTIONS_PER_CALL = 96   # questions per Jev request (verified live: 48, 96, 150, 300 answered; config)
+JEV_MAX_INPUT_TOKENS = 45_000     # estimated input tokens per request (verified: 56.6k ok, ~110k+ fails 400); split above it
 JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfaced (state error, pgvector fallback)
 JUDGE_BACKOFF_S = 0.5
 HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
@@ -166,6 +168,20 @@ WHERE a.id = %(item)s
 """
 
 
+class _TooLarge(Exception):
+    """Jev answered HTTP 400 max_tokens_exceeded: the request is split and retried."""
+
+
+def _is_max_tokens(exc: Exception) -> bool:
+    body = ""
+    if hasattr(exc, "read"):   # urllib HTTPError: the body names the error
+        try:
+            body = exc.read().decode(errors="replace")
+        except Exception:
+            pass
+    return "max_tokens_exceeded" in f"{exc} {body}"
+
+
 @dataclass
 class RelationHit:
     candidate: int          # index into the candidates asked about
@@ -200,12 +216,27 @@ class JevRelationJudge:
     """Jev (System One, `score` questions, 0..3) answers the relation questions
     of Jev-Mem's linker: semantic, causes, caused_by, one question per
     (candidate, relation). score / 3 is the confidence; a link needs at least
-    `threshold` (0.6). Same wire shape and limits as the Jev reranker."""
+    `threshold` (0.6).
+
+    Batching (verified on the live wire by the scout: 48, 96, 150 and 300
+    questions per request were answered; 300 questions of 1,000 chars, 419 KB,
+    failed loud with HTTP 400 max_tokens_exceeded): the real limit is input
+    TOKENS, not questions. A request holds up to `max_questions_per_call`
+    questions (96) and an estimated `max_input_tokens` (45,000) at most; with
+    `relations_per_call` all relation questions of a candidate travel together.
+    A larger set SPLITS into several requests; no candidate or text is dropped
+    or cut. A 400 max_tokens_exceeded halves the request and retries."""
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
-                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD):
+                 timeout: float = JEV_TIMEOUT_S, threshold: float = JEV_THRESHOLD,
+                 max_questions_per_call: int = JEV_MAX_QUESTIONS_PER_CALL,
+                 max_input_tokens: int = JEV_MAX_INPUT_TOKENS,
+                 relations_per_call: bool = True):
         self.transport, self.model, self.timeout = transport, model, timeout
         self.threshold = threshold
+        self.max_questions_per_call = max_questions_per_call
+        self.max_input_tokens = max_input_tokens
+        self.relations_per_call = relations_per_call
 
     def _question(self, relation: str, cand: str) -> dict:
         return {"type": "score",
@@ -213,64 +244,107 @@ class JevRelationJudge:
                                  "title": relation, "text": fit_passage(cand, relation)},
                 "criteria": _RELATION_CRITERIA}
 
+    def _units(self, candidates: list[str]) -> list[list[tuple[int, str]]]:
+        """The indivisible groups of questions: a candidate's relation questions
+        together (when relations_per_call and they fit one request), else single."""
+        together = self.relations_per_call and self.max_questions_per_call >= len(RELATIONS)
+        if together:
+            return [[(ci, rel) for rel in RELATIONS] for ci in range(len(candidates))]
+        return [[(ci, rel)] for ci in range(len(candidates)) for rel in RELATIONS]
+
+    def _batches(self, source_text, candidates) -> list[list[tuple[int, str]]]:
+        base = len(json.dumps(self._request(source_text, candidates, [])).encode())
+        batches, cur, q, size = [], [], 0, base
+        for unit in self._units(candidates):
+            usize = sum(len(json.dumps(self._question(rel, candidates[ci])).encode()) + 12
+                        for ci, rel in unit)
+            if cur and (q + len(unit) > self.max_questions_per_call
+                        or (size + usize) // CHARS_PER_TOKEN > self.max_input_tokens):
+                batches.append(cur)
+                cur, q, size = [], 0, base
+            cur += unit
+            q += len(unit)
+            size += usize
+        if cur:
+            batches.append(cur)
+        return batches
+
     def judge(self, source_text: str, candidates: list[str],
               calls: list[dict]) -> list[RelationHit]:
-        # one request scores up to JEV_MAX_BATCH candidates (all their relation
-        # questions) within JEV_INPUT_BYTES: the wire note's limits (the live
-        # wire was verified past 300 questions; the real limit is input tokens,
-        # which the byte bound keeps clear). Larger sets split, none is dropped.
-        batches: list[list[tuple[int, str]]] = []
-        cur: list[int] = []
-        for ci in range(len(candidates)):
-            trial = cur + [ci]
-            if cur and (len(trial) > JEV_MAX_BATCH or len(json.dumps(self._request(
-                    source_text, candidates, self._asks(trial))).encode()) > JEV_INPUT_BYTES):
-                batches.append(self._asks(cur))
-                cur = [ci]
-            else:
-                cur = trial
-        if cur:
-            batches.append(self._asks(cur))
         hits: list[RelationHit] = []
-        for batch in batches:
-            req = self._request(source_text, candidates, batch)
-            t0 = time.monotonic()
-            rec: dict = {"purpose": "jev_relations", "model": self.model, "tokens_in": None,
-                         "tokens_out": None, "cost_usd": None, "json_mode": False,
-                         "messages_count": len(batch), "prompt_text": json.dumps(req),
-                         "response_text": None, "error": None}
+        pending = self._batches(source_text, candidates)
+        while pending:
+            batch = pending.pop(0)
             try:
-                resp = self.transport(req, self.timeout)
-                rec["response_text"] = json.dumps(resp)
-                u = resp.get("usage") or {}
-                rec.update(model=resp.get("model") or self.model,
-                           tokens_in=u.get("input_tokens"),
-                           tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
-                answers = resp.get("answers")
-                if not isinstance(answers, dict) or set(answers) != {
-                        f"p{n}" for n in range(len(batch))}:
-                    raise ValueError("answers are not exactly the asked ids")
-                for n, (ci, rel) in enumerate(batch):
-                    a = answers[f"p{n}"]
-                    v = a.get("score") if isinstance(a, dict) else None
-                    if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                            or not 0 <= v <= 3:
-                        raise ValueError("answer does not score every question in 0..3")
-                    conf = float(v) / 3.0
-                    if conf >= self.threshold:
-                        lt, st, fwd = RELATIONS[rel]
-                        hits.append(RelationHit(ci, lt, st, conf, fwd))
-            except Exception as exc:
-                rec["error"] = f"{type(exc).__name__}: {exc}"
-                raise
-            finally:
-                rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
-                calls.append(rec)
+                hits.extend(self._send(source_text, candidates, batch, calls))
+            except _TooLarge:
+                units = self._regroup(batch)
+                if len(units) < 2:
+                    logger.error("jev link request of one candidate is over the token limit "
+                                 "(max_tokens_exceeded); full source text: %s; full candidate "
+                                 "text: %s", source_text, candidates[batch[0][0]])
+                    raise
+                mid = len(units) // 2
+                logger.warning("jev max_tokens_exceeded on %d questions: halving", len(batch))
+                pending[:0] = [[a for u in units[:mid] for a in u],
+                               [a for u in units[mid:] for a in u]]
         return hits
 
     @staticmethod
-    def _asks(cis: list[int]) -> list[tuple[int, str]]:
-        return [(ci, rel) for ci in cis for rel in RELATIONS]
+    def _regroup(batch):
+        """The batch's asks grouped by candidate, in order (a candidate stays whole
+        when it is the only one it can be split into)."""
+        groups: list[list[tuple[int, str]]] = []
+        for ask in batch:
+            if groups and groups[-1][0][0] == ask[0]:
+                groups[-1].append(ask)
+            else:
+                groups.append([ask])
+        if len(groups) < 2 and len(batch) > 1:   # one candidate, several questions
+            return [[a] for a in batch]
+        return groups
+
+    def _send(self, source_text, candidates, batch, calls) -> list[RelationHit]:
+        hits: list[RelationHit] = []
+        req = self._request(source_text, candidates, batch)
+        t0 = time.monotonic()
+        rec: dict = {"purpose": "jev_relations", "model": self.model, "tokens_in": None,
+                     "tokens_out": None, "cost_usd": None, "json_mode": False,
+                     "messages_count": len(batch), "prompt_text": json.dumps(req),
+                     "response_text": None, "error": None}
+        try:
+            try:
+                resp = self.transport(req, self.timeout)
+            except Exception as exc:
+                if _is_max_tokens(exc):
+                    raise _TooLarge(str(exc)) from exc
+                raise
+            rec["response_text"] = json.dumps(resp)
+            u = resp.get("usage") or {}
+            rec.update(model=resp.get("model") or self.model,
+                       tokens_in=u.get("input_tokens"),
+                       tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
+            answers = resp.get("answers")
+            if not isinstance(answers, dict) or set(answers) != {
+                    f"p{n}" for n in range(len(batch))}:
+                raise ValueError("answers are not exactly the asked ids")
+            for n, (ci, rel) in enumerate(batch):
+                a = answers[f"p{n}"]
+                v = a.get("score") if isinstance(a, dict) else None
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not 0 <= v <= 3:
+                    raise ValueError("answer does not score every question in 0..3")
+                conf = float(v) / 3.0
+                if conf >= self.threshold:
+                    lt, st, fwd = RELATIONS[rel]
+                    hits.append(RelationHit(ci, lt, st, conf, fwd))
+        except Exception as exc:
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            calls.append(rec)
+        return hits
 
     def _request(self, source_text, candidates, batch) -> dict:
         return {"model": self.model, "state": {"query": source_text},

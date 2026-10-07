@@ -17,7 +17,6 @@ from prospecta.channels import (
     run_channels,
 )
 from prospecta.memory import Memory
-from prospecta.stages import JEV_INPUT_BYTES
 from prospecta.stages import (
     JevReader, JevScore, Item, LLMResult, StageDeps, run_stages, validate_recall_config,
 )
@@ -558,21 +557,68 @@ def test_neighbours_absolute_floor_cuts_even_when_relative_stop_admits():
     assert neighbours_until_drop(rows, lambda r: r["cos"], 0.9, page=8, floor=0.7)[0] == []
 
 
-def test_judge_batches_16_candidates_per_call_and_drops_none():
-    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+def _sem(rel, cand, query):
+    return 3 if rel == "semantic" else 0
+
+
+def test_judge_default_96_questions_per_call_relations_together_and_drops_none():
+    jev = JevStub(_sem)
     cands = [f"cand {i}" for i in range(40)]
     hits = JevRelationJudge(jev).judge("query", cands, [])
-    assert [len(r["questions"]) for r in jev.requests] == [48, 48, 24]   # 16 + 16 + 8 candidates
+    assert [len(r["questions"]) for r in jev.requests] == [96, 24]   # 32 + 8 candidates
     assert sorted(h.candidate for h in hits) == list(range(40))
 
 
-def test_judge_splits_requests_at_the_byte_limit_and_drops_none():
-    jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
-    cands = [f"cand {i} " + "x" * 3000 for i in range(16)]
+def test_judge_question_limit_is_configurable_and_relations_switch():
+    cands = [f"cand {i}" for i in range(10)]
+    jev = JevStub(_sem)
+    hits = JevRelationJudge(jev, max_questions_per_call=16).judge("query", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [15, 15]   # 5 whole candidates a call
+    assert sorted(h.candidate for h in hits) == list(range(10))
+    jev = JevStub(_sem)   # relations_per_call off: single questions fill the limit
+    JevRelationJudge(jev, max_questions_per_call=16, relations_per_call=False).judge("q", cands, [])
+    assert [len(r["questions"]) for r in jev.requests] == [16, 14]
+
+
+def test_judge_splits_at_the_token_estimate_and_drops_none():
+    jev = JevStub(_sem)
+    cands = [f"cand {i} " + "x" * 12000 for i in range(20)]   # ~720 KB: far over 45k tokens
     hits = JevRelationJudge(jev).judge("query", cands, [])
     assert len(jev.requests) > 1
-    assert all(len(json.dumps(r).encode()) <= JEV_INPUT_BYTES for r in jev.requests)
-    assert sorted(h.candidate for h in hits) == list(range(16))
+    assert all(len(json.dumps(r).encode()) // 4 <= 45_000 for r in jev.requests)
+    assert sorted(h.candidate for h in hits) == list(range(20))
+    assert sum(len(r["questions"]) for r in jev.requests) == 60
+
+
+class TokenLimitedJev(JevStub):
+    """The live behaviour: a request over the token limit fails loud with HTTP 400."""
+
+    def __init__(self, rule, limit_tokens):
+        super().__init__(rule)
+        self.limit, self.rejected = limit_tokens, 0
+
+    def __call__(self, request, timeout):
+        if len(json.dumps(request).encode()) // 3 > self.limit:
+            self.rejected += 1
+            raise RuntimeError('HTTP 400 {"error": "max_tokens_exceeded"}')
+        return super().__call__(request, timeout)
+
+
+def test_judge_halves_and_retries_on_max_tokens_exceeded():
+    # the estimate (45k tokens at 4 chars) lets 29 KB-ish through that the wire (3 chars/token, 8k) refuses
+    jev = TokenLimitedJev(_sem, limit_tokens=8_000)
+    cands = [f"cand {i} " + "x" * 3000 for i in range(16)]
+    calls: list = []
+    hits = JevRelationJudge(jev).judge("query", cands, calls)
+    assert jev.rejected >= 1
+    assert sorted(h.candidate for h in hits) == list(range(16))   # every candidate judged
+    assert sum(1 for c in calls if c["error"]) == jev.rejected
+
+
+def test_judge_single_candidate_over_the_limit_surfaces():
+    jev = TokenLimitedJev(_sem, limit_tokens=100)
+    with pytest.raises(Exception, match="max_tokens_exceeded"):
+        JevRelationJudge(jev).judge("query", ["cand " + "x" * 3000], [])
 
 
 def test_each_unordered_pair_is_judged_once_and_rerun_asks_nothing(mem):

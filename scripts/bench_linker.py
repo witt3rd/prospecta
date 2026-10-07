@@ -5,16 +5,22 @@ Stub Jev counts calls and PRICES them with a per-call token model: calls, tokens
 and cost are a MODEL of the real service (nothing leaves the process), the
 neighbour selection, batching and pair cache are the real code under test.
 
-Batching: up to 16 candidates (all relation questions) per call within 60 KB; the live
-wire was verified at 48..300 questions per request (limit is input tokens).
+Batching (JevRelationJudge defaults): up to 96 questions (32 candidates x 3 relations) and
+an estimated 45,000 input tokens per call. Live wire, verified by the scout: 48, 96, 150
+and 300 questions per request answered; 300 questions x 1,000 chars (419 KB) failed loud
+with HTTP 400 max_tokens_exceeded: the real limit is input tokens. A 400 halves and retries.
 
 Run it once per code version (the label is only printed): the same script runs
 against current main (checkout elsewhere, PYTHONPATH=<dir>) and against this branch.
 
-Measured (stub model, fixed clusters; calls per note at 500/1000/1845/3690 notes):
-  main   (PR 43):  5.52 / 8.60 / 5.74 / 4.36   cost 12.0 / 38.8 / 46.5 / 68.9 USD
-  batched+pair-cache+floor 0.5:  1.46 / 2.11 / 1.64 / 1.39   cost 7.2 / 24.3 / 30.8 / 49.3 USD
-Past the cluster plateau (1845 -> 3690) the extra notes cost ~1.15 calls each: linear.
+Measured (STUB cost model, fixed clusters; calls per note at 500/1000/1845/3690 notes):
+  main (PR 43):                       5.52 / 8.60 / 5.74 / 4.36   12392 calls, 46.5 USD at 1845
+  this branch, 16 questions per call: 3.30 / 5.24 / 3.76 / 3.09   6932 calls, 31.1 USD at 1845
+                                      (BENCH_MAX_QUESTIONS=16 BENCH_RELATIONS_PER_CALL=0)
+  this branch, default 96 per call:   1.06 / 1.36 / 1.17 / 1.05   2153 calls, 30.8 USD at 1845
+Past the cluster plateau (1845 -> 3690) the extra notes cost ~1.0 call each: linear. Cost
+is driven by input tokens, which batching does not change; the pair cache and the cosine
+floor cut the judged pairs (main 57k judged vs 33k at 1845 notes in the scaled corpus).
 
   BENCH_LABEL=after PROSPECTA_TEST_PG_URL=postgresql://... python scripts/bench_linker.py 500 1000 1845
 """
@@ -138,7 +144,12 @@ def run(base_url: str, n: int, mode: str):
             m.retain(t, source=f"s{i}", index_text=t, metadata={   # one note a day, as a diary
                 "created": (datetime.date(2020, 1, 1) + datetime.timedelta(days=i // 2)).isoformat()})
         t_retain = time.monotonic() - t0
-        m._linker = Linker(judge=JevRelationJudge(jev))
+        kw = {}   # BENCH_MAX_QUESTIONS / BENCH_RELATIONS_PER_CALL=0 select the other settings
+        if os.environ.get("BENCH_MAX_QUESTIONS"):
+            kw["max_questions_per_call"] = int(os.environ["BENCH_MAX_QUESTIONS"])
+        if os.environ.get("BENCH_RELATIONS_PER_CALL") == "0":
+            kw["relations_per_call"] = False
+        m._linker = Linker(judge=JevRelationJudge(jev, **kw))
         t1 = time.monotonic()
         with psycopg.connect(url) as c:
             ids = [r[0] for r in c.execute("SELECT id::text FROM documents ORDER BY created_at, id")]
