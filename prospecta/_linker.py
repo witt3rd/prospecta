@@ -88,11 +88,11 @@ prev AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) < (me.dt
          ORDER BY o.dt DESC, o.created_at DESC, o.id DESC LIMIT 1),
 nxt AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) > (me.dt, me.created_at, me.id)
         ORDER BY o.dt, o.created_at, o.id LIMIT 1),
-near AS (SELECT o.id, abs(o.dt - me.dt) AS days FROM others o, me
+closest AS (SELECT min(abs(o.dt - me.dt)) AS days FROM others o, me
+            WHERE abs(o.dt - me.dt) <= %(days)s),
+near AS (SELECT o.id, abs(o.dt - me.dt) AS days FROM others o, me, closest cl
           WHERE abs(o.dt - me.dt) <= %(days)s
-            AND 1.0 / (1 + abs(o.dt - me.dt)) >= %(rel)s * (
-                SELECT 1.0 / (1 + min(abs(o2.dt - me.dt))) FROM others o2
-                WHERE abs(o2.dt - me.dt) <= %(days)s)),
+            AND 1.0 / (1 + abs(o.dt - me.dt)) >= %(rel)s * (1.0 / (1 + cl.days))),
 rep AS (   -- one representative item per note: the first anchor
     SELECT DISTINCT ON (d.id) d.id AS doc, m.id AS item
     FROM documents d JOIN memory_items m ON m.document_id = d.id
