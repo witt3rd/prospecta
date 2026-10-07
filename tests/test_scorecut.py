@@ -83,3 +83,19 @@ def test_reader_reads_every_batch_and_unions_follow_ups():
     r = R()
     ok, fu = read_all(r, "q", [_item(i) for i in range(4)], [], context_tokens=4_000 + 25)
     assert not ok and sum(r.seen) == 4 and len(fu) == len(r.seen) > 1
+
+
+def test_jev_reader_requests_stay_under_its_byte_limit():
+    from prospecta.stages import JEV_INPUT_BYTES, JevReader
+    sizes = []
+
+    def transport(req, timeout):
+        sizes.append(len(json.dumps(req).encode()))
+        return {"answers": {k: {"score": 3} for k in req["questions"]}}
+    items = []
+    for i in range(20):
+        it = _item(i)
+        it.evidence = "e" * 8_000
+        items.append(it)
+    ok, _ = read_all(JevReader(transport), "q", items, [])
+    assert ok and len(sizes) > 1 and max(sizes) <= JEV_INPUT_BYTES

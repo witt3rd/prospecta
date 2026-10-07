@@ -19,7 +19,7 @@ from typing import Any, Callable, Protocol
 
 from prospecta._filters import coerce_date
 from prospecta._scorecut import (POOL_MIN_REL, READER_MIN_REL, rel_cut,
-                                 RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, split_batches)
+                                 RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, split_batches)
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
@@ -654,6 +654,7 @@ class JevReader:
     bridge to the second fact). On any failure the hop is skipped (the caller
     records the error)."""
     name = "jev_reader"
+    batch_tokens = (JEV_INPUT_BYTES - 2_000) // (len(_STOP_QUESTIONS) * CHARS_PER_TOKEN)
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
                  timeout: float = JEV_TIMEOUT_S):
@@ -790,8 +791,8 @@ def read_all(reader, query: str, items: list[Item], calls: list[dict],
     """The reader sees every qualifying note. Only the model's window forces a
     split: then each batch is read (map) and the verdicts merge (reduce):
     sufficient only if every batch is, follow-ups are the union."""
-    batches = split_batches(items, lambda it: it.header + it.evidence,
-                            context_tokens - RESERVED_TOKENS) or [[]]
+    budget = getattr(reader, "batch_tokens", context_tokens - RESERVED_TOKENS)
+    batches = split_batches(items, lambda it: it.header + it.evidence, budget) or [[]]
     sufficient, fus = True, []
     for b in batches:
         last: Exception | None = None
