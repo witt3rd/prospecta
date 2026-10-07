@@ -140,3 +140,42 @@ def test_semantic_channel_reaches_qualifying_items_beyond_hnsw_ef_search(fresh_d
             assert len(cur.execute(sql, (lit,)).fetchall()) == 100
     m.close()
     assert len(got) == total
+
+
+def test_new_defaults_keep_strict_gold_notes_the_old_ones_drop():
+    """Synthetic corpus: gold notes score low against the best (cosine 0.5x, BM25 0.1x,
+    fused 0.2x). The old defaults (channels 0.6 / 0.15, pool 0.4) drop them; the new
+    ones (no channel cut, pool 0.15) keep them."""
+    from prospecta._scorecut import CHANNEL_MIN_REL, POOL_MIN_REL
+    from prospecta.channels.bm25 import Bm25Chunks
+    from prospecta.channels.semantic import DenseChunks, AnticipatedQuestions
+    cos = [("best", 0.9), ("gold", 0.45), ("other", 0.8)]
+    bm = [("best", 20.0), ("gold", 2.0), ("other", 10.0)]
+    fused = [("best", 1.0), ("gold", 0.2), ("other", 0.5)]
+
+    def keep(rows, rel):
+        return {n for n, _ in rel_cut(rows, lambda r: r[1], rel)}
+    assert "gold" not in keep(cos, 0.6) and "gold" not in keep(bm, 0.15)
+    assert "gold" not in keep(fused, 0.4)
+    assert CHANNEL_MIN_REL == 0 and keep(cos, CHANNEL_MIN_REL) == {"best", "gold", "other"}
+    assert keep(bm, CHANNEL_MIN_REL) == {"best", "gold", "other"}
+    assert POOL_MIN_REL == 0.15 and "gold" in keep(fused, POOL_MIN_REL)
+    assert "gold" in keep(fused, 0.05)
+    assert Bm25Chunks().min_rel == 0 and DenseChunks().min_rel == 0
+    assert AnticipatedQuestions().min_rel == 0
+    assert DenseChunks(min_rel=0.6).min_rel == 0.6      # explicit override stays
+
+
+def test_default_rerank_pool_cut_and_report_line():
+    from prospecta.stages import DEFAULT_RECALL_CONFIG
+    from prospecta.evaluation import format_report
+    assert DEFAULT_RECALL_CONFIG["rerank"]["min_rel_score"] == 0.15
+    rep = {"bank": "b", "n_questions": 0, "legacy_bank_scored_with_defaults": False,
+           "full": {"stages": {}, "summary": {
+               "gold": {"hit1": 1.0, "hit10": 1.0, "mrr": 1.0, "cover10": 1.0},
+               "gold2": {"n": 0}, "by_class": {}}},
+           "recall_config": DEFAULT_RECALL_CONFIG,
+           "channel_config": [{"name": "bm25"}, {"name": "dense_chunk"}]}
+    text = format_report(rep)
+    assert ("cuts: channels bm25 0.0, dense_chunk 0.0 (0 = no cut); "
+            "rerank pool >= 0.15 x best fused score") in text

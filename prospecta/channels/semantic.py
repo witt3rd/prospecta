@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 
-from prospecta._scorecut import CHANNEL_DEFAULT_MIN_REL, CHANNEL_MIN_REL, fetch_until_cut
+from prospecta._scorecut import CHANNEL_MIN_REL, fetch_until_cut
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.db.queries import _meta_param, _vec_literal
 
@@ -61,7 +61,7 @@ class _Semantic:
     def __init__(self, min_rel: float | None = None, **_legacy):
         """`min_rel`: keep every item whose cosine >= min_rel x the best cosine
         (no count). Legacy `limit` in a stored config is ignored."""
-        self.min_rel = CHANNEL_MIN_REL.get(self.name, CHANNEL_DEFAULT_MIN_REL) \
+        self.min_rel = CHANNEL_MIN_REL \
             if min_rel is None else float(min_rel)
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:

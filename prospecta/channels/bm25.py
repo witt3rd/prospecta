@@ -274,7 +274,7 @@ class Bm25Chunks:
     def __init__(self, min_rel: float | None = None, **_legacy):
         """`min_rel`: keep every chunk whose BM25 score >= min_rel x the best
         (no count). Legacy `limit` in a stored config is ignored."""
-        self.min_rel = CHANNEL_MIN_REL["bm25"] if min_rel is None else float(min_rel)
+        self.min_rel = CHANNEL_MIN_REL if min_rel is None else float(min_rel)
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         mult = 4 if state.metadata_filter else 1
