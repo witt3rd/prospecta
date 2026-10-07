@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from prospecta._entities import resolve_entities
+from prospecta._entities import fold_path, resolve_entities
 from prospecta._llmutil import llm_call_record, llm_text
 from prospecta._template import render_prompt
 from prospecta.db.queries import _meta_param
@@ -66,11 +66,6 @@ class MapReduceResult:
     notes_visited: int = 0
     facts_found: int = 0
     plan: dict = field(default_factory=dict)
-
-
-def _norm_name(name: str) -> str:
-    n = name.strip().replace("\\", "/").casefold()
-    return n[:-3] if n.endswith(".md") else n
 
 
 def _norm_fact(fact: str) -> str:
@@ -182,13 +177,13 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     scan = [n for n in names if _clean(n) != _clean(entity)] if found else list(names)
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
                                scan_relevance=scan_relevance)
-    by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
+    by_norm = {fold_path(src): (doc, src) for doc, src, _ in notes}
     base_count: dict[str, int] = {}
     for _, src, _ in notes:
-        b = _norm_name(src).rsplit("/", 1)[-1]
+        b = fold_path(src).rsplit("/", 1)[-1]
         base_count[b] = base_count.get(b, 0) + 1
-    by_base = {_norm_name(src).rsplit("/", 1)[-1]: (doc, src) for doc, src, _ in notes
-               if base_count[_norm_name(src).rsplit("/", 1)[-1]] == 1}
+    by_base = {fold_path(src).rsplit("/", 1)[-1]: (doc, src) for doc, src, _ in notes
+               if base_count[fold_path(src).rsplit("/", 1)[-1]] == 1}
     calls: list[dict] = []
     progress: list[dict] = []
     raw_facts: list[dict] = []   # {fact, note}
@@ -233,12 +228,12 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     for it in items:
         it["citations"] = []
         for n in it["notes"]:
-            k = _norm_name(n)
+            k = fold_path(n)
             doc, src = by_norm.get(k) or by_base.get(k.rsplit("/", 1)[-1], (None, n))
             c = {"note": src, "document_id": doc, "known": doc is not None}
             it["citations"].append(c)
-            if _norm_name(src) not in seen:
-                seen.add(_norm_name(src))
+            if fold_path(src) not in seen:
+                seen.add(fold_path(src))
                 citations.append(c)
     text = "\n".join(f"- {it['fact']} " + " ".join(f"[{n}]" for n in
                      dict.fromkeys(c["note"] for c in it["citations"])) for it in items) \

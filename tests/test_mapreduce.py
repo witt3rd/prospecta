@@ -335,3 +335,12 @@ def test_mapreduce_keeps_every_entity_linked_note_despite_weak_text_hits(fresh_d
     assert set(linked) <= got and set(linked) <= got_alias
     assert {"ws0.md", "ws1.md", "ws2.md"} <= got
     m.close()
+
+
+def test_mapreduce_has_no_private_folding():
+    import inspect
+    from prospecta import _mapreduce, _entities
+    assert not hasattr(_mapreduce, "_norm_name")
+    assert _mapreduce.fold_path is _entities.fold_path
+    assert "unicodedata" not in inspect.getsource(_mapreduce)
+    assert _entities.fold_path("A\\Mr.  Nelson.MD") == "a/mr nelson"

@@ -47,6 +47,14 @@ def fold(name: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
 
 
+def fold_path(name: str) -> str:
+    """Fold a note path/name: fold() each path segment, drop a trailing .md."""
+    n = name.strip().replace("\\", "/")
+    if n.casefold().endswith(".md"):
+        n = n[:-3]
+    return "/".join(fold(seg) for seg in n.split("/"))
+
+
 def tokens(name: str) -> list[str]:
     """Core tokens: folded, honorifics/articles removed, initials kept only if
     nothing longer remains."""
