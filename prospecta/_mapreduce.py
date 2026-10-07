@@ -9,6 +9,7 @@ Completeness over speed. Bounded by an explicit batch size; every batch is
 recorded in a progress trace (notes visited, facts found, cost)."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -24,6 +25,19 @@ DEFAULT_BATCH_SIZE = 8
 MAP_ATTEMPTS = 2   # a failed batch is retried once, then surfaced
 DEFAULT_EXCERPT_CHARS = 6000   # a note longer than this is sent as its entity-mention paragraphs
 
+_ENTITIES_SQL = """
+SELECT e.id, e.name, e.norm FROM memory_entities e
+WHERE e.bank_id = %(bank)s
+  AND (e.norm = ANY(%(names)s)
+       OR e.id IN (SELECT a.entity_id FROM memory_entity_aliases a
+                   WHERE a.bank_id = %(bank)s AND a.norm = ANY(%(names)s)))
+"""
+
+_ALIASES_SQL = """
+SELECT a.alias, a.norm FROM memory_entity_aliases a
+WHERE a.bank_id = %(bank)s AND a.entity_id = ANY(%(ids)s)
+"""
+
 _NOTES_SQL = """
 SELECT d.id::text, d.source, d.original_text
 FROM documents d
@@ -32,16 +46,18 @@ WHERE d.bank_id = %(bank)s
         lower(btrim(d.person)) = ANY(%(names)s)
      OR d.id IN (
             SELECT m.document_id
-            FROM memory_entities e
-            JOIN memory_item_entities ie ON ie.entity_id = e.id
+            FROM memory_item_entities ie
             JOIN memory_items m ON m.id = ie.item_id
-            WHERE e.bank_id = %(bank)s AND e.norm = ANY(%(names)s))
+            WHERE ie.entity_id = ANY(%(ids)s))
+     OR (%(rx)s <> '' AND d.original_text ~* %(rx)s)
   )
   AND (%(meta)s::jsonb IS NULL OR EXISTS (
             SELECT 1 FROM memory_items mi
             WHERE mi.document_id = d.id AND mi.metadata @> %(meta)s::jsonb))
 ORDER BY d.source, d.id
 """
+
+MIN_SCAN_CHARS = 3   # an alias shorter than this is too ambiguous to scan note text for
 
 
 @dataclass
@@ -65,16 +81,48 @@ def _norm_fact(fact: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", fact.casefold())).strip()
 
 
-def fetch_entity_notes(conn, bank_id: str, names: list[str],
-                       metadata_filter: dict | None = None) -> list[tuple[str, str, str]]:
-    """(document_id, source, text) of every note tied to the entity: its
-    documents.person, or any item mentioning an entity whose norm is one of
-    `names` (the entity name and its aliases), within the optional filter."""
-    norms = sorted({re.sub(r"\s+", " ", n.strip().lower()) for n in names if n.strip()})
+def _clean(n: str) -> str:
+    return re.sub(r"\s+", " ", n.strip().lower())
+
+
+def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list[str], list]:
+    """Everything the entity is called: `names` plus, for each entity whose norm
+    or alias norm is one of them, its name and EVERY alias row. Returns
+    (all names as written, normalised names, entity ids)."""
+    norms = sorted({_clean(n) for n in names if n.strip()})
     if not norms:
         raise ValueError("map-reduce recall needs an entity name")
+    written = list(dict.fromkeys(n.strip() for n in names if n.strip()))
+    ids: list = []
     with conn.cursor() as cur:
-        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms,
+        cur.execute(_ENTITIES_SQL, {"bank": bank_id, "names": norms})
+        ents = cur.fetchall()
+        ids = [r[0] for r in ents]
+        written += [r[1] for r in ents]
+        norms += [r[2] for r in ents]
+        if ids:
+            cur.execute(_ALIASES_SQL, {"bank": bank_id, "ids": ids})
+            for alias, norm in cur.fetchall():
+                written.append(alias)
+                norms.append(norm)
+    return (list(dict.fromkeys(written)), sorted(set(norms)), ids)
+
+
+def fetch_entity_notes(conn, bank_id: str, names: list[str],
+                       metadata_filter: dict | None = None,
+                       scan_names: list[str] | None = None) -> list[tuple[str, str, str]]:
+    """(document_id, source, text) of every note tied to the entity: its
+    documents.person, any item mentioning the entity (found by name or by any
+    alias row), or whose text contains a name in `scan_names` (alias strings:
+    a note that uses an alias but whose extraction listed no entity is still
+    reached), within the optional filter. Returns `names` resolved via
+    `resolve_names`."""
+    _, norms, ids = resolve_names(conn, bank_id, names)
+    scan = sorted({n.strip() for n in (scan_names if scan_names is not None else names)
+                   if len(n.strip()) >= MIN_SCAN_CHARS}, key=str.casefold)
+    rx = r"\m(?:" + "|".join(re.escape(n) for n in scan) + r")\M" if scan else ""
+    with conn.cursor() as cur:
+        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx,
                                  "meta": _meta_param(metadata_filter)})
         return [(r[0], r[1] or r[0], r[2]) for r in cur.fetchall()]
 
@@ -107,9 +155,26 @@ def _call(llm, prompt: str, *, purpose: str, calls: list[dict]) -> str:
     return llm_text(out)
 
 
+def _parse_reply(raw: str) -> dict:
+    """The first JSON object in a reply. Sonnet sometimes answers the JSON, a
+    prose line, then the JSON again: take the first object, ignore the rest."""
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    dec = json.JSONDecoder()
+    i = t.find("{")
+    while i >= 0:
+        try:
+            v, _ = dec.raw_decode(t, i)
+        except ValueError:
+            i = t.find("{", i + 1)
+            continue
+        if isinstance(v, dict):
+            return v
+        i = t.find("{", i + 1)
+    raise ValueError("reply holds no JSON object")
+
+
 def _facts_of(raw: str, key: str) -> list[dict]:
-    from prospecta.stages import parse_json_object
-    v = parse_json_object(raw).get(key)
+    v = _parse_reply(raw).get(key)
     return [e for e in v if isinstance(e, dict) and isinstance(e.get("fact"), str)
             and e["fact"].strip()] if isinstance(v, list) else []
 
@@ -125,8 +190,9 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
                   on_progress=None) -> MapReduceResult:
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
-    names = [entity, *(aliases or [])]
-    notes = fetch_entity_notes(conn, bank_id, names, metadata_filter)
+    names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
+    scan = [n for n in names if _clean(n) != _clean(entity)]   # alias strings, not the bare name
+    notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan)
     by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
     base_count: dict[str, int] = {}
     for _, src, _ in notes:
@@ -194,7 +260,7 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     return MapReduceResult(
         synthesis=text, items=items, citations=citations, progress=progress, calls=calls,
         notes_visited=visited, facts_found=len(items),
-        plan={"mode": "mapreduce", "entity": entity, "aliases": list(aliases or []),
+        plan={"mode": "mapreduce", "entity": entity, "aliases": [n for n in names if _clean(n) != _clean(entity)],
               "batch_size": batch_size, "n_notes": len(notes), "n_batches": n_batches,
               "metadata_filter": metadata_filter, "progress": progress,
               "raw_facts": len(raw_facts), "failed_notes": failed_notes})
@@ -211,28 +277,35 @@ def _dedupe(raw_facts: list[dict]) -> list[dict]:
 
 
 def _reduce(question: str, raw_facts: list[dict], llm, calls: list[dict]) -> list[dict]:
-    """LLM merge of paraphrased duplicates; on any failure, or when the model
-    drops a note-fact pair it was given, fall back to the deterministic merge."""
+    """LLM merge of paraphrased duplicates, by id: the model groups the numbered
+    distinct facts; any fact it leaves out is kept as its own item, so nothing
+    is dropped (a singleton survives). On any failure, the deterministic merge."""
     base = _dedupe(raw_facts)
     if len(base) < 2:
         return base
-    listing = "\n".join(f"- {f['fact']} [{f['note']}]" for f in raw_facts)
+    listing = "\n".join(f"{i}. {f['fact']} [{', '.join(f['notes'])}]"
+                        for i, f in enumerate(base, 1))
     prompt = render_prompt("mapreduce-reduce", {"query": question, "facts": listing})
     try:
         merged = _facts_of(_call(llm, prompt, purpose="mapreduce_reduce", calls=calls), "items")
     except Exception as exc:
         logger.warning("map-reduce reduce failed, using the deterministic merge: %s", exc)
         return base
-    out = []
+    claimed: dict[int, int] = {}   # base index -> output position
+    out: list[dict] = []
     for e in merged:
-        notes = [str(n).strip() for n in (e.get("notes") or []) if str(n).strip()]
-        out.append({"fact": e["fact"].strip(), "notes": list(dict.fromkeys(notes))})
-    given = {_norm_name(f["note"]) for f in raw_facts if f["note"]}
-    kept = {_norm_name(n) for it in out for n in it["notes"]}
-    merged_text = [f" {_norm_fact(it['fact'])} " for it in out]
-    facts_kept = all(any(f" {_norm_fact(f['fact'])} " in t for t in merged_text)
-                     for f in raw_facts)
-    if not out or not given <= kept or not facts_kept:   # completeness over tidiness
-        logger.warning("map-reduce reduce lost notes or facts; using the deterministic merge")
-        return base
+        ids = [i - 1 for i in dict.fromkeys(e.get("ids") or [])
+               if isinstance(i, int) and not isinstance(i, bool) and 1 <= i <= len(base)
+               and i - 1 not in claimed]
+        if not ids:
+            continue
+        for i in ids:
+            claimed[i] = len(out)
+        notes = list(dict.fromkeys(n for i in ids for n in base[i]["notes"]))
+        out.append({"fact": e["fact"].strip(), "notes": notes})
+    for i, f in enumerate(base):   # completeness over tidiness: unclaimed facts stay as they are
+        if i not in claimed:
+            out.append({"fact": f["fact"], "notes": list(f["notes"])})
+    if len(out) < len(base):
+        logger.info("map-reduce reduce merged %d facts into %d items", len(base), len(out))
     return out
