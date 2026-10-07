@@ -725,6 +725,86 @@ class Memory:
             synth_call=dict(grounded_res.call) if grounded_res else {},
         )
 
+    def recall_mapreduce(
+        self,
+        message: str,
+        *,
+        entity: str,
+        aliases: "list[str] | None" = None,
+        metadata_filter: dict | None = None,
+        batch_size: int | None = None,
+        on_progress=None,
+    ) -> RAGResult:
+        """Map-reduce recall for SET / discovery questions (``what are X's
+        nicknames``): every note tied to `entity` (documents.person, the entity
+        table by name or `aliases`, `metadata_filter`) is read in batches of
+        `batch_size` notes, facts are extracted with a citation each, then
+        merged into one deduplicated cited list (RAGResult.synthesis,
+        .citations). Completeness over speed. Cost, notes visited and facts
+        found are recorded per batch in recall_events.plan (mode 'mapreduce').
+        """
+        import time as _time
+
+        from prospecta import _mapreduce
+
+        llm = self._synth_llm or self._llm
+        if llm is None:
+            raise RuntimeError(
+                "Memory.recall_mapreduce requires an `llm` callable; "
+                "construct Memory(llm=...)"
+            )
+        t_start = _time.monotonic()
+        bank_id = self._default_bank_id
+        with self._pool.connection() as conn:
+            res = _mapreduce.run_mapreduce(
+                conn, bank_id, message, llm, entity=entity, aliases=aliases,
+                metadata_filter=metadata_filter,
+                batch_size=_mapreduce.DEFAULT_BATCH_SIZE if batch_size is None else batch_size,
+                on_progress=on_progress)
+        duration_ms = int((_time.monotonic() - t_start) * 1000)
+
+        from prospecta.stages import totals
+        tot = totals(res.calls)
+        for c in res.calls:
+            try:
+                self._tracer("llm_call", {
+                    "bank_id": bank_id, "purpose": c["purpose"], "json_mode": True,
+                    "duration_ms": c["duration_ms"], "messages_count": 1,
+                    "prompt_text": c["prompt_text"], "response_text": c["response_text"],
+                    "model": c["model"], "tokens_in": c["tokens_in"],
+                    "tokens_out": c["tokens_out"], "cost_usd": c["cost_usd"],
+                })
+            except Exception:  # pragma: no cover
+                logger.exception("tracer raised on llm_call; ignoring")
+        try:
+            self._tracer("recall", {
+                "bank_id": bank_id,
+                "queries": [message],
+                "mode": "mapreduce",
+                "n_results": len(res.items),
+                "duration_ms": duration_ms,
+                "trace": None,
+                "results": [{"fact": it["fact"], "notes": it["notes"]} for it in res.items],
+                "synthesis": res.synthesis,
+                "citations": res.citations,
+                "plan": res.plan,
+                **tot,
+            })
+        except Exception:  # pragma: no cover
+            logger.exception("tracer raised on recall; ignoring")
+
+        return RAGResult(
+            synthesis=res.synthesis, sources=[], queries=[Query(text=message)],
+            queries_to_results={}, citations=res.citations,
+            evidence=[{"fact": it["fact"], "notes": it["notes"],
+                       "citations": it["citations"]} for it in res.items],
+            synth_call={"model": next((c["model"] for c in res.calls if c["model"]), None),
+                        "tokens_in": tot["tokens_in"], "tokens_out": tot["tokens_out"],
+                        "cost_usd": tot["cost_usd"], "duration_ms": duration_ms,
+                        "n_llm_calls": tot["n_llm_calls"],
+                        "notes_visited": res.notes_visited, "facts_found": res.facts_found},
+        )
+
     # ------------------------------------------------------------------
     # T14 — background sweeper (P14 filesystem drift safety net)
     # ------------------------------------------------------------------
