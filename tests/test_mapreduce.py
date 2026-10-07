@@ -383,7 +383,7 @@ def test_mapreduce_hub_person_candidate_set_follows_name_bearing_notes(fresh_db)
         body = f"Hub talked; also called Dizzy{i}. Dizzy was the nickname."
         m.retain(body, source=src, index_text=body)
     for i in range(1300 - 9):
-        body = f"Hub went about thing {i}. " + "Filler text. " * 10
+        body = f"They went about thing {i}. " + "Filler text. " * 10
         m.retain(body, source=f"h{i}.md", index_text=f"h {i}")
     with psycopg.connect(fresh_db) as conn:
         eid = conn.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
