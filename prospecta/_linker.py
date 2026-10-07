@@ -797,6 +797,7 @@ class Linker:
             dim = int(cur.fetchone()[0])
         kind = "chunk" if anchors[0]["kind"] == "chunk" else "question"
         best: dict = {}   # candidate document -> best cosine over my anchors
+        per_anchor: list = []   # (anchor, its neighbour items, best first)
         for a in anchors:
             def fetch(n, a=a):
                 from prospecta.channels.semantic import _scan_everything
@@ -821,41 +822,52 @@ class Linker:
                 fetch, lambda c: float(c["cos"]), self.neighbour_min_rel,
                 floor=self.neighbour_min_cos)
             stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
+            per_anchor.append((a, cands))
             for c in cands:
                 d = c["document_id"]
                 best[d] = max(best.get(d, 0.0), float(c["cos"]))
         if not best:
             return
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], str(kv[0])))
-        reps = self._doc_reps(conn, [d for d, _ in ranked], kind)
-        me = dict(anchors[0], document_id=doc)
-        cands = [dict(reps[d], cos=cos) for d, cos in ranked if d in reps]
-        edges = None
+        groups = None   # [(me item, candidate items, edges)]
         origin = "jev"
         if self.judge is not None:
-            try:   # 'connected': the top judge_top_k documents only; mutual / nearest / cached inside
+            try:
                 stats["completeness"] = self._completeness(conn, bank_id, mode)
-                all_pairs = stats["completeness"] == "all-pairs"
-                edges = self._judged_edges(
-                    conn, bank_id, me, cands if all_pairs else cands[:self.judge_top_k],
-                    kind, dim, stats, calls, all_pairs=all_pairs)
+                if stats["completeness"] == "all-pairs":   # chunk level: every anchor vs its neighbours
+                    groups = []
+                    for a, cands in per_anchor:
+                        me = dict(a, document_id=doc)
+                        groups.append((me, cands, self._judged_edges(
+                            conn, bank_id, me, cands, kind, dim, stats, calls, all_pairs=True)))
+                else:   # 'connected': one representative pair per note, the top judge_top_k notes
+                    reps = self._doc_reps(conn, [d for d, _ in ranked], kind)
+                    me = dict(anchors[0], document_id=doc)
+                    cands = [dict(reps[d], cos=cos) for d, cos in ranked if d in reps]
+                    groups = [(me, cands, self._judged_edges(
+                        conn, bank_id, me, cands[:self.judge_top_k], kind, dim, stats, calls))]
             except Exception as exc:   # surfaced: state error row, retried by link_pending
                 stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
-        if edges is None:   # no judge, or Jev could not answer: pgvector neighbours
+                groups = None
+        if groups is None:   # no judge, or Jev could not answer: pgvector neighbours
             origin = "pgvector"
-            edges = [(me["id"], c["id"], "SEMANTIC", "RELATED_TO", c["cos"], i)
-                     for i, c in enumerate(cands) if c["cos"] >= self.vector_floor]
+            reps = self._doc_reps(conn, [d for d, _ in ranked], kind)
+            me = dict(anchors[0], document_id=doc)
+            cands = [dict(reps[d], cos=cos) for d, cos in ranked if d in reps]
+            groups = [(me, cands, [(me["id"], c["id"], "SEMANTIC", "RELATED_TO", c["cos"], i)
+                                   for i, c in enumerate(cands) if c["cos"] >= self.vector_floor])]
         with conn.cursor() as cur:
             rows = []
-            for e in edges:   # SEMANTIC is symmetric: one judgment writes both directions
-                src, dst, lt, st, conf, rank = e[:6]
-                fwd = e[6] if len(e) > 6 else True
-                cos = cands[rank]["cos"]
-                if lt == "SEMANTIC":
-                    rows += [(src, dst, lt, st, conf, cos), (dst, src, lt, st, conf, cos)]
-                else:
-                    rows.append((src, dst, lt, st, conf, cos) if fwd
-                                else (dst, src, lt, st, conf, cos))
+            for _me, cands, edges in groups:
+                for e in edges:   # SEMANTIC is symmetric: one judgment writes both directions
+                    src, dst, lt, st, conf, rank = e[:6]
+                    fwd = e[6] if len(e) > 6 else True
+                    cos = cands[rank]["cos"]
+                    if lt == "SEMANTIC":
+                        rows += [(src, dst, lt, st, conf, cos), (dst, src, lt, st, conf, cos)]
+                    else:
+                        rows.append((src, dst, lt, st, conf, cos) if fwd
+                                    else (dst, src, lt, st, conf, cos))
             for src, dst, lt, st, conf, cos in sorted(rows, key=lambda r: r[:4]):
                 cur.execute(
                     "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "

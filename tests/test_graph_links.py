@@ -752,3 +752,35 @@ def test_link_pass_upgrades_connected_to_all_pairs_resumably(fresh_db):
     fut = m.link_pass("all-pairs", background=True)
     assert fut.result()["documents"] == 0
     m.close()
+
+
+def test_chunk_level_link_from_a_non_first_chunk_all_pairs_vs_connected(fresh_db):
+    vec = {"A": [1, 0, 0, 0], "B": [0, 1, 0, 0]}
+
+    def embed(ts):
+        return [vec[t[0]] for t in ts]
+
+    def run(mode):
+        with psycopg.connect(fresh_db) as c:
+            c.execute("DELETE FROM documents")
+            c.commit()
+        m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
+        m.create_bank("b", embedding_dim=4)
+        m.retain("A first part " * 30 + "\n\n" + "B second part " * 30, source="x",
+                 index_text="A q", child_chunks=True)
+        m.retain("B other note " * 30, source="y", index_text="B q", child_chunks=True)
+        jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
+        m._linker = Linker(judge=JevRelationJudge(jev), neighbour_min_cos=0.5,
+                           link_completeness=mode)
+        for d in docs(m).values():
+            m.link_document(d)
+        with conn_of(m) as c:
+            n = c.execute(
+                "SELECT count(*) FROM memory_links l JOIN memory_items a ON a.id=l.src "
+                "JOIN memory_items b ON b.id=l.dst WHERE l.origin='jev' AND l.link_type='SEMANTIC' "
+                "AND a.kind='chunk' AND b.kind='chunk' AND a.ordinal > 0 "
+                "AND a.document_id <> b.document_id").fetchone()[0]
+        m.close()
+        return n
+    assert run("all-pairs") > 0     # the second chunk of x links to y
+    assert run("connected") == 0    # the note-level representative (first chunk) never meets y

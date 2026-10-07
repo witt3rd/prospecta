@@ -92,7 +92,7 @@ def validate_recall_config(cfg: dict) -> None:
         if key not in ("rerank", "gate", "reader", "evidence", "depth",
                        "link_completeness"):
             raise ValueError(f"unknown recall_config key {key!r}")
-    if cfg.get("link_completeness", "connected") not in ("connected", "all-pairs"):
+    if cfg.get("link_completeness", "all-pairs") not in ("connected", "all-pairs"):
         raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
     check_depth(cfg.get("depth"))
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))

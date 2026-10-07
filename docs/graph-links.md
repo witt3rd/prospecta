@@ -43,18 +43,27 @@ sufficiency; the follow-up probe is the best excerpt itself.
 
 ## Link completeness: all-pairs (default) or connected
 
-The linker judges per NOTE (an item pair per note pair, A->B and B->A one pair; the
-first anchor of each note represents it). `link_completeness` sets how many qualifying
-neighbour notes (cosine floor + relative stop, as before) are judged:
+`link_completeness` sets how many qualifying neighbours (cosine floor + relative stop, as
+before) are judged. A missing setting means `all-pairs` everywhere (linker, bank
+`recall_config` validation). Decision (captain): quality over speed, cost is not the limit,
+so `all-pairs` is the default knowingly and `connected` is the explicit cheaper setting.
 
-- `all-pairs` (DEFAULT): every qualifying pair; 96 questions per call, the pair cache and
-  the similarity floor keep it affordable.
-- `connected`: the reduced-pairs rule: at most `judge_top_k` (32 = one call) neighbours per
+- `all-pairs` (DEFAULT): judged at CHUNK level: every anchor (chunk, else question) of a note
+  against its neighbours from the per-anchor HNSW fetch; each unordered chunk pair once through
+  the pair cache (keyed by the text-hash pair), links written between the judged chunks. 96
+  questions per call, the pair cache and the similarity floor keep it affordable. No
+  per-note collapse, no top-K, no mutual test.
+- `connected`: the reduced-pairs rule, and ONLY here the per-note collapse (the first anchor of
+  each note represents it: one pair per note pair, A->B and B->A one pair; links between a
+  note's other chunks and other notes are NOT judged): at most `judge_top_k` (32 = one call) neighbours per
   note, judged only if MUTUAL (each in the other's top 32) or among the note's
   `judge_nearest` (3). SEMANTIC (same subject) is treated as transitive inside a dense
-  cluster (members beyond the top 32 are reached through cluster neighbours); CAUSAL /
+  cluster (members beyond the top 32 are reached through cluster neighbours; this
+  transitivity assumption for SEMANTIC links is UNPROVEN); CAUSAL /
   LEADS_TO is not transitive and is written only for judged pairs. It DROPS some direct
-  semantic pair links in dense clusters (connectivity is preserved); the quality/cost knob.
+  semantic pair links in dense clusters (connectivity is preserved) and chunk-level links
+  of non-first chunks; the quality/cost knob. The 3-5 calls/note target is this mode's goal
+  only, not all-pairs'.
 - both: a pair whose normalised text (modulo frontmatter, whitespace, case) is identical
   is RELATED_TO at 1.0 with no call; the cache `memory_link_pairs` is keyed by the
   text-hash pair, so a re-run asks nothing (rows cascade with their items: re-indexing a
@@ -71,7 +80,7 @@ A bank can import with `connected` and be upgraded without a re-import:
     prospecta link-pass --mode all-pairs [--resume] [--limit N]
     memory.link_pass("all-pairs", limit=None, background=True)   # a Future of the progress dict
 
-It re-runs only the semantic step of every linked document whose link state does not
+Moving to `all-pairs` re-runs at chunk level. It re-runs only the semantic step of every linked document whose link state does not
 record `completeness = all-pairs`, on its own connection (never blocks retain, own thread
 when background). Progress lines/dicts: documents, pairs_judged (`judged`), pairs_cached,
 failed, remaining. Resumable: a finished document records its completeness, and the pair
@@ -83,7 +92,7 @@ stay for the next run.
 STUB Jev with a per-call token cost model (nothing leaves the process); Postgres+pgvector
 real. Dense synthetic corpus: clusters of 226/170/130/110/100 notes (~40 percent of 1,845),
 a third of notes multi-chunk, exact duplicates, a planted causal partner every 10th note.
-Before = main at 6f0e54c. Figures are modelled; the scout re-measures on the real corpus.
+Before = main at 6f0e54c. NOTE: the all-pairs figures below were measured with the note-level collapse (one pair per note pair); the chunk-level all-pairs now implemented costs more on multi-chunk notes, pending the scout's re-measure (connected figures are unchanged). Figures are modelled; the scout re-measures on the real corpus.
 
 | notes | judged pairs/note: before / all-pairs / connected | calls/note: before / all-pairs / connected | cost USD: before / all-pairs / connected |
 |---|---|---|---|
@@ -104,4 +113,8 @@ judged pairs/note 9 / 17 / 29 / 52: NOT near-linear: per-note work grows with th
 size, i.e. near-quadratic in the cluster (judging all pairs of a cluster is inherently
 so); `connected` stays flat at ~6 judged pairs/note in both. The stub's calls/note is
 below the real 6-20 because synthetic notes have few anchors; the real driver was
-chunk-level pairs, now one pair per note pair.
+chunk-level pairs (all-pairs is chunk-level again; connected is one pair per note pair).
+
+Recall note: the benchmark's ground truth is note-level and cannot see a lost chunk-level
+link; `tests/test_graph_links.py` has a chunk-level test (a link from a note's non-first chunk):
+found in all-pairs, lost in connected.
