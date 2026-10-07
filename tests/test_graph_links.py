@@ -766,7 +766,7 @@ def test_chunk_level_link_from_a_non_first_chunk_all_pairs_vs_connected(fresh_db
             c.commit()
         m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
         m.create_bank("b", embedding_dim=4)
-        m.retain("A first part " * 30 + "\n\n" + "B second part " * 30, source="x",
+        m.retain("A first part " * 60 + "\n\n" + "B second part " * 60, source="x",
                  index_text="A q", child_chunks=True)
         m.retain("B other note " * 30, source="y", index_text="B q", child_chunks=True)
         jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
