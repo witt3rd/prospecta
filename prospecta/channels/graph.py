@@ -50,39 +50,53 @@ _EDGES = """
 """
 
 # Hub holders are fetched once per (entity, kind) -- not once per frontier item --
-# and then joined to every frontier item that holds the entity (the frontier item's
-# own document is left out of its neighbours). `{p}` prefixes the CTE names.
+# and joined to the two best frontier items of distinct documents holding the entity
+# (all that the best-score-per-neighbour merge can use; a holder in the best item's
+# own document takes the second; a frontier item's own document is left out of its neighbours). `{p}` prefixes the CTE names.
 _HUBS = """
-{p}he AS MATERIALIZED (
-    SELECT ie.entity_id, si.kind
-    FROM (SELECT DISTINCT item FROM {frm}) s
-    JOIN memory_items si ON si.id = s.item
-    JOIN memory_item_entities ie ON ie.item_id = s.item
-    CROSS JOIN LATERAL (
-        SELECT count(*) AS n FROM (SELECT 1 FROM memory_item_entities x
-                                   WHERE x.entity_id = ie.entity_id LIMIT %(hub)s + 1) q
-    ) hc
-    WHERE hc.n > %(hub)s AND %(hub_cap)s > 0
-    GROUP BY ie.entity_id, si.kind
-),
-{p}hh AS MATERIALIZED (
-    SELECT he.entity_id, he.kind, b.item_id, bi.document_id AS doc
-    FROM {p}he he
-    CROSS JOIN LATERAL (
-        SELECT ie2.item_id FROM memory_item_entities ie2
-        JOIN memory_items bi ON bi.id = ie2.item_id
-        WHERE ie2.entity_id = he.entity_id AND bi.kind = he.kind
-        ORDER BY ie2.n DESC, ie2.item_id LIMIT %(hub_cap)s
-    ) b
-    JOIN memory_items bi ON bi.id = b.item_id
-),
-{p}hubs AS (
-    SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent, hh.item_id AS nid,
-           'ENTITY'::text AS link_type, 'SHARED_ENTITY'::text AS subtype, 1.0::real AS confidence
+{p}fe AS MATERIALIZED (   -- frontier item x entity it holds (each item once)
+    SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent,
+           ie.entity_id, si.kind
     FROM {frm} s
     JOIN memory_items si ON si.id = s.item
     JOIN memory_item_entities ie ON ie.item_id = s.item
-    JOIN {p}hh hh ON hh.entity_id = ie.entity_id AND hh.kind = si.kind AND hh.doc <> s.origin_doc
+    WHERE %(hub_cap)s > 0
+),
+{p}he AS MATERIALIZED (   -- hub test once per entity, not once per (item, entity)
+    SELECT e.entity_id, e.kind
+    FROM (SELECT DISTINCT entity_id, kind FROM {p}fe) e
+    CROSS JOIN LATERAL (
+        SELECT count(*) AS n FROM (SELECT 1 FROM memory_item_entities x
+                                   WHERE x.entity_id = e.entity_id LIMIT %(hub)s + 1) q
+    ) hc
+    WHERE hc.n > %(hub)s
+),
+{p}ft AS MATERIALIZED (   -- per (entity, kind): the two best frontier items of distinct documents
+    SELECT entity_id, kind, item, origin_doc, score, hops, via, link_types, parent
+    FROM (
+        SELECT d.*, row_number() OVER (PARTITION BY d.entity_id, d.kind ORDER BY d.score DESC, d.item) AS rk
+        FROM (SELECT DISTINCT ON (f.entity_id, f.kind, f.origin_doc) f.*
+              FROM {p}fe f JOIN {p}he he ON he.entity_id = f.entity_id AND he.kind = f.kind
+              ORDER BY f.entity_id, f.kind, f.origin_doc, f.score DESC, f.item) d
+    ) r WHERE rk <= 2
+),
+{p}hh AS MATERIALIZED (   -- holders: each hub entity's items read once, the best hub_cap per kind
+    SELECT entity_id, kind, item_id, doc
+    FROM (
+        SELECT h.entity_id, h.kind, ie2.item_id, bi.document_id AS doc,
+               row_number() OVER (PARTITION BY h.entity_id, h.kind ORDER BY ie2.n DESC, ie2.item_id) AS rn
+        FROM {p}he h
+        JOIN memory_item_entities ie2 ON ie2.entity_id = h.entity_id
+        JOIN memory_items bi ON bi.id = ie2.item_id AND bi.kind = h.kind
+        WHERE true {skip}
+    ) r WHERE rn <= %(hub_cap)s
+    {reuse}
+),
+{p}hubs AS (   -- each holder joins the (at most two) best frontier items of its entity: once per hub
+    SELECT t.item, t.origin_doc, t.score, t.hops, t.via, t.link_types, t.parent, hh.item_id AS nid,
+           'ENTITY'::text AS link_type, 'SHARED_ENTITY'::text AS subtype, 1.0::real AS confidence
+    FROM {p}ft t
+    JOIN {p}hh hh ON hh.entity_id = t.entity_id AND hh.kind = t.kind AND hh.doc <> t.origin_doc
 )
 """
 
@@ -96,7 +110,7 @@ s0 AS (
     FROM seed s JOIN memory_items m ON m.document_id = s.doc AND m.bank_id = %(bank)s
 ),
 e1 AS (""" + _EDGES.format(frm="s0") + """),
-""" + _HUBS.format(frm="s0", p="a_") + """,
+""" + _HUBS.format(frm="s0", p="a_", skip="", reuse="") + """,
 h1 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 1 AS hops, item AS parent,
            score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
@@ -113,7 +127,9 @@ frontier AS (
     WHERE h.score > 0 AND %(max_hops)s >= 2
       AND h.score * %(decay)s * %(wmax)s >= %(rel)s * best1.b
 ),
-""" + _HUBS.format(frm="frontier", p="b_") + """,
+""" + _HUBS.format(frm="frontier", p="b_",
+    skip="AND NOT EXISTS (SELECT 1 FROM a_he o WHERE o.entity_id = h.entity_id AND o.kind = h.kind)",
+    reuse="UNION ALL SELECT a.entity_id, a.kind, a.item_id, a.doc FROM a_hh a JOIN b_he h USING (entity_id, kind)") + """,
 e2 AS (""" + _EDGES.format(frm="frontier") + """
     UNION ALL
     SELECT * FROM b_hubs
