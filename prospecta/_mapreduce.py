@@ -57,7 +57,7 @@ class MapReduceResult:
 
 
 def _norm_name(name: str) -> str:
-    n = name.strip().replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    n = name.strip().replace("\\", "/").casefold()
     return n[:-3] if n.endswith(".md") else n
 
 
@@ -128,6 +128,12 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     names = [entity, *(aliases or [])]
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter)
     by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
+    base_count: dict[str, int] = {}
+    for _, src, _ in notes:
+        b = _norm_name(src).rsplit("/", 1)[-1]
+        base_count[b] = base_count.get(b, 0) + 1
+    by_base = {_norm_name(src).rsplit("/", 1)[-1]: (doc, src) for doc, src, _ in notes
+               if base_count[_norm_name(src).rsplit("/", 1)[-1]] == 1}
     calls: list[dict] = []
     progress: list[dict] = []
     raw_facts: list[dict] = []   # {fact, note}
@@ -172,7 +178,8 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
     for it in items:
         it["citations"] = []
         for n in it["notes"]:
-            doc, src = by_norm.get(_norm_name(n), (None, n))
+            k = _norm_name(n)
+            doc, src = by_norm.get(k) or by_base.get(k.rsplit("/", 1)[-1], (None, n))
             c = {"note": src, "document_id": doc, "known": doc is not None}
             it["citations"].append(c)
             if _norm_name(src) not in seen:
@@ -222,7 +229,10 @@ def _reduce(question: str, raw_facts: list[dict], llm, calls: list[dict]) -> lis
         out.append({"fact": e["fact"].strip(), "notes": list(dict.fromkeys(notes))})
     given = {_norm_name(f["note"]) for f in raw_facts if f["note"]}
     kept = {_norm_name(n) for it in out for n in it["notes"]}
-    if not out or not given <= kept:   # completeness over tidiness
-        logger.warning("map-reduce reduce lost notes; using the deterministic merge")
+    merged_text = [f" {_norm_fact(it['fact'])} " for it in out]
+    facts_kept = all(any(f" {_norm_fact(f['fact'])} " in t for t in merged_text)
+                     for f in raw_facts)
+    if not out or not given <= kept or not facts_kept:   # completeness over tidiness
+        logger.warning("map-reduce reduce lost notes or facts; using the deterministic merge")
         return base
     return out
