@@ -19,6 +19,11 @@ up again by `link_pending`. Per document:
 - Entities by the injected `llm` (Sonnet; prompt `extract-entities`), then
   `ENTITY/SHARED_ENTITY` links by a join. An entity held by more than 30 items (`ENTITY_HUB`) is a hub
   and gets no per-anchor links; GraphExpand reaches its holders through the entity table.
+  The same pass emits aliases (nicknames, pen names, aka) per person (migration 0014):
+  `memory_entity_aliases` rows resolve an alias to the person entity, so a note using any alias
+  is held by the person; mentions already extracted under an alias move onto the person.
+  `Linker.backfill_aliases(conn, bank_id, limit, after)` is the resumable backfill by document id
+  (progress in `memory_alias_state`; errors recorded and skipped).
 - Semantic links: the top 10 pgvector neighbours per anchor item. With a
   `JevRelationJudge(transport)` Jev answers `semantic`, `causes`, `caused_by` as System
   One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`); without one, or if
