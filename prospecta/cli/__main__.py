@@ -182,6 +182,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sw.add_argument("--interval", type=float, default=86400.0)
 
+    # ---- link-pass ------------------------------------------------------
+    lp = sub.add_parser(
+        "link-pass",
+        help="Upgrade linked documents to --mode all-pairs after the import (resumable)")
+    lp.add_argument("--mode", choices=("all-pairs", "connected"), default="all-pairs")
+    lp.add_argument("--resume", action="store_true",
+                    help="Accepted for clarity: a pass always resumes (link state + pair cache)")
+    lp.add_argument("--limit", type=int, default=None, help="Documents in this run (default all)")
+
     # ---- backup / restore ----------------------------------------------
     bk = sub.add_parser("backup", help="pg_dump the database to a file")
     bk.add_argument("path", type=Path)
@@ -237,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sweep":
         from prospecta.cli.sweep import cmd_sweep
         return cmd_sweep(args)
+    if args.command == "link-pass":
+        from prospecta.cli.link_pass import cmd_link_pass
+        return cmd_link_pass(args)
     if args.command == "backup":
         from prospecta.cli.backup import cmd_backup
         return cmd_backup(args)
