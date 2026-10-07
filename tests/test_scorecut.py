@@ -171,11 +171,11 @@ def test_default_rerank_pool_cut_and_report_line():
     from prospecta.evaluation import format_report
     assert DEFAULT_RECALL_CONFIG["rerank"]["min_rel_score"] == 0.15
     rep = {"bank": "b", "n_questions": 0, "legacy_bank_scored_with_defaults": False,
-           "full": {"stages": {}, "summary": {"by_class": {}}},
+           "full": {"stages": {}, "summary": {
+               "gold": {"hit1": 1.0, "hit10": 1.0, "mrr": 1.0, "cover10": 1.0},
+               "gold2": {"n": 0}, "by_class": {}}},
            "recall_config": DEFAULT_RECALL_CONFIG,
            "channel_config": [{"name": "bm25"}, {"name": "dense_chunk"}]}
-    try:
-        text = format_report(rep)
-    except Exception:  # summary shape is irrelevant here; the cuts line comes first
-        text = ""
-    assert text == "" or "rerank pool >= 0.15 x best fused score" in text
+    text = format_report(rep)
+    assert ("cuts: channels bm25 0.0, dense_chunk 0.0 (0 = no cut); "
+            "rerank pool >= 0.15 x best fused score") in text
