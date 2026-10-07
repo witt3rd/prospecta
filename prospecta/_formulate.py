@@ -12,7 +12,6 @@ P-principles enforced here:
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -106,8 +105,11 @@ def _parse(raw: str) -> tuple[list[Query], ErrorKind | None]:
     Empty `queries` arrays (after filtering) are treated as schema_mismatch.
     """
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        from prospecta.stages import parse_json_object  # lazy: avoid import cycle
+        parsed = parse_json_object(raw)
+    except ValueError as exc:
+        if "not an object" in str(exc):
+            return [], "schema_mismatch"
         return [], "malformed_json"
 
     if not isinstance(parsed, dict):
