@@ -109,7 +109,7 @@ def test_sonnet_listwise_reorders_grades_and_accounts(mem):
     assert row[:4] == ("rerank_listwise", "stub-sonnet", 100, 10) and float(row[4]) == 0.002
 
 
-def test_evidence_in_prompt_is_best_chunk_capped_at_1000(mem):
+def test_evidence_in_prompt_is_best_chunk_in_full(mem):
     long = "cat sat " + "x" * 3000
     mem.retain(long, source="long.md", index_text="cat sat long")
     with psycopg.connect(mem.database_url) as conn:
@@ -124,7 +124,18 @@ def test_evidence_in_prompt_is_best_chunk_capped_at_1000(mem):
     mem.search("cat sat " + "x" * 3000, limit=5)
     prompt = llm.prompts[0]
     assert "long.md | date:" in prompt
-    assert all(len(block) < 1200 for block in prompt.split("\n\n[")[1:])
+    assert "x" * 3000 in prompt   # no silent clipping of evidence
+
+
+def test_fit_passage_keeps_text_and_logs_full_warning_only_on_physical_limit(caplog):
+    from prospecta.stages import JEV_PASSAGE_MAX_BYTES, fit_passage
+    ok = "y" * 10_000
+    assert fit_passage(ok, "h") == ok
+    big = "z" * (JEV_PASSAGE_MAX_BYTES + 500)
+    with caplog.at_level("WARNING"):
+        cut = fit_passage(big, "h")
+    assert len(cut) == JEV_PASSAGE_MAX_BYTES
+    assert big in caplog.text   # the warning carries the full passage
 
 
 @pytest.mark.parametrize("llm", [StubLLM(fail=True), StubLLM(raw="no json here"),

@@ -13,8 +13,8 @@ mem.set_recall_config({
 })
 ```
 
-- **Sonnet rerank** (`SonnetListwise`): the fused top 30, one best chunk (<= 1,000
-  chars) per note under a header of note name, date and person; the model replies
+- **Sonnet rerank** (`SonnetListwise`): the fused top 30, one best chunk (in
+  full, never clipped) per note under a header of note name, date and person; the model replies
   JSON `{grades, ranking}`; order = ranking, then grade, then fused order. Any
   failure (provider error, unparseable reply) keeps the fused order and records
   `fallback_reason` in `recall_events.rerank`.

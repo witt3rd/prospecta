@@ -35,7 +35,7 @@ import psycopg.errors
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
-    JEV_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_PASSAGE_CHARS, JEV_TIMEOUT_S,
+    JEV_BATCH, JEV_INPUT_BYTES, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
     JevTransport, call_llm, parse_json_object, totals,
 )
 
@@ -199,7 +199,7 @@ class JevRelationJudge:
     def _question(self, relation: str, cand: str) -> dict:
         return {"type": "score",
                 "instructions": {"task": _RELATION_TASK[relation], "kind": "note",
-                                 "title": relation, "text": cand[:JEV_PASSAGE_CHARS]},
+                                 "title": relation, "text": fit_passage(cand, relation)},
                 "criteria": _RELATION_CRITERIA}
 
     def judge(self, source_text: str, candidates: list[str],

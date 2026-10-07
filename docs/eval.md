@@ -4,9 +4,10 @@
 
 `recall_synth(message, grounded=True)` replaces the plain RAG step with the
 cited synthesis of the hybrid design (8.8). Evidence: the best chunk of each of
-the top `evidence_top` (default: every note scoring at least half the top score, bounded only by the context window; one recall, the question as the only query; scope defaults to the extracted filter set) notes of the blended recall plus its neighbours by
-chunk `ordinal` (at most 3 chunks per note), or, with `scope=[note names or
-document ids]` that resolves to one or more notes, the whole scope set (any size). The model
+the notes of the blended recall scoring at least `evidence.min_rel_score` of
+the best, each with its chunks kept by score (see `docs/limits.md`; `evidence_top`
+is an optional per-call note count, `None` by default), or, with `scope=[note names or
+document ids]` that resolves to any number of notes, the whole scope set (one recall, the question as the only query; `scope` defaults to the extracted filter set). The model
 cites `[note name]` for every claim and answers `not in memory` when the
 evidence lacks it. `RAGResult.citations` (`note`, `document_id`, `known`; unknown
 = the model cited a name not in the evidence), `.evidence` and `.synth_call`

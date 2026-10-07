@@ -323,7 +323,7 @@ def _body_and_offset(content: str) -> tuple[str, int]:
 def _matching_chunk(query: str, chunks: list, fallback: str) -> str:
     """The chunk sharing the most words with the question text."""
     if not chunks:
-        return fallback[:CHUNK_MAX_CHARS]
+        return fallback
     words = set(re.findall(r"\w{3,}", query.lower()))
     best = max(chunks, key=lambda c: len(words & set(re.findall(r"\w{3,}", c.content.lower()))))
     return best.content

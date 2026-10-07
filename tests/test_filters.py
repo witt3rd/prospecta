@@ -100,22 +100,69 @@ def F(doc, score):
     return FusedDoc(document_id=doc, source=doc, score=score, best=C(doc, 1, "dense_chunk"))
 
 
-def test_promotion_moves_members_to_front_and_never_excludes():
+def test_promotion_boosts_members_and_never_excludes():
     fused = [F("a", 3), F("b", 2), F("c", 1)]
-    members = [C("c", 1), C("z", 2)]
-    out = promote_scope(fused, members)
-    assert [f.document_id for f in out] == ["c", "z", "a", "b"]  # z added, none removed
+    members = [C("c", 1), C("z", 2)]   # cosine 0.5 each
+    out = promote_scope(fused, members, weight=4.0)
+    ids = [f.document_id for f in out]
+    assert set(ids) == {"a", "b", "c", "z"}          # z added, none removed
+    assert ids[:2] == ["c", "z"] or ids[:2] == ["z", "c"]  # boost lifts them past a, b
 
 
-def test_scope_members_gates():
+def test_promotion_weight_decides_not_count():
+    fused = [F("a", 3), F("b", 2)]
+    assert [f.document_id for f in promote_scope(fused, [C("b", 1)], weight=0.1)] == ["a", "b"]
+    assert [f.document_id for f in promote_scope(fused, [C("b", 1)], weight=2.0)] == ["b", "a"]
+    assert promote_scope(fused, [C("b", 1)], weight=0) == fused
+
+
+def test_scope_members_gates_and_has_no_size_limit():
     hard = QueryPlan(text="q", filters=Filters(people=["A"], hard=True))
     soft = QueryPlan(text="q", filters=Filters(people=["A"], hard=False))
-    few = [C(f"d{i}", i + 1) for i in range(12)]
-    assert scope_members(hard, few, 50) == few
-    assert scope_members(soft, few, 50) == []
-    assert scope_members(hard, [C(f"d{i}", i + 1) for i in range(13)], 50) == []
-    assert scope_members(hard, few, 12) == []  # set may be truncated by the limit
-    assert scope_members(hard, [], 50) == []
+    many = [C(f"d{i}", i + 1) for i in range(200)]
+    assert scope_members(hard, many) == many
+    assert scope_members(soft, many) == []
+    assert scope_members(hard, []) == []
+
+
+def test_q096_style_large_filter_set_cover_at_10():
+    """Large filter set (40 notes, 3 gold, all gold in the set but buried in the
+    fused pool): the old 12-note cap did nothing; the boost lifts gold."""
+    gold = {"g1", "g2", "g3"}
+    outside = [F(f"x{i}", 1.0 - i * 0.005) for i in range(60)]
+    inset = [F(f"m{i}", 0.30 - i * 0.001) for i in range(37)] + [F(g, 0.2) for g in sorted(gold)]
+    fused = sorted(outside + inset, key=lambda f: -f.score)
+    def cos(d):  # gold are the closest members to the query
+        return 0.9 if d in gold else 0.3
+    members = [Candidate(document_id=f.document_id, item_id=None, source=f.document_id,
+                         channel="meta", rank=i + 1, score=cos(f.document_id), evidence=None)
+               for i, f in enumerate(inset)]
+    def cover(order):
+        return len(gold & {f.document_id for f in order[:10]}) / len(gold)
+    old_cap = fused if len(members) > 12 else promote_scope(fused, members)  # PROMOTE_MAX=12
+    new = promote_scope(fused, members, weight=1.0)
+    print(f"cover@10 old cap={cover(old_cap):.2f} boost={cover(new):.2f}")
+    assert cover(old_cap) == 0.0 and cover(new) == 1.0
+
+
+def test_q096_style_weak_cosine_members():
+    """Members with weak cosine still rise above non-members of equal fused score
+    only in proportion to cosine; a cosine-0 member gets no boost (the boost
+    multiplies a real score)."""
+    gold = {"g1", "g2", "g3"}
+    outside = [F(f"x{i}", 1.0 - i * 0.005) for i in range(60)]
+    inset = [F(f"m{i}", 0.30 - i * 0.001) for i in range(37)] + [F(g, 0.2) for g in sorted(gold)]
+    fused = sorted(outside + inset, key=lambda f: -f.score)
+    def mk(cos):
+        return [Candidate(document_id=f.document_id, item_id=None, source=f.document_id,
+                          channel="meta", rank=i + 1, score=cos(f.document_id), evidence=None)
+                for i, f in enumerate(inset)]
+    def cover(order):
+        return len(gold & {f.document_id for f in order[:10]}) / len(gold)
+    weak = promote_scope(fused, mk(lambda d: 0.85 if d in gold else 0.05), weight=1.0)
+    zero = promote_scope(fused, mk(lambda d: 0.0), weight=1.0)
+    print(f"cover@10 weak-cosine boost={cover(weak):.2f} zero-cosine={cover(zero):.2f}")
+    assert cover(weak) == 1.0 and cover(zero) == 0.0
 
 
 # ------------------------------------------------------- db integration
@@ -209,13 +256,13 @@ def test_meta_channel_ranks_filter_set_and_soft_filter_adds_no_promotion(mem):
     assert len(res) == 4  # nothing excluded
 
 
-def test_hard_scope_promotes_whole_set_even_beyond_limit(mem):
+def test_hard_scope_promotes_set_members(mem):
     mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
     mem._llm = llm_returning({"people": ["Alice"], "date_from": "2024-03-01",
                               "date_to": "2024-04-30", "hard": True})
     traces: list = []
-    res = mem.search("walk the dog by the park", limit=1, _trace=traces)
-    assert set(_sources(res)) == {"a1.md", "a2.md"}  # all members despite limit=1
+    res = mem.search("walk the dog by the park", limit=2, _trace=traces)
+    assert set(_sources(res)) == {"a1.md", "a2.md"}  # boosted members lead
     assert len(traces[0]["fusion"]["scope_promoted"]) == 2
 
 
