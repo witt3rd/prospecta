@@ -292,3 +292,46 @@ def test_mapreduce_candidate_set_is_precise_with_common_alias_word(fresh_db):
     assert {e["fact"].casefold() for e in res.evidence} == {f"name {n}".casefold() for n in ALL5}
     assert res.synth_call["notes_visited"] == len(after)
     m.close()
+
+
+def test_mapreduce_keeps_every_entity_linked_note_despite_weak_text_hits(fresh_db):
+    """Notes tied to the person ONLY by entity link / alias row (no person
+    front-matter, name absent or weakly present in text) are never cut by the
+    scan relevance; only unlinked text-scan hits are subject to it."""
+    m = Memory(database_url=fresh_db, bank_id="b", llm=MapReduceLLM(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    linked = []
+    for i in range(30):   # linked only by entity: text never says the name (or says it once, buried)
+        body = f"Quiet note {i}, also called Nick{i}. " + ("filler " * 200 if i % 2 else "")
+        if i % 3 == 0:
+            body += " Patricia once."
+        src = f"linked{i}.md"
+        m.retain(body, source=src, index_text=body)
+        linked.append(src)
+    for i in range(5):   # strong text-scan hits (raise the best scan score)
+        body = f"strong {i} " + "Patricia " * 50
+        m.retain(body, source=f"strong{i}.md", index_text=body)
+    with psycopg.connect(fresh_db) as conn:
+        eid = conn.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
+                           "VALUES ('b', 'Pat', 'pat', 'person') RETURNING id").fetchone()[0]
+        conn.execute("INSERT INTO memory_entity_aliases (bank_id, entity_id, alias, norm) "
+                     "VALUES ('b', %s, 'Patricia', 'patricia')", (eid,))
+        for src in linked:
+            item = conn.execute(
+                "SELECT m.id FROM memory_items m JOIN documents d ON d.id = m.document_id "
+                "WHERE d.source = %s LIMIT 1", (src,)).fetchone()[0]
+            conn.execute("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)",
+                         (item, eid))
+        for i, person in enumerate(["Pat  Smith", "Pat\tSmith", " pat smith "]):
+            m.retain(f"Unrelated body {i}.", source=f"ws{i}.md", index_text=f"ws {i}")
+            conn.execute("UPDATE documents SET person = %s WHERE source = %s", (person, f"ws{i}.md"))
+        conn.commit()
+        from prospecta import _mapreduce
+        names, _, _ = _mapreduce.resolve_names(conn, "b", ["Pat", "Pat Smith"])
+        got = {s for _, s, _ in _mapreduce.fetch_entity_notes(
+            conn, "b", names, scan_names=["Patricia"], scan_relevance=0.25)}
+        got_alias = {s for _, s, _ in _mapreduce.fetch_entity_notes(
+            conn, "b", ["Patricia"], scan_names=["Patricia"], scan_relevance=0.99)}
+    assert set(linked) <= got and set(linked) <= got_alias
+    assert {"ws0.md", "ws1.md", "ws2.md"} <= got
+    m.close()
