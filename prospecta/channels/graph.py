@@ -52,7 +52,8 @@ _EDGES = """
 # Hub holders are fetched once per (entity, kind) -- not once per frontier item --
 # and joined to the two best frontier items of distinct documents holding the entity
 # (all that the best-score-per-neighbour merge can use; a holder in the best item's
-# own document takes the second; a frontier item's own document is left out of its neighbours). `{p}` prefixes the CTE names.
+# own document takes the second; a frontier item's own document is left out of its
+# neighbours). `{p}` prefixes the CTE names.
 _HUBS = """
 {p}fe AS MATERIALIZED (   -- frontier item x entity it holds (each item once)
     SELECT s.item, s.origin_doc, s.score, s.hops, s.via, s.link_types, s.parent,
