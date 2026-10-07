@@ -248,4 +248,47 @@ def test_mapreduce_depth_defaults_deep_and_is_recorded(fresh_db):
     assert rows == [("deep",), ("standard",)]
     with pytest.raises(ValueError):
         m.recall_mapreduce("nicknames?", entity="Pat", depth="shallow")
+
+
+def test_mapreduce_candidate_set_is_precise_with_common_alias_word(fresh_db):
+    """9 gold notes among 1,500; 1,300 merely mention the alias word 'Wizard' once."""
+    m = Memory(database_url=fresh_db, bank_id="b", llm=RealisticLLM(), embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    gold = {
+        "g1.md": ("Greg", "Greg, nickname Wizard of Oz."),
+        "g2.md": ("Greg", "Greg's pen name Ann Archer; nickname Gregsy."),
+        "g3.md": ("Greg", "Wrote as pen name Jay Fenwick."),
+        "g4.md": ("Greg", "Nickname Wizard of Oz."),
+        "g5.md": ("Greg", "Nickname Gregsy."),
+        "g6.md": ("", "Wizard of Oz wrote this; Wizard of Oz again; pen name Mara Quill."),
+        "g7.md": ("", "Wizard of Oz, Wizard of Oz: nickname Wizard of Oz."),
+        "g8.md": ("", "Wizard of Oz. Wizard of Oz. pen name Jay Fenwick."),
+        "g9.md": ("", "Wizard of Oz Wizard of Oz Wizard of Oz; nickname Gregsy."),
+    }
+    for src, (person, body) in gold.items():
+        front = f"---\nperson: {person}\n---\n" if person else ""
+        m.retain(front + body, source=src, index_text=body)
+    for i in range(1300):
+        body = (f"Note {i}: we watched the Wizard of Oz in passing. " + "Filler text. " * 20)
+        m.retain(body, source=f"w{i}.md", index_text=f"w {i}")
+    for i in range(191):
+        m.retain(f"Plain note {i}.", source=f"n{i}.md", index_text=f"plain {i}")
+    with psycopg.connect(fresh_db) as conn:
+        eid = conn.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
+                           "VALUES ('b', 'Greg', 'greg', 'person') RETURNING id").fetchone()[0]
+        conn.execute("INSERT INTO memory_entity_aliases (bank_id, norm, alias, entity_id) "
+                     "VALUES ('b', 'wizard of oz', 'Wizard of Oz', %s)", (eid,))
+        conn.commit()
+        assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 1500
+        from prospecta._mapreduce import fetch_entity_notes
+        before = fetch_entity_notes(conn, "b", ["Greg"], scan_names=["Wizard of Oz"],
+                                    scan_relevance=0.0)
+        after = fetch_entity_notes(conn, "b", ["Greg"], scan_names=["Wizard of Oz"])
+    print(f"candidate set before={len(before)} after={len(after)}")
+    assert len(before) > 1300
+    srcs = {s for _, s, _ in after}
+    assert set(gold) <= srcs and len(srcs - set(gold)) < 100
+    res = m.recall_mapreduce("what are Greg's nicknames?", entity="Greg", batch_size=4)
+    assert {e["fact"].casefold() for e in res.evidence} == {f"name {n}".casefold() for n in ALL5}
+    assert res.synth_call["notes_visited"] == len(after)
     m.close()
