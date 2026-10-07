@@ -369,3 +369,39 @@ def test_mapreduce_alias_list_excludes_variants_of_the_entity(fresh_db):
             aliases=["Nelson", "Mr Nelson", "Nélson", "Pippin"])
     assert res.plan["aliases"] == ["Pippin"]
     m.close()
+
+
+def test_mapreduce_hub_person_candidate_set_follows_name_bearing_notes(fresh_db):
+    """A hub person: 1,300 notes entity-linked, 9 of which say the asked nickname.
+    The resolver runs once; the candidate set is those 9 (plus relevant scan hits),
+    not all 1,300, and the map cost is proportional to it."""
+    llm = MapReduceLLM()
+    m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    gold = [f"gold{i}.md" for i in range(9)]
+    for i, src in enumerate(gold):
+        body = f"Hub talked; also called Dizzy{i}. Dizzy was the nickname."
+        m.retain(body, source=src, index_text=body)
+    for i in range(1300 - 9):
+        body = f"They went about thing {i}. " + "Filler text. " * 10
+        m.retain(body, source=f"h{i}.md", index_text=f"h {i}")
+    with psycopg.connect(fresh_db) as conn:
+        eid = conn.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) "
+                           "VALUES ('b', 'Hub', 'hub', 'person') RETURNING id").fetchone()[0]
+        conn.execute("INSERT INTO memory_entity_aliases (bank_id, entity_id, alias, norm) "
+                     "VALUES ('b', %s, 'Dizzy', 'dizzy')", (eid,))
+        conn.execute("INSERT INTO memory_item_entities (item_id, entity_id) "
+                     "SELECT DISTINCT ON (document_id) id, %s FROM memory_items", (eid,))
+        conn.commit()
+        from prospecta._mapreduce import fetch_entity_notes, resolve_names
+        names, _, _ = resolve_names(conn, "b", ["Hub"])
+        got = fetch_entity_notes(conn, "b", names, scan_names=["Dizzy"])
+        assert conn.execute("SELECT count(DISTINCT document_id) FROM memory_item_entities ie "
+                            "JOIN memory_items i ON i.id = ie.item_id").fetchone()[0] == 1300
+    srcs = [s for _, s, _ in got]
+    assert set(gold) <= set(srcs) and len(srcs) < 50
+    res = m.recall_mapreduce("what are Hub's nicknames?", entity="Hub", batch_size=4)
+    assert res.synth_call["notes_visited"] == len(srcs)
+    assert len(llm.map_prompts) == -(-len(srcs) // 4)   # map cost follows the real set
+    assert len(res.evidence) == 9
+    m.close()

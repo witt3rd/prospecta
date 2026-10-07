@@ -27,30 +27,40 @@ DEFAULT_BATCH_SIZE = 8
 # is kept when its text-rank is at least this fraction of the best scan hit's.
 # Entity-linked / alias-resolved / documents.person notes are always kept.
 DEFAULT_SCAN_RELEVANCE = 0.25
+# A HUB entity is linked to more notes than this (within the filter). For a hub the
+# link alone says little, so an entity-linked note is precise only when its text
+# also names one of the asked aliases (or the person field matches); below it every
+# linked note is kept. This is a hubness test, not a cap on the candidate set.
+HUB_LINKED_NOTES = 100
 MAP_ATTEMPTS = 2   # a failed batch is retried once, then surfaced
 DEFAULT_EXCERPT_CHARS = 6000   # a note longer than this is sent as its entity-mention paragraphs
 
 _NOTES_SQL = """
 WITH cand AS (
   SELECT d.id, d.source, d.original_text,
-         (   coalesce(lower(regexp_replace(btrim(d.person), '[[:space:]]+', ' ', 'g')) = ANY(%(names)s), false)
-          OR d.id IN (SELECT m.document_id FROM memory_item_entities ie
-                      JOIN memory_items m ON m.id = ie.item_id
-                      WHERE ie.entity_id = ANY(%(ids)s))) AS precise,
-         (%(rx)s <> '' AND d.original_text ~* %(rx)s) AS scanned
+         coalesce(lower(regexp_replace(btrim(d.person), '[[:space:]]+', ' ', 'g')) = ANY(%(names)s), false) AS by_person,
+         d.id IN (SELECT m.document_id FROM memory_item_entities ie
+                  JOIN memory_items m ON m.id = ie.item_id
+                  WHERE ie.entity_id = ANY(%(ids)s)) AS linked,
+         (%(rx)s <> '' AND d.original_text ~* %(rx)s) AS scanned,
+         (%(hrx)s <> '' AND d.original_text ~* %(hrx)s) AS named
   FROM documents d
   WHERE d.bank_id = %(bank)s
     AND (%(meta)s::jsonb IS NULL OR EXISTS (
             SELECT 1 FROM memory_items mi
             WHERE mi.document_id = d.id AND mi.metadata @> %(meta)s::jsonb))
+), hubness AS (
+  SELECT c.*, (SELECT count(*) FROM cand WHERE linked) > %(hub)s AS hub FROM cand c
+), flagged AS (
+  SELECT h.*, (by_person OR (linked AND (NOT hub OR %(hrx)s = '' OR named))) AS precise FROM hubness h
 ), scored AS (
   SELECT c.*, CASE WHEN c.scanned THEN
               ts_rank(to_tsvector('simple', c.original_text), nullif(%(tsq)s, '')::tsquery, 1) ELSE 0 END AS score
-  FROM cand c WHERE c.precise OR c.scanned
+  FROM flagged c WHERE c.precise OR c.scanned
 )
 SELECT id::text, source, original_text FROM scored
 WHERE precise OR score >= %(rel)s * (SELECT coalesce(max(score), 0) FROM scored WHERE NOT precise AND scanned)
-ORDER BY source, id
+ORDER BY score DESC, source, id
 """
 
 MIN_SCAN_CHARS = 3   # an alias shorter than this is too ambiguous to scan note text for
@@ -83,22 +93,29 @@ def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list
 def fetch_entity_notes(conn, bank_id: str, names: list[str],
                        metadata_filter: dict | None = None,
                        scan_names: list[str] | None = None,
-                       scan_relevance: float = DEFAULT_SCAN_RELEVANCE) -> list[tuple[str, str, str]]:
+                       scan_relevance: float = DEFAULT_SCAN_RELEVANCE,
+                       resolved=None) -> list[tuple[str, str, str]]:
     """(document_id, source, text) of every note tied to the entity: its
     documents.person, any item mentioning the entity (found by name or by any
     alias row), or whose text contains a name in `scan_names` (alias strings:
     a note that uses an alias but whose extraction listed no entity is still
-    reached), within the optional filter. Returns `names` resolved via
-    `resolve_names`."""
-    _, norms, ids = resolve_names(conn, bank_id, names)
+    reached), within the optional filter. Pass `resolved` (a Resolution) to
+    skip resolving `names` again. Best-scoring notes come first."""
+    if resolved is None:
+        _, norms, ids = resolve_names(conn, bank_id, names)
+    else:
+        norms, ids = sorted(set(resolved.norms) | {norm_key(x) for x in resolved.people}), resolved.ids
     scan = sorted({n.strip() for n in (scan_names if scan_names is not None else names)
                    if len(n.strip()) >= MIN_SCAN_CHARS}, key=str.casefold)
     rx = r"\m(?:" + "|".join(re.escape(n) for n in scan) + r")\M" if scan else ""
+    hub_names = sorted({n.strip() for n in [*names, *scan] if len(n.strip()) >= MIN_SCAN_CHARS},
+                       key=str.casefold)
+    hrx = r"\m(?:" + "|".join(re.escape(n) for n in hub_names) + r")\M" if hub_names else ""
     tsq = " | ".join(f"({' <-> '.join(w for w in re.findall(r'\w+', n.casefold()))})"
                      for n in scan if re.findall(r"\w+", n)) or ""
     with conn.cursor() as cur:
-        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx,
-                                 "tsq": tsq, "rel": scan_relevance,
+        cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx, "hrx": hrx,
+                                 "tsq": tsq, "rel": scan_relevance, "hub": HUB_LINKED_NOTES,
                                  "meta": _meta_param(metadata_filter)})
         return [(r[0], r[1] or r[0], r[2]) for r in cur.fetchall()]
 
@@ -167,12 +184,12 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
                   on_progress=None) -> MapReduceResult:
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
-    names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
-    _, _, found = resolve_names(conn, bank_id, [entity, *(aliases or [])])
+    res = resolve_entities(conn, bank_id, [entity, *(aliases or [])])   # once
+    names, found = res.names, res.ids
     # alias strings, not the bare name; but when nothing resolved the bare name is all we have
     scan = [n for n in names if not same_name(n, entity)] if found else list(names)
     notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
-                               scan_relevance=scan_relevance)
+                               scan_relevance=scan_relevance, resolved=res)
     by_norm = {fold_path(src): (doc, src) for doc, src, _ in notes}
     base_count: dict[str, int] = {}
     for _, src, _ in notes:

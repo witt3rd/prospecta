@@ -111,7 +111,9 @@ cannot be complete. `recall_mapreduce` reads every note tied to the entity
 (`documents.person`, the entity table by name or `aliases`, `metadata_filter`),
 plus alias-text matches that score at least `scan_relevance` x the best
 text hit (a recall net, not a full scan), in batches, extracts the asked facts with a citation each, and merges them into
-one deduplicated cited list. Progress, cost, notes visited and facts found are
+one deduplicated cited list. For a hub entity (linked to more than 100 notes) a linked note is kept only when its
+text names the entity or an alias (or `documents.person` matches); notes are mapped best-score first.
+Progress, cost, notes visited and facts found are
 recorded in `recall_events.plan` (mode `mapreduce`).
 
 ```python
