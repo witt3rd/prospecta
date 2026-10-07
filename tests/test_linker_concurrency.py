@@ -118,3 +118,148 @@ def test_failed_step_is_loud_recorded_and_picked_up_by_link_pending(mem, monkeyp
     with conn_of(mem) as c:
         assert c.execute("SELECT count(*) FROM memory_link_state WHERE status='error'"
                          ).fetchone()[0] == 0
+
+
+# ----------------------------------------------------------- multi-writer (defect 4)
+
+def _clustered(n=24):
+    return [(f"c{i}", f"Kelly and Forge at Acme: topic {i % 4} cluster note {i}",
+             {"created": f"2024-01-{1 + i:02d}", "person": "kelly" if i % 3 else "forge"})
+            for i in range(n)]
+
+
+def _link_set(m, bank):
+    with conn_of(m) as c:
+        return set(c.execute(
+            "SELECT s.source, d.source, l.link_type, l.subtype FROM memory_links l "
+            "JOIN memory_items a ON a.id = l.src JOIN documents s ON s.id = a.document_id "
+            "JOIN memory_items b ON b.id = l.dst JOIN documents d ON d.id = b.document_id "
+            "WHERE l.bank_id = %s", (bank,)).fetchall())
+
+
+def _bank_docs(m, bank):
+    with conn_of(m) as c:
+        return [str(r[0]) for r in c.execute(
+            "SELECT id FROM documents WHERE bank_id = %s ORDER BY source", (bank,))]
+
+
+def _run_threads(fn, parts):
+    errs = []
+
+    def wrap(p):
+        try:
+            fn(p)
+        except Exception as exc:
+            errs.append(exc)
+    ts = [threading.Thread(target=wrap, args=(p,)) for p in parts]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    return errs
+
+
+def _new(url, bank_id="b", **kw):
+    return Memory(database_url=url, bank_id=bank_id, llm=None, embed=stub_embed, **kw)
+
+
+def _state_counts(m, bank):
+    with conn_of(m) as c:
+        return c.execute(
+            "SELECT count(*) FILTER (WHERE status = 'error'), count(*) "
+            "FROM memory_link_state WHERE bank_id = %s", (bank,)).fetchone()
+
+
+def _mk(url, bank, linker=True):
+    return _new(url, bank_id=bank,
+                linker=Linker(llm=EntityLLM(), asynchronous=False, entity_hub=1000) if linker else None)
+
+
+def test_eight_writers_link_the_same_set_as_a_serial_run(fresh_db):
+    corpus = _clustered()
+    # serial reference (bank s): retain all, then the eight walks in turn (a single walk links
+    # each pair from the later note only, so the comparison needs the same walks)
+    ref = _mk(fresh_db, "s", linker=False)
+    ref.create_bank("s", embedding_dim=EMBED_DIM)
+    for src, text, md in corpus:
+        ref.retain(text, source=src, index_text=f"q {src}", metadata=md)
+    ref._linker = Linker(llm=EntityLLM(), entity_hub=1000)   # a hub cut depends on arrival order
+    sids = _bank_docs(ref, "s")
+    for i in range(8):   # the same eight walks the concurrent linkers make, one after another
+        for d in sids[i:] + sids[:i]:
+            ref.link_document(d, "s")
+    for d in sids:   # a final pass: every note then sees every other note's entities
+        ref.link_document(d, "s")
+    serial = _link_set(ref, "s")
+    assert serial
+    # 8 writers (own Memory each) retain concurrently into bank b ...
+    writers = [_mk(fresh_db, "b", linker=False) for _ in range(8)]
+    writers[0].create_bank("b", embedding_dim=EMBED_DIM)
+
+    def retain(i):
+        for src, text, md in corpus[i::8]:
+            writers[i].retain(text, source=src, index_text=f"q {src}", metadata=md)
+    assert _run_threads(retain, range(8)) == []
+    # ... then 8 linkers walk the whole set in their own order: contention on every document
+    linkers = [_mk(fresh_db, "b") for _ in range(8)]
+    ids = _bank_docs(writers[0], "b")
+    assert _run_threads(lambda i: [linkers[i].link_document(d, "b") for d in
+                                   (ids[i:] + ids[:i])], range(8)) == []
+    for d in ids:   # the same final pass (a concurrent walk may link a pair from one side only)
+        linkers[0].link_document(d, "b")
+    assert _state_counts(ref, "b") == (0, len(corpus))
+    assert _link_set(ref, "b") == serial
+    [m.close() for m in writers + linkers + [ref]]
+
+
+def test_eight_writers_retaining_with_inline_linking_fail_nothing(fresh_db):
+    corpus = _clustered()
+    writers = [_mk(fresh_db, "i") for _ in range(8)]
+    writers[0].create_bank("i", embedding_dim=EMBED_DIM)
+
+    def retain(i):
+        for src, text, md in corpus[i::8]:
+            writers[i].retain(text, source=src, index_text=f"q {src}", metadata=md)
+    assert _run_threads(retain, range(8)) == []
+    assert _state_counts(writers[0], "i") == (0, len(corpus))
+    [w.close() for w in writers]
+
+
+def test_same_document_is_linked_once_under_the_advisory_lock(mem):
+    _seed(mem, 3)
+    d = next(iter(docs(mem).values()))
+    inside, peak, lock = [0], [0], threading.Lock()
+
+    class Probe(Linker):
+        def _temporal(self, conn, *a):
+            with lock:
+                inside[0] += 1
+                peak[0] = max(peak[0], inside[0])
+            import time
+            time.sleep(0.1)
+            try:
+                return super()._temporal(conn, *a)
+            finally:
+                with lock:
+                    inside[0] -= 1
+    mem._linker = Probe()
+    assert _run_threads(lambda _: mem.link_document(d), range(4)) == []
+    assert peak[0] == 1
+
+
+def test_one_memory_shared_by_threads_uses_a_connection_per_thread(mem):
+    seen = []
+
+    def grab(_):
+        with mem._pool.connection() as c:
+            seen.append(id(c))
+            c.execute("SELECT 1")
+    assert _run_threads(grab, range(4)) == []
+    assert len(set(seen)) == 4
+
+
+def test_linking_a_deleted_document_is_skipped_not_half_linked(mem):
+    _seed(mem, 2)
+    mem._linker = Linker()
+    stats = mem.link_document("00000000-0000-0000-0000-000000000000")
+    assert stats["skipped"] == "document gone"
+    with conn_of(mem) as c:
+        assert c.execute("SELECT count(*) FROM memory_link_state").fetchone()[0] == 0
