@@ -32,6 +32,7 @@ from typing import Any, Protocol
 
 import psycopg.errors
 
+from prospecta._scorecut import fetch_until_cut
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
@@ -41,12 +42,11 @@ from prospecta.stages import (
 
 logger = logging.getLogger(__name__)
 
-NEIGHBOURS = 10            # candidates per anchor, by pgvector
+NEIGHBOUR_MIN_REL = 0.6    # candidates per anchor: every neighbour with cosine >= 0.6 x the nearest (no count)
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
-VECTOR_TOP = 5
 TEMPORAL_DAYS = 3
-TEMPORAL_CLOSE_CAP = 5
+TEMPORAL_MIN_REL = 0.5     # TEMPORALLY_CLOSE: every note within TEMPORAL_DAYS whose closeness 1/(1+days) >= 0.5 x the closest's
 DEADLOCK_RETRIES = 6       # attempts per step on deadlock / serialization failure
 DEADLOCK_BACKOFF_S = 0.05  # first backoff; doubles with jitter
 ETYPES = {"person", "org", "place", "project", "product", "event", "other"}
@@ -89,7 +89,10 @@ prev AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) < (me.dt
 nxt AS (SELECT o.id FROM others o, me WHERE (o.dt, o.created_at, o.id) > (me.dt, me.created_at, me.id)
         ORDER BY o.dt, o.created_at, o.id LIMIT 1),
 near AS (SELECT o.id, abs(o.dt - me.dt) AS days FROM others o, me
-          WHERE abs(o.dt - me.dt) <= %(days)s ORDER BY abs(o.dt - me.dt), o.id LIMIT %(cap)s),
+          WHERE abs(o.dt - me.dt) <= %(days)s
+            AND 1.0 / (1 + abs(o.dt - me.dt)) >= %(rel)s * (
+                SELECT 1.0 / (1 + min(abs(o2.dt - me.dt))) FROM others o2
+                WHERE abs(o2.dt - me.dt) <= %(days)s)),
 rep AS (   -- one representative item per note: the first anchor
     SELECT DISTINCT ON (d.id) d.id AS doc, m.id AS item
     FROM documents d JOIN memory_items m ON m.document_id = d.id
@@ -267,7 +270,8 @@ class Linker:
     llm: Any = None
     judge: RelationJudge | None = None
     model: str | None = None
-    neighbours: int = NEIGHBOURS
+    neighbour_min_rel: float = NEIGHBOUR_MIN_REL
+    temporal_min_rel: float = TEMPORAL_MIN_REL
     temporal_days: int = TEMPORAL_DAYS
     entity_hub: int = ENTITY_HUB
     vector_floor: float = VECTOR_FLOOR
@@ -344,7 +348,7 @@ class Linker:
             cur.execute(_NEXT, {"bank": bank_id, "doc": doc})
             n = cur.rowcount
             cur.execute(_TEMPORAL, {"bank": bank_id, "doc": doc,
-                                    "days": self.temporal_days, "cap": TEMPORAL_CLOSE_CAP})
+                                    "days": self.temporal_days, "rel": self.temporal_min_rel})
             stats["temporal"] = n + cur.rowcount
 
     def _entities(self, conn, bank_id, doc, anchors, stats, calls):
@@ -485,10 +489,17 @@ class Linker:
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
         for a in anchors:
             kind = "chunk" if a["kind"] == "chunk" else "question"
-            with conn.cursor() as cur:
-                cur.execute(_NEIGHBOUR_SQL.format(kind=kind), {
-                    "bank": bank_id, "doc": doc, "n": self.neighbours, "item": a["id"]})
-                cands = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
+
+            def fetch(n, kind=kind, a=a):
+                from prospecta.channels.semantic import _scan_everything
+                with conn.transaction(), conn.cursor() as cur:
+                    _scan_everything(cur)   # a short page must mean the source is exhausted
+                    cur.execute(_NEIGHBOUR_SQL.format(kind=kind), {
+                        "bank": bank_id, "doc": doc, "n": n, "item": a["id"]})
+                    rows = [dict(zip([c.name for c in cur.description], r))
+                            for r in cur.fetchall()]
+                return sorted(rows, key=lambda c: -float(c["cos"]))
+            cands = fetch_until_cut(fetch, lambda c: float(c["cos"]), self.neighbour_min_rel)
             if not cands:
                 continue
             hits: list[RelationHit] | None = None
@@ -503,7 +514,7 @@ class Linker:
             if hits is None:   # no judge, or Jev could not answer: pgvector neighbours
                 origin = "pgvector"
                 hits = [RelationHit(i, "SEMANTIC", "RELATED_TO", float(c["cos"]))
-                        for i, c in enumerate(cands[:VECTOR_TOP])
+                        for i, c in enumerate(cands)
                         if float(c["cos"]) >= self.vector_floor]
             with conn.cursor() as cur:
                 def edge(h):

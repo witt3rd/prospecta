@@ -14,7 +14,7 @@ backoff, and a step that still fails is recorded in `memory_link_state` as `erro
 up again by `link_pending`. Per document:
 
 - `NEXT` between consecutive chunks, and `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE`
-  (within 3 days, at most 5) to the chronological neighbours of the same `person`, in SQL
+  (within 3 days, closeness >= `temporal_min_rel` 0.5 x the closest) to the chronological neighbours of the same `person`, in SQL
   from `prospecta_doc_date(document_metadata, created_at, created_on)` (created_on first); no model call.
 - Entities by the injected `llm` (Sonnet; prompt `extract-entities`), then
   `ENTITY/SHARED_ENTITY` links by a join. An entity held by more than 30 items (`ENTITY_HUB`) is a hub
@@ -24,19 +24,18 @@ up again by `link_pending`. Per document:
   is held by the person; mentions already extracted under an alias move onto the person.
   `Linker.backfill_aliases(conn, bank_id, limit, after)` is the resumable backfill by document id
   (progress in `memory_alias_state`; errors recorded and skipped).
-- Semantic links: the top 10 pgvector neighbours per anchor item. With a
+- Semantic links: every pgvector neighbour per anchor item with cosine >= `neighbour_min_rel` (0.6) x the nearest (see `limits.md`). With a
   `JevRelationJudge(transport)` Jev answers `semantic`, `causes`, `caused_by` as System
   One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`); without one, or if
   Jev fails, neighbours with cosine >= 0.75 become `RELATED_TO` (`origin='pgvector'`).
 
-**GraphExpand** (`graph`, kind `expand`) seeds from the best 10 documents of the pool,
+**GraphExpand** (`graph`, kind `expand`) seeds from every pool document with RRF >= `seed_min_rel` (0.5) x the best,
 walks two bounded, indexed hops over links in both directions (plus the entity-table join for hub
 entities), multiplying by
 decay 0.5, the link type weight (SEMANTIC 1.0, CAUSAL 0.8, TEMPORAL 0.5, ENTITY 0.5) and
-the link confidence; at most 60 neighbour items, reported per document. It is **enabled
+the link confidence; every reached neighbour scoring >= `node_min_rel` (0.4) x the best reached, reported per document. It is **enabled
 in `DEFAULT_CHANNEL_CONFIG` at weight 1** (captain's decision; the design had it dark);
-set `weight` (0 silences it) and `params` (`seeds`, `max_hops`, `decay`, `node_cap`,
-`frontier`, `hub`, `hub_cap`, `type_weights`) per bank. Its contribution is to be measured on real questions.
+set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_hops`, `decay`, `hub`, `hub_cap`, `type_weights`) per bank. Its contribution is to be measured on real questions.
 
 **JevReader** (`recall_config.reader.type = "jev"`, needs `Memory(jev=...)`): Jev's
 `evidence_sufficient`, `continue_useful`, `missing_evidence` as one request decide

@@ -3,12 +3,13 @@
 Seeds are the best items of the pool the recall channels found. Two bounded
 hops follow memory_links in both directions, and the entity table for hub
 entities (see _EDGES / _HUBS below). Every step multiplies the score by a decay, the link's type
-weight and its confidence; the walk keeps at most `node_cap` neighbour items
-(Jev-Mem's 60), best first, and reports them as documents. A document reached
+weight and its confidence; the walk keeps every neighbour item whose score is
+at least `node_min_rel` x the best reached score (no count), best first, and
+reports them as documents. A document reached
 only through its own seed's links is not an expansion and is dropped.
 
-params (all optional): seeds (10), max_hops (2), decay (0.5),
-node_cap (60), frontier (200, items expanded in hop 2), hub (30, the Linker's
+params (all optional): seed_min_rel (0.5: every pool document whose RRF >= 0.5 x
+the best is a seed), max_hops (2), decay (0.5), node_min_rel (0.4), hub (30, the Linker's
 ENTITY_HUB), hub_cap (200, holders reached per hub entity), type_weights ({"SEMANTIC":1.0,"CAUSAL":0.8,"TEMPORAL":0.5,
 "ENTITY":0.5}).
 """
@@ -19,20 +20,18 @@ import json
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 
 DEFAULT_TYPE_WEIGHTS = {"SEMANTIC": 1.0, "CAUSAL": 0.8, "TEMPORAL": 0.5, "ENTITY": 0.5}
-DEFAULT_SEEDS = 10
+DEFAULT_SEED_MIN_REL = 0.5
 DEFAULT_DECAY = 0.5
-DEFAULT_NODE_CAP = 60
+DEFAULT_NODE_MIN_REL = 0.4
 MAX_HOPS = 2
 ENTITY_HUB = 30         # an entity on more items than this is a hub: no per-anchor links
 DEFAULT_HUB_CAP = 200   # holders reached per hub entity per seed item
-DEFAULT_FRONTIER = 200  # items expanded in hop 2
 _RRF_K = 60
 
 # Two explicit, bounded hops instead of a recursive walk over both directions
 # of an OR join. Each hop is a UNION ALL of two index scans (src side, dst
-# side). After hop 1 only the best `frontier` items (by score) are expanded:
-# scores only fall along a path (decay, weight, confidence are all <= 1), so
-# the frontier holds every item that could still reach the node cap. Hub
+# side). After hop 1 every item with a positive score is expanded (no count).
+# Scores only fall along a path (decay, weight, confidence are all <= 1). Hub
 # entities (more than `hub` items) carry no per-anchor links; hops 1 and 2 reach the
 # other holders of a frontier item's hub entities through the memory_item_entities
 # join, up to `hub_cap` per entity.
@@ -87,7 +86,6 @@ h1 AS (
 ),
 frontier AS (
     SELECT * FROM h1 WHERE score > 0 AND %(max_hops)s >= 2
-    ORDER BY score DESC, item LIMIT %(frontier)s
 ),
 e2 AS (""" + _EDGES.format(frm="frontier") + """
     UNION ALL
@@ -109,15 +107,14 @@ reached AS (
 top AS (
     SELECT r.*, m.document_id FROM reached r JOIN memory_items m ON m.id = r.item_id
     WHERE m.document_id <> r.origin_doc
-    ORDER BY r.score DESC, r.item_id LIMIT %(cap)s * 4
 )
 SELECT t.item_id, t.document_id, d.source, m.content, m.original_chunk, m.metadata,
        t.hops, t.score, t.via, t.link_types
 FROM top t
 JOIN memory_items m ON m.id = t.item_id
 JOIN documents d ON d.id = t.document_id
+WHERE t.score >= %(rel)s * (SELECT max(score) FROM top)
 ORDER BY t.score DESC, d.source, t.item_id
-LIMIT %(cap)s
 """
 
 
@@ -129,20 +126,22 @@ class GraphExpand:
     def __init__(self, **params):
         self.params = params
 
-    def seeds(self, state: RecallState, n: int) -> tuple[list[str], list[float]]:
-        """Best seed documents of the pool: RRF over every channel's list."""
+    def seeds(self, state: RecallState, rel: float) -> tuple[list[str], list[float]]:
+        """Seed documents of the pool: RRF over every channel's list; every
+        document at or above `rel` x the best is a seed (no count)."""
         acc: dict[str, float] = {}
         for c in state.pool:
             acc[c.document_id] = acc.get(c.document_id, 0.0) + 1.0 / (_RRF_K + c.rank)
-        top = sorted(acc.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
-        if not top:
+        ranked = sorted(acc.items(), key=lambda kv: (-kv[1], kv[0]))
+        if not ranked:
             return [], []
-        best = top[0][1]
+        best = ranked[0][1]
+        top = [kv for kv in ranked if kv[1] >= rel * best]
         return [d for d, _ in top], [s / best for _, s in top]
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         p = self.params
-        docs, ws = self.seeds(state, int(p.get("seeds", DEFAULT_SEEDS)))
+        docs, ws = self.seeds(state, float(p.get("seed_min_rel", DEFAULT_SEED_MIN_REL)))
         if not docs:
             return []
         tw = {**DEFAULT_TYPE_WEIGHTS, **(p.get("type_weights") or {})}
@@ -152,8 +151,7 @@ class GraphExpand:
                 "decay": float(p.get("decay", DEFAULT_DECAY)),
                 "tw": json.dumps(tw),
                 "max_hops": int(p.get("max_hops", MAX_HOPS)),
-                "cap": int(p.get("node_cap", DEFAULT_NODE_CAP)),
-                "frontier": int(p.get("frontier", DEFAULT_FRONTIER)),
+                "rel": float(p.get("node_min_rel", DEFAULT_NODE_MIN_REL)),
                 "hub": int(p.get("hub", ENTITY_HUB)),
                 "hub_cap": int(p.get("hub_cap", DEFAULT_HUB_CAP)),
             })

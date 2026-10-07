@@ -20,13 +20,13 @@ physical window, not a clip; **tuning** = a constant of an algorithm, not a cap;
 | Jev timeout | `JEV_TIMEOUT_S` | 10 s | latency bound on an optional stage; failure keeps the fused order | ours-config (constructor arg) |
 | Fallback chunk (`_matching_chunk`) | `_retain.py` | **removed clip** | the text is returned whole when a note has no chunk items | was ours |
 | Graph hop clamp (`MAX_HOPS` min) | `channels/graph.py` | **removed clamp**; default 2 | `max_hops` is a walk-depth param; default stays 2 | ours-config |
-| Graph node cap (`node_cap`) | `channels/graph.py` | 60 (param) | bounds the walk's work (Jev-Mem's value); best-first by score, so it drops only the weakest | ours-config (**still a count**: next change) |
+| Graph node cap (was `node_cap` 60) and hop-2 `frontier` (200) | `channels/graph.py` `node_min_rel` | **removed**; every reached neighbour with score >= 0.4 x the best reached | scores only fall along a path, so the walk expands every positive-score hop-1 item and keeps what clears the relative cut. A stored `node_cap`/`frontier`/`seeds` param is ignored | was ours |
 | Rerank pool (was `RERANK_POOL` 30) | `stages.py`, `recall_config.rerank.min_rel_score` | **removed**; fused score >= 0.4 x the best fused score | the pool is every fused note at or above the relative score (`POOL_MIN_REL`); the reranker sees all of it. Bounded only by the reader model's window (below) | was ours |
 | Hop follow-ups (was `max_follow_ups` 2) and new notes (was `max_new` 10) | `stages.py` `_hop` | **removed** | the reader gives one follow-up per distinct missing fact (cheap searches, no LLM); every new note at or above `reader.hop_min_rel_score` (0.4) x the best of its follow-up run joins and the joined set is reranked again | was ours |
 | Reader `top` 8 / `join_top` 15 | `stages.py` `_hop`, `reader.min_rel_score` | **removed**; rerank grade (0..3, else fused score) >= 0.6 x the best | the reader sees every qualifying note; the whole reranked set stays ahead of new candidates | was ours |
 | Channel candidate `limit` 50, fusion `POOL` 30 | `channels/semantic.py`, `bm25.py`, `meta.py`, `recall.py`, `fusion.py` | **removed**; per-channel `min_rel` (param): cosine 0.6 (dense, question), BM25 0.15, meta = whole filter set | a channel returns every candidate whose own score >= `min_rel` x its best (`fetch_until_cut`: fetches in pages of 64 (throughput) and doubles until the cut is reached). Fusion keeps every document; the pool cut is the stage's. A stored `limit`/`recall_config` count key is ignored | was ours |
-| Seeds | graph `seeds` | 10 | graph walk starting set (**still a count**: next change) | ours-config |
-| Linker caps | `_linker.py` `ENTITY_CAP` 10, `TEMPORAL_CLOSE_CAP` 5, `VECTOR_TOP` 5 | | bound links created per note at retain (not recall evidence) | ours-config (**still counts**: next change) |
+| Graph seeds (was `seeds` 10) | `channels/graph.py` `seed_min_rel` | **removed**; every pool document with RRF >= 0.5 x the best | the walk's starting set | was ours |
+| Linker caps (was `NEIGHBOURS` 10, `VECTOR_TOP` 5, `TEMPORAL_CLOSE_CAP` 5) | `_linker.py` `neighbour_min_rel` 0.6, `temporal_min_rel` 0.5 | **removed** | candidates per anchor: every pgvector neighbour with cosine >= 0.6 x the nearest (paged, HNSW-exhaustive fetch as the semantic channels); the model-free fallback also keeps the absolute `vector_floor` 0.75; TEMPORALLY_CLOSE: every note within `TEMPORAL_DAYS` (3) whose closeness 1/(1+days) >= 0.5 x the closest. Jev judges candidates in batches of its request limit (physical). Not counts: `ENTITY_HUB` 30 and graph `hub_cap` 200 (hub-entity definition and walk work bound, design) | was ours |
 | `top` / `limit` on `search` | `Memory.search(limit=10)` | 10 | the caller's request for how many results | caller's argument |
 | Grounded evidence notes (was `TOP_NOTES` 6) and chunks per note (was `CHUNKS_PER_NOTE` 3) | `_synth.py` | **removed** | notes and chunks are kept by score: `>= recall_config.evidence.min_rel_score` (0.5) x the best; an explicit `scope=` is the whole set; `evidence_top` is an optional per-call note count, `None` by default | was ours |
 | Synthesizer context window | `_synth.py` `DEFAULT_CONTEXT_TOKENS` | 200,000 tokens (`recall_config.evidence.context_tokens`) | physical model window (4 chars/token estimate, 4,000 tokens reserved for template/question/answer); only this can drop evidence, lowest-ranked first, with one full warning naming what was dropped | physical |
@@ -89,3 +89,13 @@ Printed by `tests/test_filters.py` (`pytest -s -k q096`):
 | boost, gold cosine 0.9 | 1.00 |
 | boost, weak-cosine non-gold members (gold 0.85, others 0.05) | 1.00 |
 | boost, all member cosines 0 (no boost on a zero score) | 0.00 |
+
+### Graph and linker thresholds (second PR)
+
+Config names and defaults, all relative to the best score (0 = no cut): graph channel params
+`seed_min_rel` 0.5, `node_min_rel` 0.4; Linker `neighbour_min_rel` 0.6, `temporal_min_rel` 0.5.
+Like the first PR's, these are unmeasured starting defaults chosen by the author (no links
+exist on the synthetic bank, so the synthetic eval is unchanged); tuning on the real question
+set is for the rung-caretaker scout on roger. Hub entities (`hub_cap` 200 holders) remain a
+work bound of the walk; at the default cut hub neighbours (0.5 x best) pass, so a graph walk
+over a bank with huge hubs can return many notes: raise `node_min_rel` per bank if so.
