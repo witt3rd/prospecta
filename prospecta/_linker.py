@@ -32,7 +32,6 @@ from typing import Any, Protocol
 
 import psycopg.errors
 
-from prospecta._scorecut import fetch_until_cut
 from prospecta._template import render_prompt
 from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
@@ -42,7 +41,13 @@ from prospecta.stages import (
 
 logger = logging.getLogger(__name__)
 
-NEIGHBOUR_MIN_REL = 0.6    # candidates per anchor: every neighbour with cosine >= 0.6 x the nearest (no count)
+NEIGHBOUR_MIN_REL = 0.9    # candidates per anchor: neighbours with cosine >= 0.9 x the nearest, ending at the first
+                           # marginal drop larger than (1 - 0.9) x the nearest (no count). Embedding cosines are
+                           # compressed (0.5..0.9), so 0.6 admitted nearly every note: the import was quadratic.
+JUDGE_RETRIES = 3          # attempts per judge call before the failure is surfaced (state error, pgvector fallback)
+JUDGE_BACKOFF_S = 0.5
+HNSW_EF_MAX = 1000         # pgvector's hnsw.ef_search ceiling: beyond it the fetch is exhaustive
+NEIGHBOUR_PAGE = 16        # rows per HNSW fetch (throughput; doubles until the stop rule is decided)
 JEV_THRESHOLD = 0.6        # Jev-Mem's relation probability threshold
 VECTOR_FLOOR = 0.75        # cosine floor of the model-free RELATED_TO fallback
 TEMPORAL_DAYS = 3
@@ -145,13 +150,13 @@ ON CONFLICT DO NOTHING
 
 _NEIGHBOUR_SQL = """
 SELECT n.id, n.document_id, n.content, n.original_chunk,
-       1 - (n.embedding <=> a.embedding) AS cos
+       1 - (n.embedding::vector({dim}) <=> a.embedding::vector({dim})) AS cos
 FROM memory_items a
 CROSS JOIN LATERAL (
     SELECT m.id, m.document_id, m.content, m.original_chunk, m.embedding
     FROM memory_items m
     WHERE m.bank_id = %(bank)s AND m.kind = '{kind}' AND m.document_id <> %(doc)s
-    ORDER BY m.embedding <=> a.embedding
+    ORDER BY m.embedding::vector({dim}) <=> a.embedding::vector({dim})   -- the index expression
     LIMIT %(n)s
 ) n
 WHERE a.id = %(item)s
@@ -486,30 +491,61 @@ class Linker:
                 conn.commit()
         return len(ids), last
 
+    def _judge_with_retry(self, source, texts, calls):
+        delay = JUDGE_BACKOFF_S
+        for attempt in range(1, JUDGE_RETRIES + 1):
+            try:
+                return self.judge.judge(source, texts, calls)
+            except Exception as exc:
+                if attempt == JUDGE_RETRIES:
+                    raise
+                logger.warning("linker judge: %s: %s, retry %d/%d", type(exc).__name__, exc,
+                               attempt, JUDGE_RETRIES - 1)
+                time.sleep(delay)
+                delay *= 2
+
     def _semantic(self, conn, bank_id, doc, anchors, stats, calls):
+        with conn.cursor() as cur:   # the HNSW indexes are on embedding::vector(dim)
+            cur.execute("SELECT vector_dims(embedding) FROM memory_items WHERE id = %s",
+                        (anchors[0]["id"],))
+            dim = int(cur.fetchone()[0])
         for a in anchors:
             kind = "chunk" if a["kind"] == "chunk" else "question"
 
-            def fetch(n, kind=kind, a=a):
+            def fetch(n, kind=kind, a=a, dim=dim):
                 from prospecta.channels.semantic import _scan_everything
-                with conn.transaction(), conn.cursor() as cur:
-                    _scan_everything(cur)   # a short page must mean the source is exhausted
-                    cur.execute(_NEIGHBOUR_SQL.format(kind=kind), {
-                        "bank": bank_id, "doc": doc, "n": n, "item": a["id"]})
-                    rows = [dict(zip([c.name for c in cur.description], r))
-                            for r in cur.fetchall()]
-                return sorted(rows, key=lambda c: -float(c["cos"]))
-            cands = fetch_until_cut(fetch, lambda c: float(c["cos"]), self.neighbour_min_rel)
+
+                def query(exhaustive):
+                    with conn.transaction(), conn.cursor() as cur:
+                        if exhaustive:
+                            _scan_everything(cur)   # a short page must mean the source is exhausted
+                        else:   # plain HNSW top-n: index cost, independent of the bank size
+                            cur.execute(f"SET LOCAL hnsw.ef_search = {max(2 * n, 40)}")
+                        cur.execute(_NEIGHBOUR_SQL.format(kind=kind, dim=dim), {
+                            "bank": bank_id, "doc": doc, "n": n, "item": a["id"]})
+                        return sorted((dict(zip([c.name for c in cur.description], r))
+                                       for r in cur.fetchall()), key=lambda c: -float(c["cos"]))
+                if n > HNSW_EF_MAX // 2:
+                    return query(True)
+                rows = query(False)
+                # a short page may be the index reach (ef_search) rather than the end of the
+                # source: confirm with the exhaustive scan before treating it as the end
+                return rows if len(rows) >= n else query(True)
+            cands, examined = neighbours_until_drop(
+                fetch, lambda c: float(c["cos"]), self.neighbour_min_rel)
+            stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
+            stats["candidates_judged"] = stats.get("candidates_judged", 0) + (
+                len(cands) if self.judge is not None else 0)
             if not cands:
                 continue
             hits: list[RelationHit] | None = None
             origin = "jev"
             if self.judge is not None:
                 try:
-                    hits = self.judge.judge(
+                    hits = self._judge_with_retry(
                         a["original_chunk"] or a["content"],
                         [c["original_chunk"] or c["content"] for c in cands], calls)
-                except Exception as exc:
+                except Exception as exc:   # surfaced: state error row, retried by link_pending
                     stats["errors"].append(f"jev: {type(exc).__name__}: {exc}")
             if hits is None:   # no judge, or Jev could not answer: pgvector neighbours
                 origin = "pgvector"
@@ -531,6 +567,34 @@ class Linker:
                         (bank_id, src, dst, h.link_type, h.subtype, h.confidence, origin,
                          json.dumps({"cosine": float(c["cos"])})))
                     stats["semantic"] += cur.rowcount
+
+
+def neighbours_until_drop(fetch, score, rel: float,
+                          page: int = NEIGHBOUR_PAGE) -> tuple[list, int]:
+    """Candidates from `fetch(n)` (best first, an HNSW top-n): the leading rows
+    with score >= rel x the best, ending at the first marginal drop larger than
+    (1 - rel) x the best. Grows n (doubling) only until that stop is decided, so
+    the rows touched per anchor do not grow with the bank. Returns
+    (qualifying rows, rows examined)."""
+    n = page
+    while True:
+        rows = fetch(n)
+        if not rows:
+            return [], 0
+        best = score(rows[0])
+        if rel <= 0 or best <= 0:
+            if len(rows) < n:
+                return rows, len(rows)
+        else:
+            cut, gap = rel * best, (1 - rel) * best
+            out = [rows[0]]
+            for prev, r in zip(rows, rows[1:]):
+                if score(r) < cut or score(prev) - score(r) > gap:
+                    return out, len(rows)
+                out.append(r)
+            if len(rows) < n:
+                return out, len(rows)
+        n *= 2
 
 
 def normalise(name: str) -> str:
