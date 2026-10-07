@@ -61,7 +61,7 @@ WITH cand AS (
   FROM cand c WHERE c.precise OR c.scanned
 )
 SELECT id::text, source, original_text FROM scored
-WHERE precise OR score >= %(rel)s * (SELECT coalesce(max(score), 0) FROM scored)
+WHERE precise OR score >= %(rel)s * (SELECT coalesce(max(score), 0) FROM scored WHERE NOT precise AND scanned)
 ORDER BY source, id
 """
 
