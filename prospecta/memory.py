@@ -749,6 +749,7 @@ class Memory:
         aliases: "list[str] | None" = None,
         metadata_filter: dict | None = None,
         batch_size: int | None = None,
+        scan_relevance: float | None = None,
         on_progress=None,
         depth: "Literal['standard','deep'] | None" = None,
     ) -> RAGResult:
@@ -761,6 +762,9 @@ class Memory:
         found are recorded per batch in recall_events.plan (mode 'mapreduce').
         Map-reduce reads the whole entity set (no rerank pool), so `depth`
         defaults to 'deep' and is recorded in recall_events.depth.
+        Notes tied by person/entity/alias rows are always read; notes reached
+        only by scanning alias text must rank >= `scan_relevance` x the best
+        scan hit (default _mapreduce.DEFAULT_SCAN_RELEVANCE).
         """
         from prospecta._scorecut import check_depth
         depth = check_depth(depth) or "deep"
@@ -781,6 +785,8 @@ class Memory:
                 conn, bank_id, message, llm, entity=entity, aliases=aliases,
                 metadata_filter=metadata_filter,
                 batch_size=_mapreduce.DEFAULT_BATCH_SIZE if batch_size is None else batch_size,
+                scan_relevance=(_mapreduce.DEFAULT_SCAN_RELEVANCE
+                                if scan_relevance is None else scan_relevance),
                 on_progress=on_progress)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
 

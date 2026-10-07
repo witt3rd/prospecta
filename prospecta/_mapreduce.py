@@ -22,6 +22,10 @@ from prospecta.db.queries import _meta_param
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 8
+# The alias TEXT scan is a recall net: a note found only by scanning its text
+# is kept when its text-rank is at least this fraction of the best scan hit's.
+# Entity-linked / alias-resolved / documents.person notes are always kept.
+DEFAULT_SCAN_RELEVANCE = 0.25
 MAP_ATTEMPTS = 2   # a failed batch is retried once, then surfaced
 DEFAULT_EXCERPT_CHARS = 6000   # a note longer than this is sent as its entity-mention paragraphs
 
@@ -39,22 +43,26 @@ WHERE a.bank_id = %(bank)s AND a.entity_id = ANY(%(ids)s)
 """
 
 _NOTES_SQL = """
-SELECT d.id::text, d.source, d.original_text
-FROM documents d
-WHERE d.bank_id = %(bank)s
-  AND (
-        lower(btrim(d.person)) = ANY(%(names)s)
-     OR d.id IN (
-            SELECT m.document_id
-            FROM memory_item_entities ie
-            JOIN memory_items m ON m.id = ie.item_id
-            WHERE ie.entity_id = ANY(%(ids)s))
-     OR (%(rx)s <> '' AND d.original_text ~* %(rx)s)
-  )
-  AND (%(meta)s::jsonb IS NULL OR EXISTS (
+WITH cand AS (
+  SELECT d.id, d.source, d.original_text,
+         (   coalesce(lower(btrim(d.person)) = ANY(%(names)s), false)
+          OR d.id IN (SELECT m.document_id FROM memory_item_entities ie
+                      JOIN memory_items m ON m.id = ie.item_id
+                      WHERE ie.entity_id = ANY(%(ids)s))) AS precise,
+         (%(rx)s <> '' AND d.original_text ~* %(rx)s) AS scanned
+  FROM documents d
+  WHERE d.bank_id = %(bank)s
+    AND (%(meta)s::jsonb IS NULL OR EXISTS (
             SELECT 1 FROM memory_items mi
             WHERE mi.document_id = d.id AND mi.metadata @> %(meta)s::jsonb))
-ORDER BY d.source, d.id
+), scored AS (
+  SELECT c.*, CASE WHEN c.scanned THEN
+              ts_rank(to_tsvector('simple', c.original_text), nullif(%(tsq)s, '')::tsquery, 1) ELSE 0 END AS score
+  FROM cand c WHERE c.precise OR c.scanned
+)
+SELECT id::text, source, original_text FROM scored
+WHERE precise OR score >= %(rel)s * (SELECT coalesce(max(score), 0) FROM scored WHERE NOT precise AND scanned)
+ORDER BY source, id
 """
 
 MIN_SCAN_CHARS = 3   # an alias shorter than this is too ambiguous to scan note text for
@@ -110,7 +118,8 @@ def resolve_names(conn, bank_id: str, names: list[str]) -> tuple[list[str], list
 
 def fetch_entity_notes(conn, bank_id: str, names: list[str],
                        metadata_filter: dict | None = None,
-                       scan_names: list[str] | None = None) -> list[tuple[str, str, str]]:
+                       scan_names: list[str] | None = None,
+                       scan_relevance: float = DEFAULT_SCAN_RELEVANCE) -> list[tuple[str, str, str]]:
     """(document_id, source, text) of every note tied to the entity: its
     documents.person, any item mentioning the entity (found by name or by any
     alias row), or whose text contains a name in `scan_names` (alias strings:
@@ -121,8 +130,11 @@ def fetch_entity_notes(conn, bank_id: str, names: list[str],
     scan = sorted({n.strip() for n in (scan_names if scan_names is not None else names)
                    if len(n.strip()) >= MIN_SCAN_CHARS}, key=str.casefold)
     rx = r"\m(?:" + "|".join(re.escape(n) for n in scan) + r")\M" if scan else ""
+    tsq = " | ".join(f"({' <-> '.join(w for w in re.findall(r'\w+', n.casefold()))})"
+                     for n in scan if re.findall(r"\w+", n)) or ""
     with conn.cursor() as cur:
         cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx,
+                                 "tsq": tsq, "rel": scan_relevance,
                                  "meta": _meta_param(metadata_filter)})
         return [(r[0], r[1] or r[0], r[2]) for r in cur.fetchall()]
 
@@ -187,12 +199,14 @@ def run_mapreduce(conn, bank_id: str, question: str, llm, *, entity: str,
                   aliases: list[str] | None = None, metadata_filter: dict | None = None,
                   batch_size: int = DEFAULT_BATCH_SIZE,
                   excerpt_chars: int = DEFAULT_EXCERPT_CHARS,
+                  scan_relevance: float = DEFAULT_SCAN_RELEVANCE,
                   on_progress=None) -> MapReduceResult:
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     names, _, _ = resolve_names(conn, bank_id, [entity, *(aliases or [])])
     scan = [n for n in names if _clean(n) != _clean(entity)]   # alias strings, not the bare name
-    notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan)
+    notes = fetch_entity_notes(conn, bank_id, names, metadata_filter, scan_names=scan,
+                               scan_relevance=scan_relevance)
     by_norm = {_norm_name(src): (doc, src) for doc, src, _ in notes}
     base_count: dict[str, int] = {}
     for _, src, _ in notes:
