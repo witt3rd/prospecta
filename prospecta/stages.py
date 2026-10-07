@@ -192,18 +192,27 @@ def totals(calls: list[dict]) -> dict:
 
 
 def parse_json_object(text: str) -> dict:
-    t = text.strip()
-    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
+    """The FIRST valid JSON object in a reply; tolerates prose, code fences
+    and repeated copies of the object before and after it."""
+    dec = json.JSONDecoder()
+    pos, saw_other = 0, False
+    while (i := text.find("{", pos)) >= 0:
+        try:
+            v, _ = dec.raw_decode(text, i)
+        except ValueError:
+            pos = i + 1
+            continue
+        if isinstance(v, dict):
+            return v
+        saw_other = True
+        pos = i + 1
     try:
-        v = json.loads(t)
+        v = json.loads(text.strip())
     except ValueError:
-        i, j = t.find("{"), t.rfind("}")
-        if i < 0 or j <= i:
-            raise ValueError("reply holds no JSON object")
-        v = json.loads(t[i:j + 1])
-    if not isinstance(v, dict):
+        v = None
+    if v is not None or saw_other:
         raise ValueError("reply JSON is not an object")
-    return v
+    raise ValueError("reply holds no JSON object")
 
 
 # ------------------------------------------------------------------- reranking
