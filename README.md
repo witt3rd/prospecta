@@ -108,8 +108,9 @@ for query, chunks in result.queries_to_results.items():
 
 For SET / discovery questions ("what are Greg's nicknames?") top-k retrieval
 cannot be complete. `recall_mapreduce` reads every note tied to the entity
-(`documents.person`, the entity table by name or `aliases`, `metadata_filter`)
-in batches, extracts the asked facts with a citation each, and merges them into
+(`documents.person`, the entity table by name or `aliases`, `metadata_filter`),
+plus alias-text matches that score at least `scan_relevance` x the best
+text hit (a recall net, not a full scan), in batches, extracts the asked facts with a citation each, and merges them into
 one deduplicated cited list. Progress, cost, notes visited and facts found are
 recorded in `recall_events.plan` (mode `mapreduce`).
 
