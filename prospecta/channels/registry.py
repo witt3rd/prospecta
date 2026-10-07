@@ -23,23 +23,20 @@ REGISTRY: dict[str, type] = {
 # its weight is configurable per bank and is to be measured on real questions.
 # On a bank whose items have no links yet it returns nothing.
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
-    {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {"limit": 50}},
-    {"name": "question", "enabled": True, "weight": 1, "params": {"limit": 50}},
+    {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},
+    {"name": "question", "enabled": True, "weight": 1, "params": {}},
     {"name": "graph", "enabled": True, "weight": 1,
-     "params": {"limit": 50, "seeds": 10, "max_hops": 2, "decay": 0.5, "node_cap": 60,
+     "params": {"seeds": 10, "max_hops": 2, "decay": 0.5, "node_cap": 60,
                 "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
                                  "TEMPORAL": 0.5, "ENTITY": 0.5}}},
-    {"name": "meta", "enabled": True, "weight": 3, "params": {"limit": 50}},
+    {"name": "meta", "enabled": True, "weight": 3, "params": {}},
 ]
-
-DEFAULT_LIMIT = 50
 
 
 @dataclass(frozen=True)
 class ConfiguredChannel:
     channel: object
     weight: float
-    limit: int
     params: dict = field(default_factory=dict)
 
     @property
@@ -77,7 +74,7 @@ def build_channels(config: list[dict]) -> list[ConfiguredChannel]:
         params = dict(e.get("params") or {})
         out.append(ConfiguredChannel(
             channel=_make(REGISTRY[e["name"]], params), weight=float(e.get("weight", 1)),
-            limit=int(params.get("limit", DEFAULT_LIMIT)), params=params,
+            params=params,
         ))
     order = {"recall": 0, "filter": 1, "expand": 2}
     out.sort(key=lambda c: order[c.channel.kind])  # type: ignore[attr-defined]  # stable

@@ -20,13 +20,13 @@ physical window, not a clip; **tuning** = a constant of an algorithm, not a cap;
 | Jev timeout | `JEV_TIMEOUT_S` | 10 s | latency bound on an optional stage; failure keeps the fused order | ours-config (constructor arg) |
 | Fallback chunk (`_matching_chunk`) | `_retain.py` | **removed clip** | the text is returned whole when a note has no chunk items | was ours |
 | Graph hop clamp (`MAX_HOPS` min) | `channels/graph.py` | **removed clamp**; default 2 | `max_hops` is a walk-depth param; default stays 2 | ours-config |
-| Graph node cap (`node_cap`) | `channels/graph.py` | 60 (param) | bounds the walk's work (Jev-Mem's value); best-first by score, so it drops only the weakest | ours-config |
-| Rerank pool | `stages.py` `RERANK_POOL`, `recall_config.rerank.pool` | 30 | LLM cost/latency; the pool is the fused top by score; raise or set per bank | ours-config |
-| Reader hops | `recall_config.reader` `max_follow_ups`, `max_new` | 2, 10 | bound LLM calls and pool growth; candidates join best-rank first; per bank | ours-config |
-| Reader `top` / `join_top` | `recall_config.reader` | 8 / 15 | how many ranked notes the reader sees / are kept ahead of new candidates | ours-config |
-| Channel candidate `limit`, `POOL` | `channels/recall.py`, registry params | 50 per channel, pool 30 | candidates per channel before fusion; `pool = max(POOL, limit)`; per-channel param | ours-config |
-| Seeds | graph `seeds` | 10 | graph walk starting set | ours-config |
-| Linker caps | `_linker.py` `ENTITY_CAP` 10, `TEMPORAL_CLOSE_CAP` 5, `VECTOR_TOP` 5 | | bound links created per note at retain (not recall evidence) | ours-config |
+| Graph node cap (`node_cap`) | `channels/graph.py` | 60 (param) | bounds the walk's work (Jev-Mem's value); best-first by score, so it drops only the weakest | ours-config (**still a count**: next change) |
+| Rerank pool (was `RERANK_POOL` 30) | `stages.py`, `recall_config.rerank.min_rel_score` | **removed**; fused score >= 0.4 x the best fused score | the pool is every fused note at or above the relative score (`POOL_MIN_REL`); the reranker sees all of it. Bounded only by the reader model's window (below) | was ours |
+| Hop follow-ups (was `max_follow_ups` 2) and new notes (was `max_new` 10) | `stages.py` `_hop` | **removed** | the reader gives one follow-up per distinct missing fact (cheap searches, no LLM); every new note at or above `reader.hop_min_rel_score` (0.4) x the best of its follow-up run joins and the joined set is reranked again | was ours |
+| Reader `top` 8 / `join_top` 15 | `stages.py` `_hop`, `reader.min_rel_score` | **removed**; rerank grade (0..3, else fused score) >= 0.6 x the best | the reader sees every qualifying note; the whole reranked set stays ahead of new candidates | was ours |
+| Channel candidate `limit` 50, fusion `POOL` 30 | `channels/semantic.py`, `bm25.py`, `meta.py`, `recall.py`, `fusion.py` | **removed**; per-channel `min_rel` (param): cosine 0.6 (dense, question), BM25 0.15, meta = whole filter set | a channel returns every candidate whose own score >= `min_rel` x its best (`fetch_until_cut`: fetches in pages of 64 (throughput) and doubles until the cut is reached). Fusion keeps every document; the pool cut is the stage's. A stored `limit`/`recall_config` count key is ignored | was ours |
+| Seeds | graph `seeds` | 10 | graph walk starting set (**still a count**: next change) | ours-config |
+| Linker caps | `_linker.py` `ENTITY_CAP` 10, `TEMPORAL_CLOSE_CAP` 5, `VECTOR_TOP` 5 | | bound links created per note at retain (not recall evidence) | ours-config (**still counts**: next change) |
 | `top` / `limit` on `search` | `Memory.search(limit=10)` | 10 | the caller's request for how many results | caller's argument |
 | Grounded evidence notes (was `TOP_NOTES` 6) and chunks per note (was `CHUNKS_PER_NOTE` 3) | `_synth.py` | **removed** | notes and chunks are kept by score: `>= recall_config.evidence.min_rel_score` (0.5) x the best; an explicit `scope=` is the whole set; `evidence_top` is an optional per-call note count, `None` by default | was ours |
 | Synthesizer context window | `_synth.py` `DEFAULT_CONTEXT_TOKENS` | 200,000 tokens (`recall_config.evidence.context_tokens`) | physical model window (4 chars/token estimate, 4,000 tokens reserved for template/question/answer); only this can drop evidence, lowest-ranked first, with one full warning naming what was dropped | physical |
@@ -39,6 +39,28 @@ physical window, not a clip; **tuning** = a constant of an algorithm, not a cap;
 | Gate threshold | `recall_config.gate.threshold` | 2.95 | score cut on Jev's 0..3 scale; a decision, not a clip | tuning |
 | `content_preview` | `memory.py` `PREVIEW_LEN` | 200 chars | inspection-only audit column in `recall_events`; full content stays in `memory_items` | display only |
 | Regex/filter date parse `[:10]` | `_filters.py` | 10 chars | an ISO date is 10 characters | format |
+
+## Score-based pools (what a stage sees)
+
+Rule: a stage sees everything at or above a score relative to the best; only the reading
+model's physical window can split it. Window: Claude Sonnet 5.5, 200,000 tokens
+(`SONNET_CONTEXT_TOKENS`, 4 chars/token estimate, 4,000 reserved). A qualifying set that
+exceeds it is split into consecutive batches and map-reduced, never truncated:
+
+- **Rerank**: each batch is graded by its own listwise call; grades merge into one order
+  (grade first, then the fused order). One batch (the usual case) is the unchanged call.
+- **Reader**: each batch is read; sufficient only if every batch is, follow-ups are the union.
+- **Failure**: a failed batch is retried once (`BATCH_ATTEMPTS`), then the stage fails loudly
+  with a full untruncated warning (query and every note id) and the fused order stands: nothing is dropped.
+- Defaults (`_scorecut.py`): pool 0.4, reader 0.6, hop 0.4, channels as above. Chosen from the
+  design's RRF arithmetic (single-channel rank 30 ~0.6 of a top note) and tuned only on synthetic
+  data: still to be tuned on the real 120 questions + the Greg question against a real bank.
+  `min_rel 0` means no cut.
+- `prospecta eval` no longer slices to 30 (`pool=None` scores the whole selected pool).
+
+Synthetic before/after (`/tmp/e11eval.py`: 320 notes, 8 set questions, stub embedder, no LLM):
+hit@1 .875, hit@10 1.0, MRR .9375, cover@10 .906 both before and after; candidates per
+question from the question channel 50 -> about 10. Cost (LLM) not measurable offline.
 
 No `max_tokens` is passed to any LLM call. Not audited here: CLI/TUI display widths.
 

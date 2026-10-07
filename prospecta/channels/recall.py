@@ -7,7 +7,6 @@ from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc, fuse
 from prospecta.channels.registry import build_channels
 
-POOL = 30
 RRF_K = 60
 
 SELECT_CHANNEL_CONFIG = "SELECT channel_config FROM banks WHERE bank_id = %s"
@@ -22,7 +21,7 @@ def read_channel_config(conn, bank_id: str) -> list[dict]:
 
 def run_channels(
     state: RecallState, plan: QueryPlan, config: list[dict],
-    *, k: int = RRF_K, pool: int = POOL,
+    *, k: int = RRF_K, pool: int | None = None,
 ) -> tuple[list[FusedDoc], dict]:
     """Returns (fused pool, trace). The trace holds the plan, one entry per
     channel (name, kind, weight, n, latency_ms, cost_usd, error), the fusion
@@ -37,7 +36,7 @@ def run_channels(
         cands: list[Candidate] = []
         state.pool = [c for lst in lists.values() for c in lst]
         try:
-            cands = cc.channel.retrieve(plan, state, cc.limit)
+            cands = cc.channel.retrieve(plan, state)
         except Exception as exc:  # one channel never sinks the recall
             error = f"{type(exc).__name__}: {exc}"
             state.conn.rollback()

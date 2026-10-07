@@ -23,7 +23,6 @@ from prospecta.channels import (
     QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
     run_channels, scope_members,
 )
-from prospecta.channels.recall import POOL
 from prospecta._ignore import should_ignore
 from prospecta._filters import filter_fields
 from prospecta._parser import parse_frontmatter
@@ -638,7 +637,7 @@ def _search_channels(
             metadata_filter=metadata_filter,
         )
         fused, tr = run_channels(
-            state, plan, config, k=rrf_k, pool=max(POOL, limit),
+            state, plan, config, k=rrf_k,
         )
         if recall_cfg is None:
             recall_cfg = read_recall_config(conn, bank_id)

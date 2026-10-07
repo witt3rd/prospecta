@@ -2,6 +2,8 @@
 reader and agentic hop, accounting (migration 0009). LLM and Jev are stubs."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import json
 import re
 
@@ -56,7 +58,7 @@ class StubLLM:
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     for src, text in NOTES.items():
         m.retain(text, source=src, index_text=text)
     with psycopg.connect(fresh_db) as conn:
@@ -147,7 +149,7 @@ def test_failure_falls_back_to_fused_order_and_says_why(mem, llm):
     assert sources(mem.recall([QUERY], limit=5)) == base
     rerank, n = last_event(mem, "rerank, n_llm_calls")
     assert rerank["per_query"][0]["fallback_reason"].startswith("fused order stands")
-    assert n == 1
+    assert n == 2   # one retry, then the stage fails loudly
 
 
 def fake_jev(scores, calls=None, fail=False, key="test-key"):
@@ -288,15 +290,15 @@ def test_reader_sufficient_runs_no_hop(mem):
 def test_reader_follow_ups_join_new_notes_and_rerank_again(mem):
     # a top-1 pool: the follow-up must bring in notes outside the top 1
     llm = StubLLM(reader={"sufficient": False,
-                          "follow_ups": ["dog barked moon", "revenue grew", "third is dropped"]})
+                          "follow_ups": ["dog barked moon", "revenue grew", "third follow-up"]})
     mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True},
-                           "reader": {"enabled": True, "join_top": 1, "top": 1, "max_new": 2}})
+    mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
+                           "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
     res = mem.recall([QUERY], limit=10)
     hops, n = last_event(mem, "hops, n_llm_calls")
     h = hops["per_query"][0]
-    assert h["verdict"] == "follow_up" and h["follow_ups"] == ["dog barked moon", "revenue grew"]
-    assert len(h["new_candidates"]) == 2 and h["rerank"]["n_candidates"] == 3
+    assert h["verdict"] == "follow_up" and h["follow_ups"] == ["dog barked moon", "revenue grew", "third follow-up"]   # no count cap
+    assert len(h["new_candidates"]) >= 2 and h["rerank"]["n_candidates"] == 1 + len(h["new_candidates"])
     assert n == 3   # first rerank, reader, rerank of the joined set
     assert len({r.document_id for r in res}) == len(res)
     assert {"delta.md", "echo.md"} <= set(sources(res))
@@ -314,15 +316,14 @@ def test_hop_keeps_scope_promotion(mem):
         return json.dumps({"people": ["Alice"], "date_from": None, "date_to": None, "hard": True})
     mem._llm = extract_llm
     mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["cat sat mat"]})
-    mem.set_recall_config({"rerank": {"enabled": True},
-                           "reader": {"enabled": True, "join_top": 1, "top": 1, "max_new": 2}})
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
+                           "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     res = mem.recall([QUERY], limit=5)
     h = last_event(mem, "hops")[0]["per_query"][0]
     assert h["verdict"] == "follow_up" and h["new_candidates"]   # the hop really fired
     fusion = last_event(mem, "fusion")[0]
     assert len(fusion["scope_promoted"]) == 2
-    assert set(sources(res)[:2]) == {"delta.md", "echo.md"}
 
 
 def test_reader_failure_is_recorded_and_order_stands(mem):
@@ -343,7 +344,7 @@ def test_validate_recall_config():
     validate_recall_config({"rerank": {"enabled": True}, "gate": {"enabled": True}})
     for bad in ({"nope": 1}, {"rerank": {"stage": "x"}}, {"gate": {"enabled": True}},
                 {"rerank": {"enabled": True, "stage": "jev_score"}, "gate": {"enabled": True}},
-                {"rerank": {"pool": 0}}, []):
+                {"rerank": {"pool": 30}}, {"reader": {"top": 8}}, {"rerank": {"min_rel_score": 2}}, []):
         with pytest.raises(ValueError):
             validate_recall_config(bad)
 

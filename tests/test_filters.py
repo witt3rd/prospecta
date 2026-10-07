@@ -2,6 +2,8 @@
 regex fallback), the MetadataScope channel and scope promotion."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import datetime as dt
 import json
 
@@ -243,7 +245,7 @@ def _sources(res):
 
 
 def test_meta_channel_ranks_filter_set_and_soft_filter_adds_no_promotion(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem._llm = llm_returning({"people": ["Alice"], "date_from": None, "date_to": None, "hard": False})
     traces: list = []
     res = mem.search("walk the dog", limit=10, _trace=traces)
@@ -257,7 +259,7 @@ def test_meta_channel_ranks_filter_set_and_soft_filter_adds_no_promotion(mem):
 
 
 def test_hard_scope_promotes_set_members(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem._llm = llm_returning({"people": ["Alice"], "date_from": "2024-03-01",
                               "date_to": "2024-04-30", "hard": True})
     traces: list = []
@@ -267,7 +269,7 @@ def test_hard_scope_promotes_set_members(mem):
 
 
 def test_date_filter_and_empty_scope_never_excludes(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem._llm = llm_returning({"people": [], "date_from": "2024-03-10",
                               "date_to": "2024-03-31", "hard": True})
     res = mem.search("walk the dog", limit=10)
@@ -279,7 +281,7 @@ def test_date_filter_and_empty_scope_never_excludes(mem):
 
 
 def test_no_llm_failure_means_regex_and_recall_still_works(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem._llm = llm_returning("garbage")
     res = mem.search("what did Bob Stone do", limit=10)
     assert len(res) == 4
@@ -297,7 +299,7 @@ def _recording_llm(seen):
 def test_default_extract_model_reaches_llm(mem):
     from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
     seen: list = []
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem._llm = _recording_llm(seen)
     mem.search("walk the dog", limit=5)
     assert seen == [DEFAULT_EXTRACT_MODEL] == ["anthropic/claude-sonnet-5.5"]
@@ -305,7 +307,7 @@ def test_default_extract_model_reaches_llm(mem):
 
 def test_extract_model_param_override_reaches_llm(mem):
     seen: list = []
-    cfg = [dict(e) for e in DEFAULT_CHANNEL_CONFIG]
+    cfg = [dict(e) for e in no_cut(DEFAULT_CHANNEL_CONFIG)]
     for e in cfg:
         if e["name"] == "meta":
             e["params"] = {**e["params"], "extract_model": "x/small"}

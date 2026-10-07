@@ -3,6 +3,8 @@ the Linker (typed links, temporal links in SQL, entities), GraphExpand and the
 JevReader. LLM and Jev are stubs; nothing leaves the process."""
 from __future__ import annotations
 
+from prospecta._test_helpers import no_cut
+
 import json
 import re
 
@@ -174,7 +176,7 @@ def test_graph_default_config_enabled_and_configurable():
 
 
 def test_graph_channel_joins_the_default_blend(mem):
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem.retain("cats purr softly", source="seed", index_text="cats purr softly")
     mem.retain("quantum widgets fail", source="far", index_text="quantum widgets fail")
     ids = docs(mem)
@@ -194,7 +196,7 @@ def test_graph_channel_joins_the_default_blend(mem):
     assert ch["graph"]["kind"] == "expand" and ch["graph"]["n"] >= 1 and not ch["graph"]["error"]
     # weight 0: the channel still runs but adds nothing to the fused score
     mem.set_channel_config([c if c["name"] != "graph" else {**c, "weight": 0}
-                            for c in DEFAULT_CHANNEL_CONFIG])
+                            for c in no_cut(DEFAULT_CHANNEL_CONFIG)])
     off = {r.source: r.score for r in mem.search("cats purr softly", limit=10)}
     assert off["far"] < by_src["far"].score
 
@@ -393,11 +395,11 @@ def test_reader_type_config_and_hop_with_jev(mem):
     with pytest.raises(ValueError):
         validate_recall_config({"reader": {"enabled": True, "type": "nope"}})
     validate_recall_config({"reader": {"enabled": True, "type": "jev"}})
-    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG)
+    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem.retain("cats purr softly", source="n1", index_text="cats purr softly")
     mem.retain("bridge fact about whiskers", source="n2", index_text="bridge fact about whiskers")
     mem.set_recall_config({"rerank": {"enabled": False},
-                           "reader": {"enabled": True, "type": "jev", "top": 2}})
+                           "reader": {"enabled": True, "type": "jev", "min_rel_score": 0}})
     mem._jev = JevScore(stop_stub(1, cont=3))
     traces: list = []
     mem.search("cats purr softly", limit=5, _trace=traces)

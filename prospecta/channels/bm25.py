@@ -31,6 +31,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Protocol
 
+from prospecta._scorecut import CHANNEL_MIN_REL, fetch_until_cut
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.db.queries import _meta_param
 
@@ -267,11 +268,19 @@ WHERE m.bank_id = %(bank_id)s AND m.kind = 'chunk' AND m.id = ANY(%(ids)s::uuid[
 class Bm25Chunks:
     name = "bm25"
     kind = "recall"
+    takes_params = True
     backend: Bm25Backend = _DEFAULT_BACKEND
 
-    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int) -> list[Candidate]:
-        hits = self.backend.search(state.conn, state.bank_id, plan.text,
-                                   int(limit) * _ITEM_OVERFETCH * (4 if state.metadata_filter else 1))
+    def __init__(self, min_rel: float | None = None, **_legacy):
+        """`min_rel`: keep every chunk whose BM25 score >= min_rel x the best
+        (no count). Legacy `limit` in a stored config is ignored."""
+        self.min_rel = CHANNEL_MIN_REL["bm25"] if min_rel is None else float(min_rel)
+
+    def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
+        mult = 4 if state.metadata_filter else 1
+        hits = fetch_until_cut(
+            lambda n: self.backend.search(state.conn, state.bank_id, plan.text, n * mult),
+            lambda h: float(h[1]), self.min_rel)
         if not hits:
             return []
         with state.conn.cursor() as cur:
@@ -296,6 +305,4 @@ class Bm25Chunks:
                 detail={"bm25": float(score), "content": r["content"],
                         "metadata": r.get("metadata") or {}},
             ))
-            if len(out) >= limit:
-                break
         return out
