@@ -41,7 +41,6 @@ STAGES = [("hop 1 edges", "e1"), ("hub join (hop 1)", "a_hubs"), ("hop 1 merge",
 
 def stage_times(c, g, state, docs_ws) -> dict[str, float]:
     """Cumulative seconds per target for one query, plus seed selection."""
-    p = g.params
     docs, ws = docs_ws
     tw = {**graph_mod.DEFAULT_TYPE_WEIGHTS}
     args = {"docs": docs, "ws": ws, "bank": state.bank_id, "decay": graph_mod.DEFAULT_DECAY,
@@ -73,7 +72,7 @@ def report_stages(rows: list[dict[str, float]]) -> None:
         print(f"  {label:<22} {mean:7.3f}  {inc_s[int(0.9 * (len(inc_s) - 1))]:7.3f}")
         if mean > worst[1]:
             worst = (label, mean)
-        prev = label
+        prev = None if label == "seed selection (python)" else label
     print(f"slowest stage: {worst[0]} ({worst[1]:.3f}s mean)")
 
 
@@ -166,9 +165,7 @@ def main() -> None:
                     t0 = time.perf_counter()
                     sd = g.seeds(st, graph_mod.DEFAULT_SEED_MIN_REL)
                     seed_s = time.perf_counter() - t0
-                    r = stage_times(c, g, st, sd)
-                    r["seed selection (python)"] = seed_s
-                    stage_rows.append({"seed selection (python)": seed_s, **{k: v for k, v in r.items() if k != "seed selection (python)"}})
+                    stage_rows.append({"seed selection (python)": seed_s, **stage_times(c, g, st, sd)})
                 t0 = time.perf_counter()
                 out = g.retrieve(QueryPlan(text="q"), st, 50)
                 times.append(time.perf_counter() - t0)
