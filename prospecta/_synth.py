@@ -71,8 +71,8 @@ def pick_chunks(rows: list[tuple[str, int | None, float]], best_text: str,
 
 
 def _chunk_rows(conn, bank_id: str, document_id: str,
-                qvec: str) -> list[tuple[str, int | None, float]]:
-    with conn.cursor() as cur:
+                qvec: str | None) -> list[tuple[str, int | None, float]]:
+    with conn.cursor() as cur:   # no query vector: chunks score 0, only the recalled best chunk is kept
         cur.execute(_CHUNKS_SQL, (qvec, bank_id, document_id))
         return [(t, int(i) if i is not None else None, float(sc))
                 for t, i, sc in cur.fetchall()]
@@ -86,7 +86,7 @@ def resolve_scope(conn, bank_id: str, scope: list[str]) -> list[tuple[str, str]]
 
 
 def gather_evidence(conn, bank_id: str, recalled: list, *, top: int | None = None,
-                    qvec: str, scope: list[str] | None = None,
+                    qvec: str | None = None, scope: list[str] | None = None,
                     min_rel_score: float = DEFAULT_MIN_REL_SCORE,
                     context_tokens: int = DEFAULT_CONTEXT_TOKENS,
                     ) -> tuple[list[NoteEvidence], bool]:
@@ -107,11 +107,21 @@ def gather_evidence(conn, bank_id: str, recalled: list, *, top: int | None = Non
             set_mode = True
             order = sorted(members, key=lambda m: (-(by_doc[m[0]].score if m[0] in by_doc else 0.0), m[1]))
     if not order:
-        best = max((r.score for r in by_doc.values()), default=0.0)
-        order = [(d, r.source) for d, r in by_doc.items()
-                 if best <= 0 or r.score >= min_rel_score * best]
-        if top is not None:
-            order = order[:top]
+        seen: set[str] = set()
+        cutoff = None
+        if top is None and recalled:
+            lead = recalled[0].score
+            cutoff = min_rel_score * lead if lead > 0 else lead
+        for r in recalled:
+            d = str(r.document_id)
+            if d in seen:
+                continue
+            if cutoff is not None and r.score < cutoff:
+                break
+            seen.add(d)
+            order.append((d, r.source))
+            if top is not None and len(order) >= top:
+                break
     picked = []
     for doc_id, source in order:
         r = by_doc.get(doc_id)
