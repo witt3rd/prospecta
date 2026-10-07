@@ -371,13 +371,39 @@ class Linker:
     def link_document(self, conn, bank_id: str, document_id: str,
                       calls: list[dict] | None = None) -> dict:
         """Link one document; commits. Returns stats. Errors in a step are
-        recorded in the state row and never raise."""
+        recorded in the state row and never raise. A session advisory lock on
+        the document id serialises concurrent linkers of the same document."""
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                        (f"link:{document_id}",))
+        try:
+            return self._link_locked(conn, bank_id, document_id, calls)
+        finally:
+            try:
+                conn.rollback()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                                (f"link:{document_id}",))
+                conn.commit()
+            except psycopg.Error:   # closed connection: Postgres drops the lock itself
+                logger.warning("linker could not release the lock of %s", document_id)
+
+    def _link_locked(self, conn, bank_id, document_id, calls) -> dict:
         calls = calls if calls is not None else []
         stats: dict = {"temporal": 0, "entities": 0, "entity_links": 0,
                        "semantic": 0, "errors": []}
         with conn.cursor() as cur:
             cur.execute(_ANCHORS, {"doc": document_id})
             anchors = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
+        if not anchors:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM documents WHERE id = %s", (document_id,))
+                gone = cur.fetchone() is None
+            conn.commit()
+            if gone:   # deleted or replaced meanwhile: nothing to link, no state row to write
+                logger.warning("linker: document %s no longer exists, skipped", document_id)
+                stats["skipped"] = "document gone"
+                return stats
         if anchors:
             for name, step in (("temporal", self._temporal), ("entities", self._entities),
                                ("semantic", self._semantic)):
@@ -423,7 +449,8 @@ class Linker:
         for attempt in range(1, DEADLOCK_RETRIES + 1):
             try:
                 return fn()
-            except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure) as exc:
+            except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure,
+                    psycopg.errors.ForeignKeyViolation) as exc:   # FK: a target deleted concurrently; the retry re-reads
                 conn.rollback()
                 if attempt == DEADLOCK_RETRIES:
                     raise

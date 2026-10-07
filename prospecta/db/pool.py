@@ -6,6 +6,7 @@ async deferred to v0.2.
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -22,7 +23,16 @@ class ConnectionPool:
             raise ValueError(
                 "database_url required (or set DATABASE_URL env var)"
             )
-        self._conn: Connection | None = None
+        # One connection per thread: a psycopg connection is not safe to share
+        # between threads (concurrent cursors on it raise ProgrammingError /
+        # corrupt each other's transactions).
+        self._local = threading.local()
+        self._all: list[Connection] = []
+        self._lock = threading.Lock()
+
+    @property
+    def _conn(self) -> Connection | None:
+        return getattr(self._local, "conn", None)
 
     @property
     def database_url(self) -> str:
@@ -30,9 +40,13 @@ class ConnectionPool:
         return self._database_url
 
     def _ensure_open(self) -> Connection:
-        if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self._database_url, autocommit=False)
-        return self._conn
+        conn = self._conn
+        if conn is None or conn.closed:
+            conn = psycopg.connect(self._database_url, autocommit=False)
+            self._local.conn = conn
+            with self._lock:
+                self._all = [c for c in self._all if not c.closed] + [conn]
+        return conn
 
     @contextmanager
     def connection(self) -> Iterator[Connection]:
@@ -70,6 +84,9 @@ class ConnectionPool:
             conn.close()
 
     def close(self) -> None:
-        if self._conn is not None and not self._conn.closed:
-            self._conn.close()
-        self._conn = None
+        with self._lock:
+            conns, self._all = self._all, []
+        for c in conns:
+            if not c.closed:
+                c.close()
+        self._local = threading.local()

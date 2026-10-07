@@ -166,6 +166,10 @@ def retain(
     # ------------------------------------------------------------------
     with memory._pool.connection() as conn:
         with conn.cursor() as cur:
+            # Writers of the same content serialise here (released at commit):
+            # the check-then-insert below must not race the UNIQUE constraint.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"retain:{bank_id}:{content_hash}",))
             cur.execute(
                 "SELECT id, source FROM documents "
                 "WHERE bank_id = %(bank_id)s AND content_hash = %(content_hash)s",
