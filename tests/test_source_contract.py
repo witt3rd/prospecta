@@ -608,3 +608,29 @@ def test_explain_must_be_boolean(env):
     svc = _channel_env(env)
     with pytest.raises(ApiError):
         svc.lookup({"questions": ["a"], "explain": "yes"})
+
+
+def test_coverage_document_scope_covered_stale_orphaned(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    ref = {"kind": "note", "project": "p1", "title": "T"}
+    _note(url, 1, body="Piece one about gardens.")
+    _note(url, 2, body="Piece two about tea.")
+    _rec(svc, [ref])
+    rid = _q(url, "SELECT record_id FROM prospecta_shared.source_refs")[0][0]
+    assert rid.startswith("doc:")
+
+    def p1():
+        return {c.project: c for c in ix.coverage("note")}["p1"]
+    c = p1()                                                   # covered, not orphaned
+    assert c.orphaned == [] and c.stale == []
+    assert c.indexed >= 1
+    _note(url, 2, rev=2, body="Piece two now about rivers.")   # a piece moved on
+    c = p1()
+    assert c.orphaned == []
+    assert [s["record_id"] for s in c.stale] == [rid]
+    _rec(svc, [ref])                                           # reconcile heals it
+    c = p1()
+    assert c.orphaned == [] and c.stale == []
+    _q(url, "UPDATE host_app.notes SET gone = now() WHERE id IN (1,2)")
+    assert [o["record_id"] for o in p1().orphaned] == [rid]    # no live rows: orphaned

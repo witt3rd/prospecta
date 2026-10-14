@@ -388,6 +388,22 @@ class SourceIndexer:
             counts[status] += 1
         return {"kind": kind, **counts}
 
+    def _document_state(self, kind: str, record_id: str) -> dict | None:
+        """For a document-scope record id, the record built from its live rows
+        now; None if the id is not document-scope or no live row remains."""
+        if not record_id.startswith("doc:"):
+            return None
+        try:
+            project, title = json.loads(record_id[4:])
+            with self._m._pool.connection() as conn:
+                try:
+                    return self._fetch_document(conn, kind, project, title)
+                finally:
+                    conn.rollback()
+        except Exception as e:
+            logger.warning("coverage: cannot read document %s: %s", record_id, e)
+            return None
+
     # -- coverage ---------------------------------------------------------
     def coverage(self, kind: str | None = None, project: str | None = None) -> list[Coverage]:
         """One Coverage per (kind, project): the host's live records against the
@@ -434,8 +450,19 @@ class SourceIndexer:
             else:
                 c.indexed += 1
         for (k, rid), (have, p) in sorted(derived.items()):
-            if (k, rid) not in host_keys:
+            if (k, rid) in host_keys:
+                continue
+            doc = self._document_state(k, rid)
+            if doc is None:
                 cov(k, p).orphaned.append({"record_id": rid, "indexed_revision": have})
+                continue
+            c = cov(k, p)
+            c.live += 1
+            if doc["revision"] == have:
+                c.indexed += 1
+            else:
+                c.stale.append({"record_id": rid, "revision": doc["revision"],
+                                "indexed_revision": have})
         if kind and not any(k == kind for k, _ in out):
             cov(kind, project)
         return [out[key] for key in sorted(out, key=lambda x: (x[0], x[1] or ""))]
