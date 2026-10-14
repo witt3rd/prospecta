@@ -108,6 +108,15 @@ All idempotent; they take the record's reference, never its text.
 |---|---|---|
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
+
+`/lookup` accepts `"explain": true` (default false; must be a boolean). The default
+response is unchanged. With it, each question's object gains `channels_run` (channels
+that ran and did not fail) and `channels_failed` (`[{"channel","reason"}]`, a reason in
+words, starting `failed:` for an error or `skipped:` for a channel disabled in the bank's
+config), and each hit gains `channels`: `[{"channel","rank","score","weight"}]` for every
+channel that returned it (rank within the channel, the channel's raw score, the fusion
+weight applied). Banks without a channel config use the fixed legacy fusion: `channels_run`
+names its three channels and a hit's `rank` and `weight` are null.
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
 | `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |

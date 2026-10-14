@@ -52,6 +52,8 @@ def run_channels(
     trace = {
         "plan": plan.to_json(),
         "channels": traces,
+        "skipped": [{"name": e["name"], "reason": "disabled in the bank's channel config"}
+                    for e in config if not e.get("enabled", True)],
         "fusion": {
             "method": "weighted_rrf", "k": k, "weights": weights,
             "pool": [f.document_id for f in fused],

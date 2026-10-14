@@ -549,3 +549,62 @@ def test_concurrent_reindex_matches_sequential(env):
     finally:
         mem1.close()
         mem2.close()
+
+
+# ------------------------------------------------------------------ explain
+
+def _channel_env(env):
+    from prospecta.channels.registry import DEFAULT_CHANNEL_CONFIG
+    url, mem, ix = env
+    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] in ("dense_chunk", "question")]
+    mem.set_channel_config(cfg)
+    _note(url, 1, body="Gardens need water and sun.")
+    ix.reindex_kind("note")
+    return Service(mem, ix)
+
+
+def test_explain_absent_response_is_byte_identical(env):
+    svc = _channel_env(env)
+    req = {"questions": ["what do gardens need"], "limit": 5}
+    plain = json.dumps(svc.lookup(req), sort_keys=True)
+    assert json.dumps(svc.lookup({**req, "explain": False}), sort_keys=True) == plain
+    out = svc.lookup({**req, "explain": True})["results"][0]
+    stripped = {"question": out["question"], "results": [
+        {k: v for k, v in r.items() if k != "channels"} for r in out["results"]]}
+    assert json.dumps({"results": [stripped]}, sort_keys=True) == plain
+    assert "channels_run" not in json.loads(plain)["results"][0]
+
+
+def test_explain_hit_found_by_two_channels_shows_both(env):
+    svc = _channel_env(env)
+    out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
+    assert sorted(out["channels_run"]) == ["dense_chunk", "question"]
+    assert out["channels_failed"] == []
+    hit = out["results"][0]
+    assert {c["channel"] for c in hit["channels"]} == {"dense_chunk", "question"}
+    w = {c["channel"]: c["weight"] for c in hit["channels"]}
+    assert w == {"dense_chunk": 4.0, "question": 1.0}
+    assert all(c["rank"] == 1 and isinstance(c["score"], float) for c in hit["channels"])
+
+
+def test_explain_failed_and_skipped_channels_listed(env, monkeypatch):
+    from prospecta.channels import semantic
+    from prospecta.channels.registry import DEFAULT_CHANNEL_CONFIG
+    svc = _channel_env(env)
+    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] in ("dense_chunk", "question")]
+    cfg.append({"name": "bm25", "enabled": False, "weight": 1})
+    env[1].set_channel_config(cfg)
+    monkeypatch.setattr(semantic.AnticipatedQuestions, "_sql", "SELECT broken FROM nowhere")
+    out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
+    assert out["channels_run"] == ["dense_chunk"]
+    failed = {f["channel"]: f["reason"] for f in out["channels_failed"]}
+    assert failed["question"].startswith("failed:")
+    assert failed["bm25"].startswith("skipped:") and "disabled" in failed["bm25"]
+    assert [c["channel"] for c in out["results"][0]["channels"]] == ["dense_chunk"]
+
+
+def test_explain_must_be_boolean(env):
+    from prospecta.service import ApiError
+    svc = _channel_env(env)
+    with pytest.raises(ApiError):
+        svc.lookup({"questions": ["a"], "explain": "yes"})

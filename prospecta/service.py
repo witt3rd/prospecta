@@ -6,8 +6,10 @@ Endpoints (JSON):
     GET  /healthz
     POST /lookup    {"questions": [...], "limit": 10, "kind"?, "project"?, "person"?,
                      "audience_key"?,
-                     "allowed_audience_keys"?, "allowed_projects"?}
-                                          -> ranked results per question
+                     "allowed_audience_keys"?, "allowed_projects"?, "explain"?: true}
+                                          -> ranked results per question; with explain, also
+                                             channels_run / channels_failed per question and
+                                             channels (rank, score, weight) per hit
     POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true, "concurrency"?}
     POST /remove    {"kind", "record_id"}
     POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}], "concurrency"?}
@@ -47,6 +49,40 @@ class ApiError(Exception):
         self.status, self.message = status, message
 
 
+LEGACY_CHANNELS = ("semantic", "lexical", "lexical_body")
+
+
+def _explain_query(trace: dict | None, ranked: list[dict]) -> dict:
+    """Additive explain fields for one question: channels_run, channels_failed
+    (failed or skipped, each with a reason) and, on every ranked hit, `channels`
+    (name, rank, raw score, weight applied). Mutates `ranked` to add `channels`."""
+    if trace is None:
+        # Legacy bank (no channel config): fixed three-channel fusion with no
+        # per-channel ranks; the raw per-channel scores of the hit are given.
+        for r in ranked:
+            r["channels"] = [{"channel": n, "rank": None, "score": float(r["_scores"][n]),
+                              "weight": None}
+                             for n in LEGACY_CHANNELS if r["_scores"].get(n)]
+        return {"channels_run": list(LEGACY_CHANNELS), "channels_failed": []}
+    weights = {c["name"]: c["weight"] for c in trace["channels"]}
+    by_doc: dict[str, dict[str, tuple[int, float]]] = {}
+    for c in trace["candidates"]:
+        cur = by_doc.setdefault(c["document_id"], {})
+        if c["channel"] not in cur or c["rank"] < cur[c["channel"]][0]:
+            cur[c["channel"]] = (c["rank"], c["score"])
+    for r in ranked:
+        found = by_doc.get(r["_doc"], {})
+        r["channels"] = [{"channel": n, "rank": found[n][0], "score": float(found[n][1]),
+                          "weight": weights[n]}
+                         for n in (c["name"] for c in trace["channels"]) if n in found]
+    failed = [{"channel": c["name"], "reason": f"failed: {c['error']}"}
+              for c in trace["channels"] if c["error"]]
+    failed += [{"channel": s["name"], "reason": f"skipped: {s['reason']}"}
+               for s in trace.get("skipped", [])]
+    return {"channels_run": [c["name"] for c in trace["channels"] if not c["error"]],
+            "channels_failed": failed}
+
+
 class Service:
     """The service logic, separate from HTTP so it can be tested directly."""
 
@@ -82,9 +118,14 @@ class Service:
             allow[key] = v          # [] allows nothing; "" allows records with no value
         if allow:
             flt["_allow"] = allow
+        explain = body.get("explain", False)
+        if not isinstance(explain, bool):
+            raise ApiError(400, "explain must be true or false")
         out = []
         for q in qs:
-            hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None)
+            traces: list[dict] = []
+            hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
+                                      **({"_trace": traces} if explain else {}))
             best: dict[tuple, dict] = {}
             for h in hits:
                 md = h.metadata or {}
@@ -94,8 +135,17 @@ class Service:
                 if key not in best or h.score > best[key]["score"]:
                     best[key] = {"kind": md["kind"], "record_id": md["record_id"],
                                  "revision": md.get("revision"), "score": float(h.score)}
+                    if explain:
+                        best[key]["_doc"] = h.document_id
+                        best[key]["_scores"] = h.scores
             ranked = sorted(best.values(), key=lambda r: -r["score"])[:limit]
-            out.append({"question": q, "results": ranked})
+            entry = {"question": q}
+            if explain:
+                entry.update(_explain_query(traces[0] if traces else None, ranked))
+                for r in ranked:
+                    r.pop("_doc"), r.pop("_scores")
+            entry["results"] = ranked
+            out.append(entry)
         return {"results": out}
 
     @staticmethod
