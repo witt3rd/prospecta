@@ -197,3 +197,19 @@ def test_migration_0012_is_noop_without_extension(mem):
         out = Bm25Chunks().retrieve(QueryPlan(text="revenue europe"),
                                     RecallState(conn=conn, bank_id="b"), 5)
     assert out and out[0].source == "rev.md"  # default AutoBm25 fell back to bm25s
+
+
+# ------------------------------------------------------------- identifiers
+
+def test_a_token_with_a_digit_is_never_stemmed():
+    # a hex id may end like a suffix; stripping it would make it collide with a shorter id
+    assert tokenize("c0ffeed 9a1ers a1b2ed a1b2") == ["c0ffeed", "9a1ers", "a1b2ed", "a1b2"]
+    assert tokenize("Fixed releases") == tokenize("fix release")
+
+
+def test_the_index_finds_an_id_inside_a_file_name():
+    # the query tokenises as the text does, so `name-<id>.ext` and the id alone both match
+    idx = Bm25Index.build([("a", "deliverable-7f3a91c04b2e.pr\n\nClosing notes"),
+                           ("b", "deliverable-0c4e8d1a9b27.pr")])
+    assert idx.search("deliverable-7f3a91c04b2e", 5)[0][0] == "a"
+    assert [i for i, _ in idx.search("7f3a91c04b2e", 5)] == ["a"]
