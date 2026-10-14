@@ -110,7 +110,8 @@ def bank_embedding_dim(database_url: str | None, bank_id: str) -> int | None:
         return None
     try:
         import psycopg
-        with psycopg.connect(database_url, connect_timeout=10) as conn:
+        from prospecta.db.schema import resolve_schema, scoped_url
+        with psycopg.connect(scoped_url(database_url, resolve_schema()), connect_timeout=10) as conn:
             row = conn.execute(
                 "SELECT embedding_dim FROM banks WHERE bank_id = %s", (bank_id,)
             ).fetchone()

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 import psycopg
+from prospecta.db.schema import resolve_schema, scoped_url
 
 DEFAULT_DIM = 1536  # OpenAI text-embedding-3-small shape
 DEFAULT_DIM_NOTE = (
@@ -115,10 +116,10 @@ def _verify_connectivity(database_url: str) -> bool:
 
 def _bank_exists(database_url: str, bank_id: str) -> bool:
     try:
-        with psycopg.connect(database_url) as conn:
+        with psycopg.connect(scoped_url(database_url, resolve_schema())) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'banks'"
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'banks' AND table_schema = current_schema()"
                 )
                 if cur.fetchone() is None:
                     return False

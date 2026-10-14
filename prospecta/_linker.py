@@ -482,6 +482,15 @@ class Linker:
         with conn.cursor() as cur:
             cur.execute("SELECT original_text FROM documents WHERE id = %s", (doc,))
             text = cur.fetchone()[0]
+            if not text:
+                # An in-place source record (migration 0017) keeps no text of
+                # its own: read it back from its derived chunk items.
+                cur.execute(
+                    "SELECT string_agg(original_chunk, E'\\n\\n' ORDER BY ordinal) "
+                    "FROM memory_items WHERE document_id = %s AND kind = 'chunk'", (doc,))
+                text = cur.fetchone()[0] or ""
+        if not text.strip():
+            return
         prompt = render_prompt("extract-entities", {"text": text})
         raw = call_llm(self.llm, [{"role": "user", "content": prompt}],
                        purpose="extract_entities", calls=calls, model=self.model)

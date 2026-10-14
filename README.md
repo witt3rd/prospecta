@@ -281,3 +281,7 @@ Honest about what isn't there yet:
 ## License
 
 See `LICENSE`. ⚒️
+
+## Shared database, source views, service
+
+Prospecta can run inside a database another application owns (one schema), index that application's records in place from views, and serve lookups over HTTP. See [docs/source-contract.md](docs/source-contract.md).

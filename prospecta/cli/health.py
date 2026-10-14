@@ -9,7 +9,12 @@ def _check_db(url: str | None) -> str:
         raise RuntimeError("DATABASE_URL not set")
     import psycopg
 
-    with psycopg.connect(url, connect_timeout=10) as conn:
+    from prospecta.db.schema import check_schema_writable, resolve_schema, scoped_url
+
+    schema = resolve_schema()
+    if schema:
+        check_schema_writable(url, schema)
+    with psycopg.connect(scoped_url(url, schema), connect_timeout=10) as conn:
         conn.execute("SELECT 1")
     return "ok"
 

@@ -16,6 +16,7 @@ from typing import Literal
 
 from prospecta._types import EmbedCallable, LLMCallable, Query, RAGResult, RecalledMemory, Tracer
 from prospecta.db.pool import ConnectionPool
+from prospecta.db.schema import check_schema_writable, resolve_schema, scoped_url
 from prospecta.db.queries import (
     HNSW_INDEX_TEMPLATE,
     INSERT_BANK,
@@ -142,9 +143,16 @@ class Memory:
         synth_llm: LLMCallable | None = None,
         jev: "Any | None" = None,
         linker: "Any | None" = None,
+        schema: str | None = None,
     ) -> None:
         if not database_url:
             raise ValueError("database_url is required")
+        # Shared-database mode: `schema` (or $PROSPECTA_SCHEMA) pins every
+        # connection to one schema; refuse to start if it is not writable.
+        self._schema = resolve_schema(schema)
+        if self._schema is not None:
+            check_schema_writable(database_url, self._schema)
+            database_url = scoped_url(database_url, self._schema)
         self._database_url = database_url
         self._llm = llm
         self._embed = embed
@@ -183,6 +191,10 @@ class Memory:
         # T14: sweeper thread state (lazy; created in start_sweeper).
         self._sweeper_thread = None  # type: ignore[assignment]
         self._sweeper_config = None  # type: ignore[assignment]
+
+    @property
+    def schema(self) -> str | None:
+        return self._schema
 
     @property
     def database_url(self) -> str:
