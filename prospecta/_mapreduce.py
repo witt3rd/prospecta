@@ -48,7 +48,12 @@ WITH cand AS (
   WHERE d.bank_id = %(bank)s
     AND (%(meta)s::jsonb IS NULL OR EXISTS (
             SELECT 1 FROM memory_items mi
-            WHERE mi.document_id = d.id AND mi.metadata @> %(meta)s::jsonb))
+            WHERE mi.document_id = d.id AND mi.metadata @> (%(meta)s::jsonb - '_allow')
+            AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+            (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(mi.metadata->>'audience_key','') IN
+                (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+            AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(mi.metadata->>'project','') IN
+                (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))))
 ), hubness AS (
   SELECT c.*, (SELECT count(*) FROM cand WHERE linked) > %(hub)s AS hub FROM cand c
 ), flagged AS (

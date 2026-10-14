@@ -5,7 +5,9 @@
 Endpoints (JSON):
     GET  /healthz
     POST /lookup    {"questions": [...], "limit": 10, "kind"?, "project"?, "person"?,
-                     "audience_key"?}     -> ranked results per question
+                     "audience_key"?,
+                     "allowed_audience_keys"?, "allowed_projects"?}
+                                          -> ranked results per question
     POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true}
     POST /remove    {"kind", "record_id"}
     GET  /coverage?kind=&project=
@@ -64,6 +66,16 @@ class Service:
                if body.get(k) is not None}
         if not all(isinstance(v, str) for v in flt.values()):
             raise ApiError(400, "filters must be strings")
+        allow = {}
+        for field, key in (("allowed_audience_keys", "audience_key"), ("allowed_projects", "project")):
+            v = body.get(field)
+            if v is None:
+                continue
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise ApiError(400, f"{field} must be a list of strings")
+            allow[key] = v          # [] allows nothing; "" allows records with no value
+        if allow:
+            flt["_allow"] = allow
         out = []
         for q in qs:
             hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None)

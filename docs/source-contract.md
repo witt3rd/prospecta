@@ -38,7 +38,7 @@ exactly these columns (any type that casts to the one shown; ids may be uuid or 
 |---|---|---|
 | `kind` | text | record family, e.g. note, message |
 | `record_id` | text | id, unique within `kind` |
-| `revision` | text | changes whenever the content changes (a version number, a hash, a timestamp) |
+| `revision` | text | opaque string; must change whenever the record's text, title or audience changes (see below) |
 | `title` | text | optional |
 | `text` | text | the content to index |
 | `person` | text | optional filter |
@@ -46,6 +46,15 @@ exactly these columns (any type that casts to the one shown; ids may be uuid or 
 | `created_date` | date | optional |
 | `audience_key` | text | optional access scope; lookups can filter on it |
 | `deleted_at` | timestamptz | non-NULL = the record is deleted |
+
+`revision` is compared only for equality; Prospecta never orders or parses it.
+Host obligation: change it whenever the record's `text`, `title` or
+`audience_key` changes. A record whose revision is unchanged is skipped
+(`unchanged`), so a change that does not move the revision is never seen. When
+the revision changes, `audience_key` (and `project`, `person`) are re-read from
+the view; a changed audience key retires the record's old items and re-derives
+them, and the new key takes effect for the next lookup after that reindex.
+Until then lookups use the old key (`/coverage` lists the record as `stale`).
 
 The service refuses to start if a view is missing, lacks a column or is not readable.
 
@@ -61,6 +70,19 @@ its text back from those chunks.
 
 Limits: the map-reduce recall (`recall_mapreduce`) scans `documents.original_text`,
 so in-place records are not covered by it.
+
+### Allowed-audience filter
+
+`allowed_audience_keys` (list of strings) and `allowed_projects` (list of
+strings) are optional. When given, a record whose audience key (project) is not
+in the list is never a candidate in any channel (keyword, meaning, questions,
+links, graph): it cannot appear in a result, a rerank input or a follow-up
+question. The condition is part of each channel's query, applied before
+ranking, and the graph walk never reaches or crosses a disallowed item. An
+empty list allows nothing. A record with an empty or missing audience key
+(project) is visible only if the list contains `""`. When a list is absent
+there is no restriction (unchanged behavior). In the library the same filter is
+`metadata_filter={"_allow": {"audience_key": [...], "project": [...]}}`.
 
 ## Indexing interface (`prospecta.source.SourceIndexer`)
 
@@ -83,7 +105,7 @@ All idempotent; they take the record's reference, never its text.
 | call | body / query | answer |
 |---|---|---|
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
-| `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
+| `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
 | `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |

@@ -31,7 +31,12 @@ WHERE d.bank_id = %(bank_id)s
   AND (%(people)s::text[] IS NULL OR d.person = ANY(%(people)s::text[]))
   AND (%(date_from)s::date IS NULL OR d.created_on >= %(date_from)s::date)
   AND (%(date_to)s::date IS NULL OR d.created_on <= %(date_to)s::date)
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> %(meta)s::jsonb)
+  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
+  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
 ORDER BY d.id, m.embedding <=> %(qe)s::vector
 """
 

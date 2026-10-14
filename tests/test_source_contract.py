@@ -206,3 +206,133 @@ def test_http_round_trip_and_auth(env):
         assert call("GET", "/nope")[0] == 404
     finally:
         srv.shutdown(); srv.server_close()
+
+
+# ---- allowed-audience filter -------------------------------------------------
+
+from prospecta.channels.base import Filters, QueryPlan, RecallState  # noqa: E402
+from prospecta.channels.bm25 import Bm25Chunks  # noqa: E402
+from prospecta.channels.graph import GraphExpand  # noqa: E402
+from prospecta.channels.meta import MetadataScope  # noqa: E402
+from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks  # noqa: E402
+
+GARDEN = "Gardens need water and sun to grow."
+
+
+def _ids(url, rid):
+    return {str(r[0]) for r in _q(url, "SELECT document_id FROM prospecta_shared.source_refs "
+                                       "WHERE record_id = %s", rid)}
+
+
+def _channel_docs(mem, text, allow):
+    """Document ids each channel offers as candidates for `text`."""
+    flt = {"_allow": allow} if allow is not None else None
+    plan = QueryPlan(text=text, filters=Filters(people=["ann"]))
+    out = {}
+    with mem._pool.connection() as conn:
+        for ch in (DenseChunks(), AnticipatedQuestions(), Bm25Chunks(), MetadataScope()):
+            st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
+            out[ch.name] = {c.document_id for c in ch.retrieve(plan, st)}
+        st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
+        seed = DenseChunks().retrieve(plan, RecallState(conn=conn, bank_id="b", embed=stub_embed,
+                                                        metadata_filter=flt))
+        st.pool = seed
+        out["graph"] = {c.document_id for c in GraphExpand().retrieve(plan, st)}
+        conn.rollback()
+    return out
+
+
+def _link_all(url):
+    _q(url, "INSERT INTO prospecta_shared.memory_links (bank_id, src, dst, link_type, subtype) "
+            "SELECT 'b', a.id, c.id, 'SEMANTIC', 'RELATED_TO' "
+            "FROM prospecta_shared.memory_items a, prospecta_shared.memory_items c "
+            "WHERE a.document_id <> c.document_id AND a.kind = 'chunk' AND c.kind = 'chunk'")
+
+
+def test_allowed_audience_excludes_record_from_every_channel(env):
+    url, mem, ix = env
+    _note(url, 1, body=GARDEN, aud="team-a")
+    _note(url, 2, body=GARDEN + " Gardens also like tea.", aud="team-b")
+    _note(url, 3, body=GARDEN + " Gardens and rain.", aud="")
+    ix.reindex_kind("note")
+    _link_all(url)
+    d1, d2, d3 = _ids(url, "1"), _ids(url, "2"), _ids(url, "3")
+    # Sanity: with no filter the other audiences are candidates, in every channel.
+    base = _channel_docs(mem, GARDEN, None)
+    for name in ("dense_chunk", "question", "bm25", "meta", "graph"):
+        assert base[name], name
+    assert (d2 | d3) & set().union(*base.values())
+    # Restricted to team-a: nothing else, in any channel.
+    got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a"]})
+    for name, docs in got.items():
+        assert not (docs & (d2 | d3)), name
+    assert got["dense_chunk"] == d1
+    # The empty audience key is visible only when listed.
+    got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a", ""]})
+    assert got["dense_chunk"] == d1 | d3
+    assert not any(docs & d2 for docs in got.values())
+    # An empty list allows nothing; projects filter the same way.
+    assert all(not docs for docs in _channel_docs(mem, GARDEN, {"audience_key": []}).values())
+    _note(url, 4, body=GARDEN + " Other project.", proj="p9", aud="team-a")
+    ix.index_record("note", "4")
+    got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a"], "project": ["p1"]})
+    assert not (got["dense_chunk"] & _ids(url, "4"))
+
+
+def test_allowed_audience_never_reaches_a_result_or_follow_up(env):
+    url, mem, ix = env
+    _note(url, 1, body=GARDEN, aud="team-a")
+    _note(url, 2, body=GARDEN + " Secret.", aud="team-b")
+    ix.reindex_kind("note")
+    svc = Service(mem, ix)
+    for body in ({"allowed_audience_keys": ["team-a"]},
+                 {"allowed_audience_keys": ["team-a"], "allowed_projects": ["p1"]}):
+        out = svc.lookup({"questions": [GARDEN], **body})
+        assert {x["record_id"] for x in out["results"][0]["results"]} == {"1"}
+    none = svc.lookup({"questions": [GARDEN], "allowed_audience_keys": []})
+    assert none["results"][0]["results"] == []
+    from prospecta.service import ApiError
+    with pytest.raises(ApiError):
+        svc.lookup({"questions": ["a"], "allowed_audience_keys": "team-a"})
+    # Library path, hybrid search through the bank's channels (incl. rerank inputs
+    # and follow-ups, which run on the same filtered state).
+    hits = mem.recall([GARDEN], metadata_filter={"_allow": {"audience_key": ["team-a"]}})
+    assert hits and {h.metadata["record_id"] for h in hits} == {"1"}
+
+
+def test_audience_change_takes_effect_after_reindex(env):
+    url, mem, ix = env
+    _note(url, 1, body=GARDEN, aud="team-a")
+    ix.index_record("note", "1")
+    svc = Service(mem, ix)
+
+    def seen(key):
+        out = svc.lookup({"questions": [GARDEN], "allowed_audience_keys": [key]})
+        return {x["record_id"] for x in out["results"][0]["results"]}
+
+    assert seen("team-a") == {"1"} and seen("team-b") == set()
+    _note(url, 1, rev=2, body=GARDEN, aud="team-b")       # audience moves, revision moves
+    assert seen("team-a") == {"1"}                         # not yet reindexed
+    assert ix.index_record("note", "1").status == "indexed"
+    assert seen("team-a") == set() and seen("team-b") == {"1"}
+    assert {r[1] for r in _items(url, "1")} == {"2"}       # old items retired
+
+
+def test_absent_allow_filter_changes_nothing(env):
+    url, mem, ix = env
+    _note(url, 1, body=GARDEN, aud="team-a")
+    _note(url, 2, body=GARDEN + " More.", aud="team-b")
+    _note(url, 3, body=GARDEN + " Again.", aud="")
+    ix.reindex_kind("note")
+    svc = Service(mem, ix)
+    plain = svc.lookup({"questions": [GARDEN]})
+    assert {x["record_id"] for x in plain["results"][0]["results"]} == {"1", "2", "3"}
+    # Same results with no filter, an empty filter dict, or every audience listed.
+    ref = [(h.document_id, h.score) for h in mem.recall([GARDEN])]
+    for flt in (None, {}, {"person": "ann"}):
+        got = [(h.document_id, h.score) for h in mem.recall([GARDEN], metadata_filter=flt)]
+        assert got == ref
+    allowed = [(h.document_id, h.score) for h in mem.recall(
+        [GARDEN], metadata_filter={"_allow": {"audience_key": ["team-a", "team-b", ""]}})]
+    assert allowed == ref
+    assert _channel_docs(mem, GARDEN, None) == _channel_docs(mem, GARDEN, {})
