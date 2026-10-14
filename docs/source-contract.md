@@ -108,9 +108,9 @@ All idempotent; they take the record's reference, never its text.
 |---|---|---|
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
-| `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true}` | status per above |
+| `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
-| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}]}` (any number, at least 1; processed in batches internally) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
+| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
 | `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
 
 ### Reconcile
@@ -122,6 +122,17 @@ row absent or `deleted_at` set -> its derived items are retired (`removed`;
 Prospecta cannot read (malformed, or a view error) is listed under `unreadable`
 with the reason and does not stop the others. Repeating a call changes nothing
 once the first has been applied.
+
+References are processed on a bounded pool of worker threads, each with its own
+database connection (chunking, the anticipated-question model call, embedding
+and writes all run in the worker). The size is `PROSPECTA_INDEX_CONCURRENCY`
+(default 8); a request may lower or raise it with `"concurrency"` (1..32, else
+400). Extra references wait in a queue; none is refused. Results are the same as
+a sequential run (same counts, same `unreadable` list in request order, same
+derived items). One record is only ever indexed by one worker at a time (a
+per-record advisory lock), so overlapping requests for the same records never
+duplicate derived items; the later one finds the record `unchanged`. `/index`
+with `reindex` uses the same pool.
 
 A reference is `{kind, record_id}` (one record) or `{kind, project, title}`
 (document scope): every live row of that kind, project and title is one

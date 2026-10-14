@@ -14,7 +14,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 from dataclasses import dataclass, field
 
 from prospecta._chunker import chunk_paragraphs
@@ -22,6 +24,20 @@ from prospecta._retain import CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS
 from prospecta.db.queries import _vec_literal, delete_memory_items_for_document
 
 logger = logging.getLogger(__name__)
+
+MAX_INDEX_CONCURRENCY = 32
+DEFAULT_INDEX_CONCURRENCY = 8
+
+
+def default_concurrency() -> int:
+    """PROSPECTA_INDEX_CONCURRENCY (default 8), clamped to 1..32."""
+    raw = os.environ.get("PROSPECTA_INDEX_CONCURRENCY")
+    try:
+        n = int(raw) if raw else DEFAULT_INDEX_CONCURRENCY
+    except ValueError:
+        n = DEFAULT_INDEX_CONCURRENCY
+    return max(1, min(MAX_INDEX_CONCURRENCY, n))
+
 
 # The fixed columns every source view must provide, with the Postgres type
 # family each is read as (the view may use any castable type, e.g. uuid ids).
@@ -105,9 +121,51 @@ class Coverage:
 class SourceIndexer:
     """Index/remove/coverage over the host views, writing into a Memory's bank."""
 
-    def __init__(self, memory, config: SourceConfig):
+    def __init__(self, memory, config: SourceConfig, concurrency: int | None = None):
         self._m = memory
         self.config = config
+        self.concurrency = default_concurrency() if concurrency is None else concurrency
+
+    def _workers(self, concurrency: int | None) -> int:
+        n = self.concurrency if concurrency is None else concurrency
+        return max(1, min(MAX_INDEX_CONCURRENCY, int(n)))
+
+    def _map(self, fn, items: list, concurrency: int | None) -> list:
+        """fn(item) for every item, in order, on up to `concurrency` worker
+        threads. fn must not raise (callers catch per item). Each worker uses
+        its own database connection (the pool keeps one per thread) and closes
+        it on exit. Excess items wait in a queue; none is dropped."""
+        n = min(self._workers(concurrency), len(items))
+        if n <= 1:
+            return [fn(i) for i in items]
+        todo: queue.SimpleQueue = queue.SimpleQueue()
+        for idx, item in enumerate(items):
+            todo.put((idx, item))
+        out: list = [None] * len(items)
+        crashed: list[BaseException] = []
+
+        def work():
+            try:
+                while True:
+                    try:
+                        idx, item = todo.get_nowait()
+                    except queue.Empty:
+                        return
+                    out[idx] = fn(item)
+            except BaseException as e:  # a bug in fn: stop this worker, report it
+                crashed.append(e)
+            finally:
+                self._m._pool.release_thread()
+
+        threads = [threading.Thread(target=work, name=f"prospecta-index-{i}", daemon=True)
+                   for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if crashed:
+            raise crashed[0]
+        return out
 
     # -- contract ---------------------------------------------------------
     def check_contract(self) -> None:
@@ -209,28 +267,35 @@ class SourceIndexer:
                 "created_date": min(dates) if dates else None,
                 "audience_key": rows[0]["audience_key"], "deleted_at": None}
 
-    def reconcile(self, refs: list[dict]) -> dict:
+    def reconcile(self, refs: list[dict], concurrency: int | None = None) -> dict:
         """Re-read the views for each reference ({kind, record_id} or
-        {kind, project, title}) and index, leave or retire it. Idempotent."""
-        counts = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0}
-        unreadable: list[dict] = []
-        for ref in refs:
+        {kind, project, title}) and index, leave or retire it. Idempotent.
+        References run on up to `concurrency` worker threads; the result is the
+        same as running them one by one (unreadable keeps the request order)."""
+        def one(ref):
             try:
                 kind = ref.get("kind") if isinstance(ref, dict) else None
                 if not isinstance(kind, str) or not kind:
                     raise ValueError("kind is required (string)")
                 if isinstance(ref.get("record_id"), str) and ref["record_id"]:
-                    res = self.index_record(kind, ref["record_id"])
-                elif isinstance(ref.get("project"), str) and isinstance(ref.get("title"), str):
+                    return self.index_record(kind, ref["record_id"]).status, None
+                if isinstance(ref.get("project"), str) and isinstance(ref.get("title"), str):
                     project, title = ref["project"], ref["title"]
                     res = self._sync(kind, document_record_id(project, title),
                                      lambda conn: self._fetch_document(conn, kind, project, title))
-                else:
-                    raise ValueError("reference needs record_id, or project and title")
-                counts[res.status] += 1
+                    return res.status, None
+                raise ValueError("reference needs record_id, or project and title")
             except Exception as e:
                 logger.warning("reconcile: cannot read %r: %s", ref, e)
-                unreadable.append({"reference": ref, "error": str(e)})
+                return None, {"reference": ref, "error": str(e)}
+
+        counts = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0}
+        unreadable: list[dict] = []
+        for status, err in self._map(one, list(refs), concurrency):
+            if err is not None:
+                unreadable.append(err)
+            else:
+                counts[status] += 1
         return {**counts, "unreadable": unreadable}
 
     def _build_items(self, rec: dict) -> list[dict]:
@@ -308,7 +373,7 @@ class SourceIndexer:
         return IndexResult(kind, record_id, "removed" if ref else "absent",
                            ref[0] if ref else None)
 
-    def reindex_kind(self, kind: str) -> dict:
+    def reindex_kind(self, kind: str, concurrency: int | None = None) -> dict:
         """Index every record of `kind` the views show, retire the ones that are
         deleted or gone. Idempotent: current records are left untouched."""
         bank = self._m._default_bank_id
@@ -319,8 +384,9 @@ class SourceIndexer:
                 "SELECT record_id FROM source_refs WHERE bank_id = %s AND kind = %s", (bank, kind))]
             conn.rollback()
         counts: dict[str, int] = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0}
-        for rid in sorted(set(seen) | set(known)):
-            counts[self.index_record(kind, rid).status] += 1
+        for status in self._map(lambda rid: self.index_record(kind, rid).status,
+                                sorted(set(seen) | set(known)), concurrency):
+            counts[status] += 1
         return {"kind": kind, **counts}
 
     # -- coverage ---------------------------------------------------------
