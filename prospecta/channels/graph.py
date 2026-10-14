@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
+from prospecta.db.queries import _meta_param
 
 DEFAULT_TYPE_WEIGHTS = {"SEMANTIC": 1.0, "CAUSAL": 0.8, "TEMPORAL": 0.5, "ENTITY": 0.5}
 DEFAULT_SEED_MIN_REL = 0.5
@@ -43,10 +44,12 @@ _EDGES = """
            CASE WHEN l.src = f.item THEN l.dst ELSE l.src END AS nid,
            l.link_type, l.subtype, l.confidence
     FROM {frm} f JOIN memory_links l ON l.src = f.item AND l.bank_id = %(bank)s
+    JOIN memory_items nm ON nm.id = l.dst AND @@NM@@
     UNION ALL
     SELECT f.item, f.origin_doc, f.score, f.hops, f.via, f.link_types, f.parent,
            l.src, l.link_type, l.subtype, l.confidence
     FROM {frm} f JOIN memory_links l ON l.dst = f.item AND l.bank_id = %(bank)s
+    JOIN memory_items nm ON nm.id = l.src AND @@NM@@
 """
 
 # Hub holders are fetched once per (entity, kind) -- not once per frontier item --
@@ -88,7 +91,7 @@ _HUBS = """
                row_number() OVER (PARTITION BY h.entity_id, h.kind ORDER BY ie2.n DESC, ie2.item_id) AS rn
         FROM {p}he h
         JOIN memory_item_entities ie2 ON ie2.entity_id = h.entity_id
-        JOIN memory_items bi ON bi.id = ie2.item_id AND bi.kind = h.kind
+        JOIN memory_items bi ON bi.id = ie2.item_id AND bi.kind = h.kind AND @@BI@@
         WHERE true {skip}
     ) r WHERE rn <= %(hub_cap)s
     {reuse}
@@ -109,6 +112,7 @@ s0 AS (
     SELECT m.id AS item, m.document_id AS origin_doc, s.w AS score, 0 AS hops,
            ARRAY[]::text[] AS via, ARRAY[]::text[] AS link_types, m.id AS parent
     FROM seed s JOIN memory_items m ON m.document_id = s.doc AND m.bank_id = %(bank)s
+         AND @@M@@
 ),
 e1 AS (""" + _EDGES.format(frm="s0") + """),
 """ + _HUBS.format(frm="s0", p="a_", skip="", reuse="") + """,
@@ -167,6 +171,17 @@ ORDER BY t.score DESC, d.source, t.item_id
 """
 
 
+# The allowed-audience filter (metadata_filter["_allow"], see Memory.recall): a
+# neighbour that is not allowed is never reached, so no path runs through it.
+_ALLOW = """(%(meta)s::jsonb->'_allow' IS NULL OR (
+        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(@@A@@.metadata->>'audience_key','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(@@A@@.metadata->>'project','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))"""
+for _token, _alias in (("@@NM@@", "nm"), ("@@BI@@", "bi"), ("@@M@@", "m")):
+    _SQL = _SQL.replace(_token, _ALLOW.replace("@@A@@", _alias))
+
+
 class GraphExpand:
     name = "graph"
     kind = "expand"
@@ -204,6 +219,7 @@ class GraphExpand:
                 "rel": float(p.get("node_min_rel", DEFAULT_NODE_MIN_REL)),
                 "hub": int(p.get("hub", ENTITY_HUB)),
                 "hub_cap": int(p.get("hub_cap", DEFAULT_HUB_CAP)),
+                "meta": _meta_param(state.metadata_filter),
             })
             cols = [c.name for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]

@@ -17,7 +17,12 @@ FROM memory_items m
 JOIN documents d ON d.id = m.document_id
 WHERE m.bank_id = %(bank_id)s
   AND m.kind = '{kind}'
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> %(meta)s::jsonb)
+  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
+  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
 ORDER BY m.embedding <=> %(qe)s::vector
 LIMIT %(n)s
 """
