@@ -25,7 +25,7 @@ REGISTRY: dict[str, type] = {
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},
     {"name": "question", "enabled": True, "weight": 1, "params": {}},
-    {"name": "graph", "enabled": True, "weight": 1,
+    {"name": "graph", "enabled": True, "weight": 0.25,
      "params": {"max_hops": 2, "decay": 0.5,
                 "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
                                  "TEMPORAL": 0.5, "ENTITY": 0.5}}},

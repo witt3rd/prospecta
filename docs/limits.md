@@ -105,6 +105,8 @@ Printed by `tests/test_filters.py` (`pytest -s -k q096`):
 
 Config names and defaults, all relative to the best score (0 = no cut): graph channel params
 `seed_min_rel` 0.5, `node_min_rel` 0.4; Linker `neighbour_min_rel` 0.9, `temporal_min_rel` 0.5.
+
+Default graph channel weight is 0.25 (owner decision); `node_min_rel` is the node limit (no absolute cap).
 Like the first PR's, these are unmeasured starting defaults chosen by the author (no links
 exist on the synthetic bank, so the synthetic eval is unchanged); tuning on the real question
 set is for the rung-caretaker scout on roger. Hub entities (`hub_cap` 200 holders) remain a

@@ -34,7 +34,7 @@ walks two bounded, indexed hops over links in both directions (plus the entity-t
 entities), multiplying by
 decay 0.5, the link type weight (SEMANTIC 1.0, CAUSAL 0.8, TEMPORAL 0.5, ENTITY 0.5) and
 the link confidence; every reached neighbour scoring >= `node_min_rel` (0.4) x the best reached, reported per document. It is **enabled
-in `DEFAULT_CHANNEL_CONFIG` at weight 1** (captain's decision; the design had it dark);
+in `DEFAULT_CHANNEL_CONFIG` at weight 0.25** (owner decision: keeps its rare finds, cuts cost; the walk is bounded by the relative cut `node_min_rel` 0.4, no absolute cap) (captain's decision; the design had it dark);
 set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_hops`, `decay`, `hub`, `hub_cap`, `type_weights`) per bank. Its contribution is to be measured on real questions.
 
 **JevReader** (`recall_config.reader.type = "jev"`, needs `Memory(jev=...)`): Jev's

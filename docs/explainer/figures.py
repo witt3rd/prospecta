@@ -448,7 +448,7 @@ def fusion():
         f.text(hx[5], y + 40, f"{sw:.4f}", 24, 800, ACCENT)
     f.text(0, 462, "score = sum over channels of weight / (60 + rank).  A rank counts for less the lower it sits.", 22, 700, INK, "start")
     f.text(0, 500, f"Equal weights: {eq_order[0]} and {eq_order[1]} nearly tie, and {eq_order[0]} wins.   Weighted: {wt_order[0]} wins.", 22, 400, INK2, "start")
-    f.box(1360, 70, 320, 360, "The weights", ["dense chunks 4", "metadata 3", "BM25 1", "questions 1", "graph 1"], fill="#fff", stroke=ACCENT, tsize=26, bsize=21, pad=20)
+    f.box(1360, 70, 320, 360, "The weights", ["dense chunks 4", "metadata 3", "BM25 1", "questions 1", "graph 0.25"], fill="#fff", stroke=ACCENT, tsize=26, bsize=21, pad=20)
     f.box(1360, 450, 320, 90, None, "k = 60", fill=GREY, stroke=LINE, bsize=22, pad=20, center=True)
     return f
 

@@ -169,7 +169,8 @@ def test_graph_node_cap_and_seed_exclusion(mem):
 
 def test_graph_default_config_enabled_and_configurable():
     names = {c["name"]: c for c in DEFAULT_CHANNEL_CONFIG}
-    assert names["graph"]["enabled"] and names["graph"]["weight"] > 0
+    assert names["graph"]["enabled"] and names["graph"]["weight"] == 0.25
+    assert "node_cap" not in names["graph"]["params"]  # bounded by node_min_rel (0.4), no count
     built = {c.name: c for c in build_channels(DEFAULT_CHANNEL_CONFIG)}
     assert built["graph"].channel.kind == "expand"
     assert list(built) == ["dense_chunk", "question", "meta", "graph"]   # filter then expand last

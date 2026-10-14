@@ -1,5 +1,7 @@
 # Recall stages: rerank, Jev gate, reader and hop
 
+> Channel weights come first: the default `graph` channel weight is 0.25 (owner decision), bounded by `node_min_rel` 0.4. See graph-links.md and limits.md.
+
 After the channels fuse (`banks.channel_config`), a bank can run more stages,
 all configured by `banks.recall_config` (migration 0009; `{}` = none, recall is
 unchanged). Set it with `Memory.set_recall_config(...)`.
