@@ -28,7 +28,8 @@ def _db_name(url):
 
 
 class Counter:
-    """Counts the server's open connections to the test database (not its own)."""
+    """Counts the server's open client connections to the test database (not its
+    own; autovacuum workers show the same datname and are not ours)."""
 
     def __init__(self, url):
         self._c = psycopg.connect(url, autocommit=True)
@@ -39,7 +40,7 @@ class Counter:
 
     def now(self):
         return self._c.execute(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND backend_type = 'client backend' AND pid <> pg_backend_pid()",
             (self._name,)).fetchone()[0]
 
     def _run(self):

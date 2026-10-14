@@ -247,11 +247,15 @@ def test_same_document_is_linked_once_under_the_advisory_lock(mem):
 
 def test_one_memory_shared_by_threads_uses_a_connection_per_thread(mem):
     seen = []
+    # hold all four at once: a thread that finishes early would hand its
+    # connection to the next one, and the ids would repeat
+    barrier = threading.Barrier(4, timeout=10)
 
     def grab(_):
         with mem._pool.connection() as c:
             seen.append(id(c))
             c.execute("SELECT 1")
+            barrier.wait()
     assert _run_threads(grab, range(4)) == []
     assert len(set(seen)) == 4
 
