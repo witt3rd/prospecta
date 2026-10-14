@@ -336,3 +336,85 @@ def test_absent_allow_filter_changes_nothing(env):
         [GARDEN], metadata_filter={"_allow": {"audience_key": ["team-a", "team-b", ""]}})]
     assert allowed == ref
     assert _channel_docs(mem, GARDEN, None) == _channel_docs(mem, GARDEN, {})
+
+
+def _rec(svc, refs):
+    return svc.reconcile({"references": refs})
+
+
+def test_reconcile_present_unchanged_absent_deleted_and_repeat(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    _note(url, 1)
+    _note(url, 2, gone="2026-02-01")
+    r = _rec(svc, [{"kind": "note", "record_id": "1"}])
+    assert (r["indexed"], r["unchanged"], r["removed"], r["unreadable"]) == (1, 0, 0, [])
+    r = _rec(svc, [{"kind": "note", "record_id": "1"}])          # repeat: unchanged
+    assert (r["indexed"], r["unchanged"], r["removed"]) == (0, 1, 0)
+    _note(url, 1, rev=2, body="Changed text about rivers.")      # present and changed
+    r = _rec(svc, [{"kind": "note", "record_id": "1"}])
+    assert r["indexed"] == 1 and {rv for _, rv in _items(url, "1")} == {"2"}
+    r = _rec(svc, [{"kind": "note", "record_id": "2"}, {"kind": "note", "record_id": "99"}])
+    assert (r["indexed"], r["removed"], r["absent"]) == (0, 0, 2)  # deleted/absent, never indexed
+    _q(url, "UPDATE host_app.notes SET gone = now() WHERE id = 1")   # deleted marker
+    r = _rec(svc, [{"kind": "note", "record_id": "1"}])
+    assert r["removed"] == 1 and _items(url, "1") == []
+    assert _rec(svc, [{"kind": "note", "record_id": "1"}])["removed"] == 0   # repeat
+    _note(url, 3)
+    _rec(svc, [{"kind": "note", "record_id": "3"}])
+    _q(url, "DELETE FROM host_app.notes WHERE id = 3")               # row absent
+    assert _rec(svc, [{"kind": "note", "record_id": "3"}])["removed"] == 1
+    assert _items(url, "3") == []
+
+
+def test_reconcile_unreadable_and_validation(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    r = _rec(svc, [{"kind": "note"}, {"kind": "note", "record_id": "7"}])
+    assert len(r["unreadable"]) == 1 and r["absent"] == 1
+    from prospecta.service import ApiError
+    with pytest.raises(ApiError):
+        svc.reconcile({"references": []})
+
+
+def test_reconcile_accepts_thousands_of_references(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    _note(url, 1)
+    refs = [{"kind": "note", "record_id": "1"}] + [
+        {"kind": "note", "record_id": str(1000 + i)} for i in range(1999)]
+    r = _rec(svc, refs)
+    total = r["indexed"] + r["unchanged"] + r["removed"] + r["absent"] + len(r["unreadable"])
+    assert total == 2000 and r["indexed"] == 1 and r["absent"] == 1999
+
+
+def test_reconcile_document_scope_replaces_pieces(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    ref = {"kind": "note", "project": "p1", "title": "T"}
+    _note(url, 1, body="Piece one about gardens.")
+    _note(url, 2, body="Piece two about tea.")
+    _note(url, 5, proj="other", body="Elsewhere.")
+    r = _rec(svc, [ref])
+    assert r["indexed"] == 1
+    assert _q(url, "SELECT count(*) FROM prospecta_shared.source_refs")[0][0] == 1
+    assert _rec(svc, [ref])["unchanged"] == 1                      # repeat
+    rid = _q(url, "SELECT record_id FROM prospecta_shared.source_refs")[0][0]
+    def texts():
+        return " ".join(c for (c,) in _q(url, "SELECT content FROM prospecta_shared.memory_items "
+                                              "WHERE kind='chunk' AND metadata->>'record_id' = %s", rid))
+    assert "gardens" in texts() and "tea" in texts() and "Elsewhere" not in texts()
+    _note(url, 2, rev=2, body="Piece two now about rivers.")        # one piece changes
+    assert _rec(svc, [ref])["indexed"] == 1
+    assert "rivers" in texts() and "tea" not in texts() and "gardens" in texts()
+    _q(url, "UPDATE host_app.notes SET gone = now() WHERE id = 1")  # a piece is deleted
+    assert _rec(svc, [ref])["indexed"] == 1
+    assert "gardens" not in texts() and "rivers" in texts()
+    _q(url, "UPDATE host_app.notes SET gone = now() WHERE id = 2")  # none left
+    assert _rec(svc, [ref])["removed"] == 1
+    assert _q(url, "SELECT count(*) FROM prospecta_shared.source_refs")[0][0] == 0
+    _note(url, 5, proj="p1", aud="team-b")                          # mixed audiences
+    _note(url, 6, proj="p1", aud="team-a")
+    _q(url, "UPDATE host_app.notes SET title='M' WHERE id IN (5,6)")
+    r = _rec(svc, [{"kind": "note", "project": "p1", "title": "M"}])
+    assert r["indexed"] == 0 and len(r["unreadable"]) == 1
