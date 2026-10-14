@@ -123,10 +123,10 @@ Prospecta cannot read (malformed, or a view error) is listed under `unreadable`
 with the reason and does not stop the others. Repeating a call changes nothing
 once the first has been applied.
 
-References are processed on a bounded pool of worker threads, each with its own
-database connection (chunking, the anticipated-question model call, embedding
+References are processed on a bounded pool of worker threads that borrow from the
+service's shared connection pool (chunking, the anticipated-question model call, embedding
 and writes all run in the worker). The size is `PROSPECTA_INDEX_CONCURRENCY`
-(default 8); a request may lower or raise it with `"concurrency"` (1..32, else
+(default 8, and never more than the connection pool's size); a request may lower or raise it with `"concurrency"` (1..32, else
 400). Extra references wait in a queue; none is refused. Results are the same as
 a sequential run (same counts, same `unreadable` list in request order, same
 derived items). One record is only ever indexed by one worker at a time (a
@@ -161,3 +161,20 @@ docker build -t prospecta-service .
 docker run -p 8080:8080 -e DATABASE_URL=... -e PROSPECTA_SCHEMA=prospecta \
   -e PROSPECTA_SOURCE_SCHEMA=host_views -e PROSPECTA_SERVICE_TOKEN=... prospecta-service
 ```
+
+## Database connections
+
+The service holds one bounded connection pool for the whole process. Every
+request (and every indexing worker) borrows a connection for the length of its
+work and returns it, on success or error; no thread keeps one. A request that
+finds none free waits, up to `PROSPECTA_REQUEST_TIMEOUT` seconds (default 30),
+then gets `503`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROSPECTA_DB_POOL_MAX` | 10 | most connections the process opens |
+| `PROSPECTA_DB_POOL_IDLE_SECONDS` | 60 | an idle connection is closed after this |
+| `PROSPECTA_REQUEST_TIMEOUT` | 30 | seconds a request waits for a connection |
+
+When 70 percent of the pool is in use the service logs one warning line naming
+the pool size and the count in use, at most once a minute.

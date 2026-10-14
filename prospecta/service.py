@@ -16,6 +16,9 @@ Endpoints (JSON):
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
 PROSPECTA_SOURCE_SCHEMA / PROSPECTA_SOURCE_VIEWS (the source contract),
 PROSPECTA_INDEX_CONCURRENCY (worker threads for reconcile/reindex, default 8, max 32),
+PROSPECTA_DB_POOL_MAX (the one shared connection pool, default 10),
+PROSPECTA_DB_POOL_IDLE_SECONDS (close an idle connection after this, default 60),
+PROSPECTA_REQUEST_TIMEOUT (seconds a request waits for a connection, default 30),
 PROSPECTA_BANK (default "prospecta"), PROSPECTA_SERVICE_HOST (127.0.0.1),
 PROSPECTA_SERVICE_PORT (8080), PROSPECTA_SERVICE_TOKEN (bearer token; required
 to bind a non-loopback address), plus the usual embedder/LLM settings.
@@ -30,6 +33,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from prospecta.db.pool import PoolTimeout
 from prospecta.source import MAX_INDEX_CONCURRENCY, SourceConfig, SourceContractError, SourceIndexer
 
 logger = logging.getLogger("prospecta.service")
@@ -186,6 +190,9 @@ def make_handler(service: Service, token: str | None):
                 raise ApiError(404, "not found")
             except ApiError as e:
                 self._send(e.status, {"error": e.message})
+            except PoolTimeout as e:
+                logger.warning("request waited too long for a database connection: %s", e)
+                self._send(503, {"error": "database busy, try again"})
             except Exception:
                 logger.exception("request failed")
                 self._send(500, {"error": "internal error"})
@@ -197,6 +204,14 @@ def make_handler(service: Service, token: str | None):
             self._handle("POST")
 
     return Handler
+
+
+class Server(ThreadingHTTPServer):
+    """One thread per request; none of them keeps a database connection (they
+    borrow from the shared pool). A deep accept backlog so a burst of clients
+    queues in the kernel instead of being reset."""
+    request_queue_size = 512
+    daemon_threads = True
 
 
 def build_service() -> tuple[Service, str | None]:
@@ -236,7 +251,7 @@ def main() -> int:
         print("refusing to listen on a non-loopback address without PROSPECTA_SERVICE_TOKEN",
               file=sys.stderr)
         return 2
-    srv = ThreadingHTTPServer((host, port), make_handler(service, token))
+    srv = Server((host, port), make_handler(service, token))
     logger.info("prospecta service on %s:%s", host, port)
     try:
         srv.serve_forever()

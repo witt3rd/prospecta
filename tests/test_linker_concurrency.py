@@ -40,7 +40,7 @@ def test_link_runs_on_a_dedicated_connection(mem):
     mem._linker = Spy(llm=EntityLLM())
     d = next(iter(docs(mem).values()))
     mem.link_document(d)
-    assert seen[0] is not mem._pool._conn and seen[0].closed
+    assert mem._pool.in_use == 0          # borrowed from the shared pool, returned after
 
 
 def test_concurrent_linkers_all_link_without_errors(fresh_db):
