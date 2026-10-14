@@ -418,3 +418,134 @@ def test_reconcile_document_scope_replaces_pieces(env):
     _q(url, "UPDATE host_app.notes SET title='M' WHERE id IN (5,6)")
     r = _rec(svc, [{"kind": "note", "project": "p1", "title": "M"}])
     assert r["indexed"] == 0 and len(r["unreadable"]) == 1
+
+
+# -- concurrent indexing ----------------------------------------------------
+import time  # noqa: E402
+
+N_FAKE = 300
+LLM_DELAY = 0.02   # stands in for the anticipated-question model call
+
+
+def _slow_llm(messages, **k):
+    text = json.dumps(messages)
+    if "EXPLODE" in text:
+        raise RuntimeError("model failed")
+    time.sleep(LLM_DELAY)
+    return "What is the first thing?\nWhy does the second thing matter?"
+
+
+def _fake_records(url, n=N_FAKE, bad=()):
+    with psycopg.connect(url, autocommit=True) as c:
+        for i in range(n):
+            body = f"Record {i} about topic {i % 7}.\n\nSecond paragraph {i}."
+            if i in bad:
+                body += " EXPLODE"
+            c.execute("INSERT INTO host_app.notes VALUES (%s,1,'T',%s,'ann','p1','2026-01-02','team-a',%s)",
+                      (i, body, "2026-02-01" if i % 50 == 49 else None))
+
+
+def _indexer(url, bank, llm=_slow_llm, concurrency=1):
+    mem = Memory(database_url=url, bank_id=bank, embed=stub_embed, llm=llm,
+                 schema="prospecta_shared")
+    mem.create_bank(bank, embedding_dim=EMBED_DIM)
+    return mem, SourceIndexer(mem, SourceConfig("host_app", ("records",)), concurrency)
+
+
+def _snapshot(url, bank):
+    return _q(url, "SELECT metadata->>'record_id', kind, content, ordinal FROM "
+                   "prospecta_shared.memory_items WHERE bank_id = %s ORDER BY 1,2,3,4", bank)
+
+
+def _refs(n=N_FAKE, extra=()):
+    return [{"kind": "note", "record_id": str(i)} for i in range(n)] + list(extra)
+
+
+def test_concurrent_reconcile_matches_sequential_and_is_faster(env):
+    url, mem, ix = env
+    _fake_records(url, bad={13, 200})
+    refs = _refs(extra=[{"kind": "note"}, {"kind": "note", "record_id": "9999"}])
+    mem1, ix1 = _indexer(url, "b1")
+    mem2, ix2 = _indexer(url, "b8")
+    try:
+        t = time.perf_counter(); seq = Service(mem1, ix1).reconcile({"references": refs, "concurrency": 1})
+        t_seq = time.perf_counter() - t
+        t = time.perf_counter(); par = Service(mem2, ix2).reconcile({"references": refs, "concurrency": 8})
+        t_par = time.perf_counter() - t
+        print(f"\nreconcile {N_FAKE} records: concurrency 1 {t_seq:.2f}s, 8 {t_par:.2f}s, "
+              f"speedup {t_seq / t_par:.1f}x")
+        assert par == seq
+        assert seq["indexed"] == N_FAKE - 2 - 6 and seq["absent"] == 7 and len(seq["unreadable"]) == 3
+        assert [u["error"] for u in seq["unreadable"][:2]] == ["model failed"] * 2
+        snap = _snapshot(url, "b1")
+        assert snap and snap == _snapshot(url, "b8")
+        assert t_par < t_seq
+    finally:
+        mem1.close()
+        mem2.close()
+
+
+def test_overlapping_requests_for_same_records(env):
+    url, mem, ix = env
+    _fake_records(url, n=60)
+    mem2, ix2 = _indexer(url, "b")       # same bank, own Memory: a second "request"
+    try:
+        refs = _refs(60)
+        out = {}
+
+        def go(name, svc):
+            out[name] = svc.reconcile({"references": refs, "concurrency": 8})
+        ts = [threading.Thread(target=go, args=("a", Service(mem, ix))),
+              threading.Thread(target=go, args=("b", Service(mem2, ix2)))]
+        [t.start() for t in ts]; [t.join(60) for t in ts]
+        assert not any(t.is_alive() for t in ts), "deadlock"
+        assert out["a"]["unreadable"] == [] and out["b"]["unreadable"] == []
+        assert out["a"]["indexed"] + out["b"]["indexed"] == 59   # record 49 is deleted in the view
+        assert out["a"]["unchanged"] + out["b"]["unchanged"] == 59
+        assert _q(url, "SELECT count(*) FROM prospecta_shared.documents")[0][0] == 59
+        assert _q(url, "SELECT count(*) FROM prospecta_shared.source_refs")[0][0] == 59
+        per = _q(url, "SELECT count(*) FROM prospecta_shared.memory_items GROUP BY "
+                      "metadata->>'record_id'")
+        assert len(per) == 59 and len({p[0] for p in per}) == 1
+    finally:
+        mem2.close()
+
+
+def test_one_failing_record_does_not_stop_others(env):
+    url, mem, ix = env
+    _fake_records(url, n=40, bad={5})
+    mem, ix = _indexer(url, "bf")
+    r = Service(mem, ix).reconcile({"references": _refs(40), "concurrency": 8})
+    assert r["indexed"] == 39 and len(r["unreadable"]) == 1
+    assert r["unreadable"][0]["reference"] == {"kind": "note", "record_id": "5"}
+    assert _q(url, "SELECT count(*) FROM prospecta_shared.source_refs")[0][0] == 39
+
+
+def test_concurrency_setting_and_limits(env, monkeypatch):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    for bad in (0, 33, "8", True, 1.5):
+        with pytest.raises(Exception, match="concurrency must be"):
+            svc.reconcile({"references": [{"kind": "note", "record_id": "1"}], "concurrency": bad})
+    from prospecta.source import default_concurrency
+    monkeypatch.delenv("PROSPECTA_INDEX_CONCURRENCY", raising=False)
+    assert default_concurrency() == 8
+    monkeypatch.setenv("PROSPECTA_INDEX_CONCURRENCY", "99")
+    assert default_concurrency() == 32
+    monkeypatch.setenv("PROSPECTA_INDEX_CONCURRENCY", "3")
+    assert default_concurrency() == 3
+
+
+def test_concurrent_reindex_matches_sequential(env):
+    url, mem, ix = env
+    _fake_records(url, n=60)
+    mem1, ix = _indexer(url, "b1")
+    mem2, ix2 = _indexer(url, "b8")
+    try:
+        a = ix.reindex_kind("note", 1)
+        b = ix2.reindex_kind("note", 8)
+        assert a == b and a["indexed"] == 59 and a["absent"] == 1
+        assert _snapshot(url, "b1") == _snapshot(url, "b8")
+    finally:
+        mem1.close()
+        mem2.close()

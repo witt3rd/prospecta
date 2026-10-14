@@ -8,13 +8,14 @@ Endpoints (JSON):
                      "audience_key"?,
                      "allowed_audience_keys"?, "allowed_projects"?}
                                           -> ranked results per question
-    POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true}
+    POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true, "concurrency"?}
     POST /remove    {"kind", "record_id"}
-    POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}]}
+    POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}], "concurrency"?}
     GET  /coverage?kind=&project=
 
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
 PROSPECTA_SOURCE_SCHEMA / PROSPECTA_SOURCE_VIEWS (the source contract),
+PROSPECTA_INDEX_CONCURRENCY (worker threads for reconcile/reindex, default 8, max 32),
 PROSPECTA_BANK (default "prospecta"), PROSPECTA_SERVICE_HOST (127.0.0.1),
 PROSPECTA_SERVICE_PORT (8080), PROSPECTA_SERVICE_TOKEN (bearer token; required
 to bind a non-loopback address), plus the usual embedder/LLM settings.
@@ -29,12 +30,11 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from prospecta.source import SourceConfig, SourceContractError, SourceIndexer
+from prospecta.source import MAX_INDEX_CONCURRENCY, SourceConfig, SourceContractError, SourceIndexer
 
 logger = logging.getLogger("prospecta.service")
 MAX_BODY = 1 << 20
 MAX_LIMIT = 100
-RECONCILE_BATCH = 200  # internal batch size; the request itself is unbounded
 
 
 class ApiError(Exception):
@@ -94,11 +94,20 @@ class Service:
             out.append({"question": q, "results": ranked})
         return {"results": out}
 
+    @staticmethod
+    def _concurrency(body: dict) -> int | None:
+        c = body.get("concurrency")
+        if c is None:
+            return None
+        if not isinstance(c, int) or isinstance(c, bool) or not 1 <= c <= MAX_INDEX_CONCURRENCY:
+            raise ApiError(400, f"concurrency must be an integer 1..{MAX_INDEX_CONCURRENCY}")
+        return c
+
     def index(self, body: dict) -> dict:
         ix = self._need_indexer()
         kind = _str(body, "kind")
         if body.get("reindex"):
-            return ix.reindex_kind(kind)
+            return ix.reindex_kind(kind, self._concurrency(body))
         return ix.index_record(kind, _str(body, "record_id")).as_dict()
 
     def remove(self, body: dict) -> dict:
@@ -109,13 +118,7 @@ class Service:
         refs = body.get("references")
         if not isinstance(refs, list) or not refs or not all(isinstance(r, dict) for r in refs):
             raise ApiError(400, "references must be a non-empty list of objects")
-        out = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0, "unreadable": []}
-        for i in range(0, len(refs), RECONCILE_BATCH):
-            part = ix.reconcile(refs[i:i + RECONCILE_BATCH])
-            for k in ("indexed", "unchanged", "removed", "absent"):
-                out[k] += part[k]
-            out["unreadable"].extend(part["unreadable"])
-        return out
+        return ix.reconcile(refs, self._concurrency(body))
 
     def coverage(self, kind: str | None, project: str | None) -> dict:
         return {"coverage": [c.as_dict() for c in self._need_indexer().coverage(kind, project)]}

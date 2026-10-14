@@ -83,6 +83,17 @@ class ConnectionPool:
         finally:
             conn.close()
 
+    def release_thread(self) -> None:
+        """Close the calling thread's connection, if it has one. A short-lived
+        worker thread calls this as it exits so its connection does not linger."""
+        conn = self._conn
+        self._local.conn = None
+        if conn is not None:
+            with self._lock:
+                self._all = [c for c in self._all if c is not conn]
+            if not conn.closed:
+                conn.close()
+
     def close(self) -> None:
         with self._lock:
             conns, self._all = self._all, []
