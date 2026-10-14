@@ -111,7 +111,7 @@ def fetch_entity_notes(conn, bank_id: str, names: list[str],
     hub_names = sorted({n.strip() for n in [*names, *scan] if len(n.strip()) >= MIN_SCAN_CHARS},
                        key=str.casefold)
     hrx = r"\m(?:" + "|".join(re.escape(n) for n in hub_names) + r")\M" if hub_names else ""
-    tsq = " | ".join(f"({' <-> '.join(w for w in re.findall(r'\w+', n.casefold()))})"
+    tsq = " | ".join("(" + " <-> ".join(re.findall(r"\w+", n.casefold())) + ")"
                      for n in scan if re.findall(r"\w+", n)) or ""
     with conn.cursor() as cur:
         cur.execute(_NOTES_SQL, {"bank": bank_id, "names": norms, "ids": ids, "rx": rx, "hrx": hrx,
