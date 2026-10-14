@@ -132,10 +132,11 @@ class SourceIndexer:
 
     def _map(self, fn, items: list, concurrency: int | None) -> list:
         """fn(item) for every item, in order, on up to `concurrency` worker
-        threads. fn must not raise (callers catch per item). Each worker uses
-        its own database connection (the pool keeps one per thread) and closes
-        it on exit. Excess items wait in a queue; none is dropped."""
-        n = min(self._workers(concurrency), len(items))
+        threads. fn must not raise (callers catch per item). Workers create no
+        connections of their own: each borrows from the Memory's shared pool for
+        the length of one item, and their number is capped by that pool's size.
+        Excess items wait in a queue; none is dropped."""
+        n = min(self._workers(concurrency), len(items), self._m._pool.max_size)
         if n <= 1:
             return [fn(i) for i in items]
         todo: queue.SimpleQueue = queue.SimpleQueue()
@@ -154,8 +155,6 @@ class SourceIndexer:
                     out[idx] = fn(item)
             except BaseException as e:  # a bug in fn: stop this worker, report it
                 crashed.append(e)
-            finally:
-                self._m._pool.release_thread()
 
         threads = [threading.Thread(target=work, name=f"prospecta-index-{i}", daemon=True)
                    for i in range(n)]
