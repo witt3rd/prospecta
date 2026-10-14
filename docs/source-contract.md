@@ -117,6 +117,8 @@ config), and each hit gains `channels`: `[{"channel","rank","score","weight"}]` 
 channel that returned it (rank within the channel, the channel's raw score, the fusion
 weight applied). Banks without a channel config use the fixed legacy fusion: `channels_run`
 names its three channels and a hit's `rank` and `weight` are null.
+A question that holds an identifier-shaped token (a file name, a hex id, `ask_...`, `scripts/x.py`) puts the records that hold that token as written first, whatever the other channels ranked (the exact-identifier gate, README "The exact-identifier gate"): in the chunk text or in the record's own `kind:record_id`. With `explain`, such a hit lists `exact` among its `channels` (rank null on a bank with no channel config, `score` = how many of the question's identifiers it holds).
+
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
 | `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |

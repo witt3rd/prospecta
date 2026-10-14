@@ -38,7 +38,7 @@ from prospecta.db.queries import _meta_param
 K1 = 1.5
 B = 0.75
 _ITEM_OVERFETCH = 3
-_FORMAT = 1
+_FORMAT = 2   # 2: tokens with a digit are no longer stemmed (a stored index of 1 is rebuilt)
 
 STOPWORDS = frozenset("""a about above after again against all am an and any are as at be because been
 before being below between both but by can could did do does doing down during each few for from further
@@ -55,8 +55,10 @@ _SUFFIXES = ("ization", "ational", "fulness", "ousness", "iveness", "ations", "i
 
 
 def stem(w: str) -> str:
-    """A light English suffix stripper (enough to match plural/tense variants)."""
-    if len(w) <= 3 or w.isdigit():
+    """A light English suffix stripper (enough to match plural/tense variants).
+    A token with a digit is an id, a number or a code, not a word: it is kept as
+    written (a hex id ending in `ed` or `dd` must not collide with a shorter id)."""
+    if len(w) <= 3 or any(c.isdigit() for c in w):
         return w
     for suf in _SUFFIXES:
         if w.endswith(suf) and len(w) - len(suf) >= 3:

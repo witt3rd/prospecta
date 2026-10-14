@@ -63,7 +63,16 @@ def _explain_query(trace: dict | None, ranked: list[dict]) -> dict:
             r["channels"] = [{"channel": n, "rank": None, "score": float(r["_scores"][n]),
                               "weight": None}
                              for n in LEGACY_CHANNELS if r["_scores"].get(n)]
-        return {"channels_run": list(LEGACY_CHANNELS), "channels_failed": []}
+        run = list(LEGACY_CHANNELS)
+        if any(r["_scores"].get("exact") for r in ranked):
+            # the exact-identifier gate held a document: `score` is how many of the
+            # question's identifiers it holds
+            run.append("exact")
+            for r in ranked:
+                if r["_scores"].get("exact"):
+                    r["channels"].append({"channel": "exact", "rank": None,
+                                          "score": float(r["_scores"]["exact"]), "weight": None})
+        return {"channels_run": run, "channels_failed": []}
     weights = {c["name"]: c["weight"] for c in trace["channels"]}
     by_doc: dict[str, dict[str, tuple[int, float]]] = {}
     for c in trace["candidates"]:

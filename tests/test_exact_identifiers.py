@@ -136,9 +136,9 @@ SHAPES: list[tuple[str, str, str, "callable"]] = [
      lambda i: f"pullrequestreview-54053{i}0"),
     ("ticket number", "ITEM-2001", "Tracked as {t} in the backlog", lambda i: f"ITEM-20{i}2"),
     ("dated file", "e3h-k1-20261003.md", "Notes live in logs/{t} for that run",
-     lambda i: f"e3h-k1-2026100{i}.md"),
+     lambda i: f"e3h-k1-2026110{i}.md"),
     ("whole path", "experiments/position-20261008.md", "Result written to {t}",
-     lambda i: f"experiments/position-2026100{i}.md"),
+     lambda i: f"experiments/position-2026110{i}.md"),
     ("dotted name", "arm.prefill_parts", "Call {t}() once per batch", lambda i: f"arm.prefill_part{i}"),
     ("short hex", "415c8e0acd", "Fixed in commit {t} on main", lambda i: _hex(i, 10)),
     ("hyphen words", "mechanism-relocates-upward", "The {t} effect shows up late",
@@ -150,13 +150,18 @@ for n, (shape, token, frame, decoy) in enumerate(SHAPES):
     _add("passage", f"pass_{n}_target", f"docs/shape-{n}-t.md", frame.format(t=token) + "." + EXTRA)
     TARGET[token] = f"pass_{n}_target"
 
+# The identifier as the tail of a longer word is not the identifier.
+_add("passage", "pass_reloader", "docs/reloader.md", "Edit frameworks/core/reloader.py before release.")
+
 # A token that is in too many records to be an identifier of one of them.
 for i in range(60):
     _add("note", f"note_c{i}", f"Nightly {i}", f"Nightly batch {i} wrote nightly-batch-77 to the log.")
 
-# Two identifiers in one record, and an identifier in another audience.
-_add("passage", "pass_both", "docs/both.md",
-     "Use scripts/audit-ledger.py on /srv/tower-4242/compose.yml after the move." + EXTRA)
+# Two identifiers: one record holds one, another the other, a third both.
+_add("passage", "pass_zone", "docs/zone.md", "The relay sits in zone-5150 and is checked weekly." + EXTRA)
+_add("passage", "pass_port", "docs/port.md", "The relay listens on gate-8080 and is checked weekly." + EXTRA)
+_add("passage", "pass_both", "docs/both.md", "Move the relay from zone-5150 to gate-8080." + EXTRA)
+# An identifier in another audience.
 _add("note", "note_other_team", "Plan", "The plan is kept as vault-plan-8812 for the other team.",
      aud="team-b")
 
@@ -289,9 +294,9 @@ def test_a_token_in_too_many_records_is_not_an_identifier(env, monkeypatch):
 
 def test_two_identifiers_rank_the_record_with_both_first(env):
     svc, _ = env
-    ids = _ids(svc, "audit-ledger.py in /srv/tower-4242", limit=5)
-    assert ids[0] == "pass_both"
-    assert set(ids[1:3]) == {"pass_target_stack", "pass_target_audit"}
+    ids = _ids(svc, "move it from zone-5150 to gate-8080", limit=5)
+    assert ids[0] == "pass_both" and set(ids[1:3]) == {"pass_zone", "pass_port"}
+    assert _ids(svc, "zone-5150")[0] in {"pass_zone", "pass_both"}
 
 
 def test_an_identifier_in_another_audience_is_never_returned(env):
@@ -300,6 +305,32 @@ def test_an_identifier_in_another_audience_is_never_returned(env):
     assert "note_other_team" not in _ids(svc, "vault-plan-8812", limit=100, audience=("team-a", "team-c"))
     assert _ids(svc, "vault-plan-8812", audience=("team-b",))[0] == "note_other_team"
     assert _ids(svc, "vault-plan-8812", audience=()) == []
+
+
+def test_a_longer_word_is_not_the_identifier_and_case_does_not_matter(env):
+    svc, _ = env
+    from prospecta import _exact
+    with psycopg.connect(svc.memory.database_url) as conn:
+        conn.execute(f'SET search_path = "{SCHEMA}", public')
+        loader = _exact.find_exact(conn, "b", "loader.py")
+        assert [h.source for h in loader] == ["passage:pass_1_target"]       # not reloader.py
+        assert [h.source for h in _exact.find_exact(conn, "b", "ITEM-2001")] == \
+            [h.source for h in _exact.find_exact(conn, "b", "item-2001")] == ["passage:pass_4_target"]
+
+
+def test_a_failing_lookup_never_sinks_the_recall(env, monkeypatch, caplog):
+    svc, _ = env
+    from prospecta import _exact
+    real = _exact._find
+
+    def boom(*a, **k):
+        raise RuntimeError("no table")
+    monkeypatch.setattr(_exact, "_find", boom)
+    broken = _hits(svc, "tower-4242", limit=5)
+    assert "exact-identifier lookup failed" in caplog.text
+    monkeypatch.setattr(_exact, "_find", real)
+    _gate_off(monkeypatch)
+    assert broken == _hits(svc, "tower-4242", limit=5)           # the other legs answered as they do
 
 
 def test_the_record_id_alone_is_enough(env):

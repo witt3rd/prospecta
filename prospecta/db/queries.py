@@ -702,6 +702,8 @@ def delete_documents_by_source(
 # term to match (AND semantics) and ts_rank_cd is cover-density rank, not
 # BM25 (no IDF, no length normalisation). The safety net therefore fires
 # on short queries only; long natural-language questions rarely match.
+# An identifier (a file name, an id) is not read by these legs the way it was
+# written: see prospecta._exact, the gate that puts the documents holding one first.
 HYBRID_SQL = """
 WITH
   semantic AS (
@@ -820,6 +822,19 @@ WHERE m.bank_id = %(bank_id)s
             (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
 ORDER BY lex_score DESC
 LIMIT %(limit)s
+"""
+
+
+# The metadata filter and the allowed-audience rule as one SQL fragment on
+# `memory_items m`, parameter `%(meta)s` (see `_meta_param`). The queries above
+# carry the same text inline; new queries use this one.
+META_FILTER_SQL = """
+  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
+  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
+            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
 """
 
 

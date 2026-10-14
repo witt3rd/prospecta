@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
@@ -24,6 +25,7 @@ from prospecta.channels import (
     QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
     run_channels, scope_members,
 )
+from prospecta import _exact
 from prospecta._ignore import should_ignore
 from prospecta._filters import filter_fields
 from prospecta._parser import parse_frontmatter
@@ -573,6 +575,9 @@ def search(
                 rrf_k=rrf_k,
                 metadata_filter=metadata_filter,
             )
+            # An identifier in the question (a file name, an id) comes back first.
+            rows = _exact.promote_rows(
+                rows, _exact.find_exact(conn, bank_id, text, metadata_filter))[:limit]
         return [_row_to_recalled(r, bank_id, mode="hybrid") for r in rows]
 
     if mode == "semantic":
@@ -643,6 +648,10 @@ def _search_channels(
         fused, tr = run_channels(
             state, plan, config, k=rrf_k,
         )
+        exact_ran = bool(_exact.identifier_tokens(text))
+        t_exact = time.monotonic()
+        exact_hits = _exact.find_exact(conn, bank_id, text, metadata_filter) if exact_ran else []
+        exact_ms = int((time.monotonic() - t_exact) * 1000)
         if recall_cfg is None:
             recall_cfg = read_recall_config(conn, bank_id)
         if recall_cfg:
@@ -670,6 +679,14 @@ def _search_channels(
             fused = promote_scope(fused, members, float(
                 (meta_cfg.get("params") or {}).get("promote_weight", DEFAULT_PROMOTE_WEIGHT)))
             tr["fusion"]["scope_promoted"] = [m.document_id for m in members]
+    if exact_ran:
+        # The exact-identifier gate (prospecta._exact): the documents that hold an
+        # identifier of the question go first, whatever the channels ranked.
+        fused = _exact.promote_fused(fused, exact_hits)
+        tr["fusion"]["exact_promoted"] = [h.document_id for h in exact_hits]
+        channel, cands = _exact.trace_entries(exact_hits, exact_ms)
+        tr["channels"].append(channel)
+        tr["candidates"].extend(cands)
     if trace is not None:
         trace.append(tr)
     channel_names = [c["name"] for c in tr["channels"]]
@@ -713,13 +730,14 @@ def _row_to_recalled(row: dict, bank_id: str, *, mode: str) -> RecalledMemory:
     return _make_recalled(
         row, bank_id,
         sem_score=sem, lex_score=lex_c, lex_body_score=lex_b, rrf=rrf,
+        exact=row.get("exact"), gate_boost=float(row.get("gate_boost") or 0.0),
     )
 
 
 def _make_recalled(
     row: dict, bank_id: str,
     *, sem_score: float, lex_score: float, lex_body_score: float = 0.0,
-    rrf: float,
+    rrf: float, exact: float | None = None, gate_boost: float = 0.0,
 ) -> RecalledMemory:
     # Per option γ (T19): preserve `lexical` as lexical_content alias for
     # backward compatibility. New key `lexical_body` exposes the body channel
@@ -730,11 +748,16 @@ def _make_recalled(
         "lexical_body": float(lex_body_score),
         "rrf": float(rrf),
     }
+    if exact:
+        # The exact-identifier gate held this document: `exact` is how many of the
+        # question's identifiers it holds; the score carries the boost that puts it
+        # first, `rrf` stays the fused score of the legs.
+        scores["exact"] = float(exact)
     return RecalledMemory(
         content=row["content"],
         original_chunk=row["original_chunk"],
         source=row.get("source") or "",
-        score=float(rrf),
+        score=float(rrf) + gate_boost,
         scores=scores,
         metadata=row.get("metadata") or {},
         bank_id=bank_id,

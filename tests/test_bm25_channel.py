@@ -213,3 +213,19 @@ def test_the_index_finds_an_id_inside_a_file_name():
                            ("b", "deliverable-0c4e8d1a9b27.pr")])
     assert idx.search("deliverable-7f3a91c04b2e", 5)[0][0] == "a"
     assert [i for i, _ in idx.search("7f3a91c04b2e", 5)] == ["a"]
+
+
+def test_an_index_stored_before_the_stemming_change_is_rebuilt(mem, tmp_path):
+    import gzip
+    import json
+    d = tmp_path / "old"
+    be = InProcessBm25(d)
+    with psycopg.connect(mem.database_url) as conn:
+        be.search(conn, "b", "revenue", 5)
+        path = d / "b.bm25.json.gz"
+        blob = json.loads(gzip.open(path, "rt", encoding="utf-8").read())
+        blob["index"]["format"] = 1                       # as an older version stored it
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(blob, f)
+        fresh = InProcessBm25(d)
+        assert fresh.search(conn, "b", "revenue", 5) and fresh.builds == 1

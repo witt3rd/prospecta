@@ -224,6 +224,10 @@ Prospecta is the spine + the safety net. Not the universal answer; a specific be
 
 Three channels, fused via Reciprocal Rank Fusion (k=60 default, configurable per call). The spine carries when it works; the safety net carries when it doesn't.
 
+### The exact-identifier gate
+
+None of the channels is made for an identifier. A dense embedder reads `deliverable-7f3a91c04b2e` as noise; Postgres full text parses a file name (`deliverable-7f3a91c04b2e.pr`), a path (`scripts/audit-ledger.py`) or a link as ONE token that the same text typed alone never equals; and a record's own id lives in `documents.source` and the item metadata, in no text. So a question holding a token SHAPED like an identifier (letters mixed with digits, or pieces joined by `- _ . : / @ # +`) also looks for that token as written (case-insensitive, no alphanumeric on either side) in the chunk text and in `documents.source`, under the same metadata filter and allowed-audience rule, in both the three-channel recall and a configured channel bank. The documents that hold it come first, those holding more of the question's identifiers before fewer, each group in the order the channels gave; everything else follows unchanged. A token found in more than 50 documents is not an identifier of any and is ignored; a question with no such token is untouched. A promoted hit's `scores` gain `exact` (how many identifiers it holds), `/lookup` with `explain` lists `exact` among its channels, and `prospecta._exact` holds the code. Cost: a substring scan of the bank per token (about 0.2 s for 200 000 items, at most 4 tokens); a trigram index would remove it but needs an extension that shared-database mode never creates. `scripts/exact_check.py` checks tokens against a live bank read-only (what the gate finds, next to what the full-text legs find).
+
 ---
 
 ### Configurable channels (v0.2, opt-in per bank)
