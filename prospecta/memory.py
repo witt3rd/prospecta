@@ -489,8 +489,12 @@ class Memory:
         metadata_filter: dict | None = None,
         rrf_k: int = 60,
         depth: "Literal['standard','deep'] | None" = None,
+        _trace: "list[dict] | None" = None,
     ) -> "list[RecalledMemory]":
         """Run retrieval for multiple queries; return FLAT list[RecalledMemory].
+
+        `_trace`, when given, receives the per-query channel traces (empty for
+        banks on the legacy path), so a caller can explain the hits.
 
         `depth` ('standard' | 'deep'; None = the bank's recall_config.depth,
         else 'standard') sets the rerank pool cut: 0.15 vs 0.05 x the best fused
@@ -528,6 +532,8 @@ class Memory:
             flat.extend(results)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
         self._emit_stage_calls(traces)
+        if _trace is not None:
+            _trace.extend(traces)
 
         if self._shadow_bank_id is None:
             try:
