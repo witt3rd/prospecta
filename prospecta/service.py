@@ -10,6 +10,7 @@ Endpoints (JSON):
                                           -> ranked results per question
     POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true}
     POST /remove    {"kind", "record_id"}
+    POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}]}
     GET  /coverage?kind=&project=
 
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
@@ -102,6 +103,15 @@ class Service:
     def remove(self, body: dict) -> dict:
         return self._need_indexer().remove_record(_str(body, "kind"), _str(body, "record_id")).as_dict()
 
+    def reconcile(self, body: dict) -> dict:
+        ix = self._need_indexer()
+        refs = body.get("references")
+        if not isinstance(refs, list) or not refs or not all(isinstance(r, dict) for r in refs):
+            raise ApiError(400, "references must be a non-empty list of objects")
+        if len(refs) > 500:
+            raise ApiError(400, "at most 500 references per call")
+        return ix.reconcile(refs)
+
     def coverage(self, kind: str | None, project: str | None) -> dict:
         return {"coverage": [c.as_dict() for c in self._need_indexer().coverage(kind, project)]}
 
@@ -159,6 +169,8 @@ def make_handler(service: Service, token: str | None):
                     return self._send(200, service.index(body))
                 if route == ("POST", "/remove"):
                     return self._send(200, service.remove(body))
+                if route == ("POST", "/reconcile"):
+                    return self._send(200, service.reconcile(body))
                 if route == ("GET", "/coverage"):
                     q = parse_qs(parts.query)
                     return self._send(200, service.coverage(

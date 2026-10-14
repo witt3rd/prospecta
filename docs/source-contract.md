@@ -93,6 +93,8 @@ All idempotent; they take the record's reference, never its text.
   deleted or gone from the view -> retired (`removed`, or `absent` if never indexed).
 - `reindex_kind(kind)`: runs the above for every record of the kind in the views and for every record Prospecta holds.
 - `remove_record(kind, record_id)`: retire now.
+- `reconcile(references)`: for each reference, re-read the views and apply the
+  rules of `index_record`; see "Reconcile" below.
 - `coverage(kind=None, project=None)`: one entry per (kind, project) with `live`,
   `indexed`, and lists of exact references: `missing` (live in the view, nothing
   derived), `stale` (derived revision differs from the view's), `orphaned`
@@ -108,7 +110,31 @@ All idempotent; they take the record's reference, never its text.
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
+| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}]}` (1..500) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
 | `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
+
+### Reconcile
+
+`POST /reconcile` takes references and makes Prospecta match the views for each:
+present and changed -> indexed; same revision -> left alone (`unchanged`);
+row absent or `deleted_at` set -> its derived items are retired (`removed`;
+`absent` when nothing was ever indexed). Counts are per reference. A reference
+Prospecta cannot read (malformed, or a view error) is listed under `unreadable`
+with the reason and does not stop the others. Repeating a call changes nothing
+once the first has been applied.
+
+A reference is `{kind, record_id}` (one record) or `{kind, project, title}`
+(document scope): every live row of that kind, project and title is one
+document. Its text is the rows' texts joined in (`created_date`, `record_id`)
+order, and its revision is a hash of the rows' (`record_id`, `revision`) pairs,
+so adding, removing or changing any piece re-derives the whole document and
+the new set of pieces replaces the stored set. Deleted rows do not count as
+pieces; when none is left the document is retired. It is kept under the record id
+`doc:` + JSON `[project, title]`, which is what `/lookup` and `/coverage` show.
+Rows of one document must share an `audience_key`; if they differ the reference
+is `unreadable` and nothing changes. Document scope reads `person` only when all
+rows agree, and `created_date` is the earliest. `/coverage` does not know
+document scope and lists its anchor as `orphaned`.
 
 Environment: `DATABASE_URL`, `PROSPECTA_SCHEMA`, `PROSPECTA_SOURCE_SCHEMA`,
 `PROSPECTA_SOURCE_VIEWS`, `PROSPECTA_BANK` (default `prospecta`),

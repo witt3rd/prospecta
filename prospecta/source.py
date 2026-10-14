@@ -145,12 +145,21 @@ class SourceIndexer:
 
     # -- index one --------------------------------------------------------
     def index_record(self, kind: str, record_id: str) -> IndexResult:
+        return self._sync(kind, record_id, lambda conn: self._fetch(conn, kind, record_id))
+
+    def _sync(self, kind: str, record_id: str, load) -> IndexResult:
+        """Bring one reference in line with the view; `load(conn)` returns the
+        record to index, or None when there is none."""
         m = self._m
         bank = m._default_bank_id
         with m._pool.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                          (f"source:{bank}:{kind}:{record_id}",))
-            rec = self._fetch(conn, kind, record_id)
+            try:
+                rec = load(conn)
+            except Exception:
+                conn.rollback()
+                raise
             ref = conn.execute(
                 "SELECT revision, document_id FROM source_refs "
                 "WHERE bank_id = %s AND kind = %s AND record_id = %s",
@@ -175,6 +184,54 @@ class SourceIndexer:
             conn.commit()
         m._enqueue_link(doc_id)
         return IndexResult(kind, record_id, "indexed", revision, len(items))
+
+    # -- document scope / reconcile ----------------------------------------
+    def _fetch_document(self, conn, kind: str, project: str, title: str) -> dict | None:
+        """Every live row of `kind` in `project` with `title`, as one record.
+        Its text is the rows' texts in (created_date, record_id) order; its
+        revision is a hash of the rows' (record_id, revision) pairs, so any
+        piece added, removed or changed moves it. None when no live row remains."""
+        sql = (f"SELECT * FROM ({self.config.union_sql()}) s WHERE kind = %s "
+               "AND project IS NOT DISTINCT FROM %s AND title IS NOT DISTINCT FROM %s "
+               "AND deleted_at IS NULL")
+        rows = [dict(zip(SOURCE_COLUMNS, r)) for r in conn.execute(sql, (kind, project, title))]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: (r["created_date"] is None, r["created_date"], r["record_id"]))
+        if len({r["audience_key"] or "" for r in rows}) > 1:
+            raise ValueError("pieces of one document have different audience keys")
+        people = {r["person"] for r in rows}
+        dates = [r["created_date"] for r in rows if r["created_date"]]
+        rev = hashlib.sha256(json.dumps([[r["record_id"], r["revision"]] for r in rows]).encode()).hexdigest()
+        return {"kind": kind, "record_id": document_record_id(project, title), "revision": rev,
+                "title": title, "text": "\n\n".join((r["text"] or "").strip() for r in rows),
+                "person": people.pop() if len(people) == 1 else None, "project": project,
+                "created_date": min(dates) if dates else None,
+                "audience_key": rows[0]["audience_key"], "deleted_at": None}
+
+    def reconcile(self, refs: list[dict]) -> dict:
+        """Re-read the views for each reference ({kind, record_id} or
+        {kind, project, title}) and index, leave or retire it. Idempotent."""
+        counts = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0}
+        unreadable: list[dict] = []
+        for ref in refs:
+            try:
+                kind = ref.get("kind") if isinstance(ref, dict) else None
+                if not isinstance(kind, str) or not kind:
+                    raise ValueError("kind is required (string)")
+                if isinstance(ref.get("record_id"), str) and ref["record_id"]:
+                    res = self.index_record(kind, ref["record_id"])
+                elif isinstance(ref.get("project"), str) and isinstance(ref.get("title"), str):
+                    project, title = ref["project"], ref["title"]
+                    res = self._sync(kind, document_record_id(project, title),
+                                     lambda conn: self._fetch_document(conn, kind, project, title))
+                else:
+                    raise ValueError("reference needs record_id, or project and title")
+                counts[res.status] += 1
+            except Exception as e:
+                logger.warning("reconcile: cannot read %r: %s", ref, e)
+                unreadable.append({"reference": ref, "error": str(e)})
+        return {**counts, "unreadable": unreadable}
 
     def _build_items(self, rec: dict) -> list[dict]:
         m = self._m
@@ -317,6 +374,11 @@ class SourceIndexer:
         if kind and not any(k == kind for k, _ in out):
             cov(kind, project)
         return [out[key] for key in sorted(out, key=lambda x: (x[0], x[1] or ""))]
+
+
+def document_record_id(project: str, title: str) -> str:
+    """The record id under which a (project, title) document is kept."""
+    return "doc:" + json.dumps([project, title], ensure_ascii=False)
 
 
 def ref_metadata(rec: dict) -> dict:
