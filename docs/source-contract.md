@@ -110,7 +110,7 @@ All idempotent; they take the record's reference, never its text.
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
-| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}]}` (1..500) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
+| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}]}` (any number, at least 1; processed in batches internally) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
 | `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
 
 ### Reconcile

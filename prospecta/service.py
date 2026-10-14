@@ -34,6 +34,7 @@ from prospecta.source import SourceConfig, SourceContractError, SourceIndexer
 logger = logging.getLogger("prospecta.service")
 MAX_BODY = 1 << 20
 MAX_LIMIT = 100
+RECONCILE_BATCH = 200  # internal batch size; the request itself is unbounded
 
 
 class ApiError(Exception):
@@ -108,9 +109,13 @@ class Service:
         refs = body.get("references")
         if not isinstance(refs, list) or not refs or not all(isinstance(r, dict) for r in refs):
             raise ApiError(400, "references must be a non-empty list of objects")
-        if len(refs) > 500:
-            raise ApiError(400, "at most 500 references per call")
-        return ix.reconcile(refs)
+        out = {"indexed": 0, "unchanged": 0, "removed": 0, "absent": 0, "unreadable": []}
+        for i in range(0, len(refs), RECONCILE_BATCH):
+            part = ix.reconcile(refs[i:i + RECONCILE_BATCH])
+            for k in ("indexed", "unchanged", "removed", "absent"):
+                out[k] += part[k]
+            out["unreadable"].extend(part["unreadable"])
+        return out
 
     def coverage(self, kind: str | None, project: str | None) -> dict:
         return {"coverage": [c.as_dict() for c in self._need_indexer().coverage(kind, project)]}

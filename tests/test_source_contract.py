@@ -377,6 +377,17 @@ def test_reconcile_unreadable_and_validation(env):
         svc.reconcile({"references": []})
 
 
+def test_reconcile_accepts_thousands_of_references(env):
+    url, mem, ix = env
+    svc = Service(mem, ix)
+    _note(url, 1)
+    refs = [{"kind": "note", "record_id": "1"}] + [
+        {"kind": "note", "record_id": str(1000 + i)} for i in range(1999)]
+    r = _rec(svc, refs)
+    total = r["indexed"] + r["unchanged"] + r["removed"] + r["absent"] + len(r["unreadable"])
+    assert total == 2000 and r["indexed"] == 1 and r["absent"] == 1999
+
+
 def test_reconcile_document_scope_replaces_pieces(env):
     url, mem, ix = env
     svc = Service(mem, ix)
