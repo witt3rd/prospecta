@@ -13,6 +13,10 @@ from pathlib import Path
 
 import psycopg
 
+from prospecta.db.schema import (
+    check_schema_writable, ensure_schema, resolve_schema, scoped_url,
+)
+
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -53,14 +57,24 @@ def _applied_versions(conn: psycopg.Connection) -> set[int]:
         return {row[0] for row in cur.fetchall()}
 
 
-def run_migrations(database_url: str) -> dict:
+def run_migrations(database_url: str, schema: str | None = None) -> dict:
     """Apply pending migrations idempotently.
+
+    With `schema` (or $PROSPECTA_SCHEMA) every object lands in that schema
+    only (shared-database mode): the schema is created if missing, checked
+    writable, and no extension is created.
 
     Uses pg_advisory_xact_lock to serialize concurrent migration attempts.
     Returns {"applied": [versions], "skipped": [versions]}.
     """
     applied: list[int] = []
     skipped: list[int] = []
+
+    schema = resolve_schema(schema)
+    if schema is not None:
+        ensure_schema(database_url, schema)
+        check_schema_writable(database_url, schema)
+        database_url = scoped_url(database_url, schema)
 
     with psycopg.connect(database_url, autocommit=False) as conn:
         # Acquire advisory lock for the duration of this transaction.
@@ -241,8 +255,9 @@ def finish_0005(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
     return {"backfilled": backfilled}
 
 
-def get_schema_version(database_url: str) -> int | None:
+def get_schema_version(database_url: str, schema: str | None = None) -> int | None:
     """Return the highest applied version, or None if no migrations applied."""
+    database_url = scoped_url(database_url, resolve_schema(schema))
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -250,6 +265,7 @@ def get_schema_version(database_url: str) -> int | None:
                 SELECT EXISTS (
                     SELECT 1 FROM information_schema.tables
                     WHERE table_name = 'prospecta_schema_version'
+                      AND table_schema = current_schema()
                 )
                 """
             )

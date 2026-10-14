@@ -6,6 +6,13 @@
 -- create the index by hand beforehand under the same name to skip the build.
 DO $$
 BEGIN
+    -- Shared-database mode (prospecta.shared=on): never create an extension;
+    -- use pg_search only when the database owner has already installed it.
+    IF current_setting('prospecta.shared', true) = 'on'
+       AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_search') THEN
+        RAISE NOTICE 'shared mode and pg_search not installed: skipping BM25 index';
+        RETURN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_search') THEN
         RAISE NOTICE 'pg_search not available: skipping BM25 index (bm25s channel stays in use)';
         RETURN;

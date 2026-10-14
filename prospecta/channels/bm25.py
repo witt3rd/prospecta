@@ -227,7 +227,7 @@ class PgSearchBm25:
 
     def available(self, conn) -> bool:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (PG_SEARCH_INDEX,))
+            cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s AND schemaname = current_schema()", (PG_SEARCH_INDEX,))
             return cur.fetchone() is not None
 
     def search(self, conn, bank_id: str, query: str, n: int) -> list[tuple[str, float]]:

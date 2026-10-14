@@ -16,7 +16,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'retain_events' AND column_name = 'index_text_generated'
+        WHERE table_schema = current_schema() AND table_name = 'retain_events' AND column_name = 'index_text_generated'
     ) THEN
         ALTER TABLE retain_events ADD COLUMN index_text_generated TEXT[];
     END IF;
@@ -35,7 +35,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'recall_events' AND column_name = 'results'
+        WHERE table_schema = current_schema() AND table_name = 'recall_events' AND column_name = 'results'
     ) THEN
         ALTER TABLE recall_events ADD COLUMN results JSONB;
     END IF;
@@ -55,7 +55,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'recall_events' AND column_name = 'synthesis'
+        WHERE table_schema = current_schema() AND table_name = 'recall_events' AND column_name = 'synthesis'
     ) THEN
         ALTER TABLE recall_events ADD COLUMN synthesis TEXT;
     END IF;
@@ -74,7 +74,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'llm_calls' AND column_name = 'prompt_text'
+        WHERE table_schema = current_schema() AND table_name = 'llm_calls' AND column_name = 'prompt_text'
     ) THEN
         ALTER TABLE llm_calls ADD COLUMN prompt_text TEXT;
     END IF;
@@ -84,7 +84,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'llm_calls' AND column_name = 'response_text'
+        WHERE table_schema = current_schema() AND table_name = 'llm_calls' AND column_name = 'response_text'
     ) THEN
         ALTER TABLE llm_calls ADD COLUMN response_text TEXT;
     END IF;
@@ -107,7 +107,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'formulate_events' AND column_name = 'error_kind'
+        WHERE table_schema = current_schema() AND table_name = 'formulate_events' AND column_name = 'error_kind'
     ) THEN
         ALTER TABLE formulate_events ADD COLUMN error_kind TEXT;
     END IF;

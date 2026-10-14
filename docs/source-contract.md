@@ -1,0 +1,104 @@
+# Source contract, shared-database mode and service
+
+Prospecta stays a standalone library. These three features let it run inside a
+database another application already owns, and index that application's
+records where they live. Prospecta holds no knowledge of the host; it only
+reads the contract below.
+
+## Shared-database mode
+
+Set `PROSPECTA_SCHEMA` (or `Memory(schema=...)`, `run_migrations(url, schema=...)`).
+Every table, index, function and the `prospecta_schema_version` table live in
+that one schema; every connection runs with `search_path = "<schema>", public`.
+Nothing is created elsewhere. The `vector` extension (and `pg_search`, if you
+want the BM25 index) must already be installed by the database owner; in this
+mode Prospecta never creates an extension and migration 0012 skips `pg_search`
+unless it is installed.
+
+- `run_migrations` creates the schema when missing (an existing one is left alone).
+- A configuration check runs before any start (`Memory(...)`, migrations,
+  `prospecta health`, the service): the schema must exist, the role needs
+  USAGE and CREATE on it, a probe `CREATE TABLE`/`INSERT` (rolled back) must
+  succeed, and `vector` must be installed. Otherwise it raises `SchemaError`
+  and nothing starts.
+- Names: lower-case `[a-z_][a-z0-9_]*`, not `public`, `pg_*` or `information_schema`.
+- Unset = the standalone behaviour, unchanged.
+
+Minimum grants for the role: `CONNECT` on the database, `USAGE, CREATE` on the
+Prospecta schema, `USAGE` on `public` (for the `vector` type), and `SELECT`
+on the source views (below).
+
+## Source contract
+
+Config: `PROSPECTA_SOURCE_SCHEMA` (the schema the host provides) and
+`PROSPECTA_SOURCE_VIEWS` (comma list, default `records`). Each view must have
+exactly these columns (any type that casts to the one shown; ids may be uuid or int):
+
+| column | type | meaning |
+|---|---|---|
+| `kind` | text | record family, e.g. note, message |
+| `record_id` | text | id, unique within `kind` |
+| `revision` | text | changes whenever the content changes (a version number, a hash, a timestamp) |
+| `title` | text | optional |
+| `text` | text | the content to index |
+| `person` | text | optional filter |
+| `project` | text | optional filter |
+| `created_date` | date | optional |
+| `audience_key` | text | optional access scope; lookups can filter on it |
+| `deleted_at` | timestamptz | non-NULL = the record is deleted |
+
+The service refuses to start if a view is missing, lacks a column or is not readable.
+
+What Prospecta keeps: its own derived items only (chunks, anticipated
+questions, embeddings, entities, links), each stamped with
+`kind`, `record_id`, `revision` (plus `person`, `project`, `audience_key`,
+`created_date` for filters), and one `source_refs` row per record
+(kind, record id, revision, filter columns; **no text**). The `documents` row
+that anchors the items has `original_text = ''`. Chunks are derived items and do
+contain pieces of the text, as they do for any Prospecta index; they are
+rebuilt from the view and removed with the record. The entity linker reads
+its text back from those chunks.
+
+Limits: the map-reduce recall (`recall_mapreduce`) scans `documents.original_text`,
+so in-place records are not covered by it.
+
+## Indexing interface (`prospecta.source.SourceIndexer`)
+
+All idempotent; they take the record's reference, never its text.
+
+- `index_record(kind, record_id)`: new -> `indexed`; same revision -> `unchanged`;
+  changed revision -> the old derived items are retired and rebuilt (`indexed`);
+  deleted or gone from the view -> retired (`removed`, or `absent` if never indexed).
+- `reindex_kind(kind)`: runs the above for every record of the kind in the views and for every record Prospecta holds.
+- `remove_record(kind, record_id)`: retire now.
+- `coverage(kind=None, project=None)`: one entry per (kind, project) with `live`,
+  `indexed`, and lists of exact references: `missing` (live in the view, nothing
+  derived), `stale` (derived revision differs from the view's), `orphaned`
+  (derived, but deleted or gone in the view).
+
+## Service
+
+`python -m prospecta.service` (or the `Dockerfile`). Stdlib HTTP, JSON.
+
+| call | body / query | answer |
+|---|---|---|
+| `GET /healthz` | | `{"status":"ok"}` (no auth) |
+| `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
+| `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true}` | status per above |
+| `POST /remove` | `{"kind","record_id"}` | status |
+| `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
+
+Environment: `DATABASE_URL`, `PROSPECTA_SCHEMA`, `PROSPECTA_SOURCE_SCHEMA`,
+`PROSPECTA_SOURCE_VIEWS`, `PROSPECTA_BANK` (default `prospecta`),
+`PROSPECTA_EMBEDDING_DIM`, `PROSPECTA_SERVICE_HOST` (default 127.0.0.1),
+`PROSPECTA_SERVICE_PORT` (8080), `PROSPECTA_SERVICE_TOKEN` (bearer token;
+required to listen on a non-loopback address), and the usual embedder/LLM
+variables. Without an LLM only chunk items are written; with one, anticipated
+questions too. The host decides when to call `/index` (for example after a
+change) and can use `/coverage` to find what to re-send.
+
+```
+docker build -t prospecta-service .
+docker run -p 8080:8080 -e DATABASE_URL=... -e PROSPECTA_SCHEMA=prospecta \
+  -e PROSPECTA_SOURCE_SCHEMA=host_views -e PROSPECTA_SERVICE_TOKEN=... prospecta-service
+```
