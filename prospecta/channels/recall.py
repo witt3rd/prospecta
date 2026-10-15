@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
-from prospecta.channels.fusion import FusedDoc, fuse
+from prospecta.channels.fusion import FLOOR, FusedDoc, fuse
 from prospecta.channels.registry import build_channels
 
 RRF_K = 60
@@ -21,7 +21,7 @@ def read_channel_config(conn, bank_id: str) -> list[dict]:
 
 def run_channels(
     state: RecallState, plan: QueryPlan, config: list[dict],
-    *, k: int = RRF_K, pool: int | None = None,
+    *, k: int = RRF_K, pool: int | None = None, fusion: dict | None = None,
 ) -> tuple[list[FusedDoc], dict]:
     """Returns (fused pool, trace). The trace holds the plan, one entry per
     channel (name, kind, weight, n, latency_ms, cost_usd, error), the fusion
@@ -45,17 +45,21 @@ def run_channels(
             "name": cc.name, "kind": cc.channel.kind, "weight": cc.weight,
             "n": len(cands), "latency_ms": int((time.monotonic() - t0) * 1000),
             "cost_usd": 0.0, "error": error,
+            **({"note": cc.channel.last_note} if getattr(cc.channel, "last_note", None) else {}),
         })
     state.channel_lists = lists
     weights = {cc.name: cc.weight for cc in channels}
-    fused = fuse(lists, weights, k=k, pool=pool)
+    method = (fusion or {}).get("method", "rrf")
+    floor = int((fusion or {}).get("floor", FLOOR))
+    fused = fuse(lists, weights, k=k, pool=pool, method=method, floor=floor)
     trace = {
         "plan": plan.to_json(),
         "channels": traces,
         "skipped": [{"name": e["name"], "reason": "disabled in the bank's channel config"}
                     for e in config if not e.get("enabled", True)],
         "fusion": {
-            "method": "weighted_rrf", "k": k, "weights": weights,
+            "method": "weighted_rrf" if method == "rrf" else method, "k": k,
+            "weights": weights, **({"floor": floor} if method == "floor_union" else {}),
             "pool": [f.document_id for f in fused],
         },
         "candidates": [

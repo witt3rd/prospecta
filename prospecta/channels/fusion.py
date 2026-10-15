@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from prospecta.channels.base import Candidate
 
 
+METHODS = ("rrf", "floor_union")
+FLOOR = 3     # floor_union: the top results of every channel that always survive
+
+
 @dataclass(frozen=True)
 class FusedDoc:
     document_id: str
@@ -23,11 +27,20 @@ def fuse(
     *,
     k: int = 60,
     pool: int | None = None,
+    method: str = "rrf",
+    floor: int = FLOOR,
 ) -> list[FusedDoc]:
     """Fuse per-channel candidate lists. Channels with weight 0 (or absent
     from `weights`) contribute nothing. A document appearing twice in one
     channel counts once, at its best (lowest) rank. `pool` None (default)
-    returns every fused document; the score cut is the caller's (stages)."""
+    returns every fused document; the score cut is the caller's (stages).
+
+    `method` "rrf" (default) orders by the fused score. "floor_union" keeps the
+    same fused scores but puts first (in fused order) every document that is in
+    the top `floor` of ANY live channel (weight > 0), then the rest in fused
+    order: one channel's best hits are never buried by the others' consensus."""
+    if method not in METHODS:
+        raise ValueError(f"fusion method must be one of {METHODS}, got {method!r}")
     acc: dict[str, dict] = {}
     for channel in sorted(lists):
         w = float(weights.get(channel, 0.0))
@@ -55,4 +68,10 @@ def fuse(
         for doc, d in acc.items() if d["score"] > 0
     ]
     fused.sort(key=lambda f: (-f.score, f.source, f.document_id))
+    if method == "floor_union" and floor > 0:
+        kept = {c.document_id for ch, cands in lists.items()
+                if float(weights.get(ch, 0.0)) > 0
+                for c in sorted(cands, key=lambda c: c.rank)[:floor]}
+        fused = ([f for f in fused if f.document_id in kept]
+                 + [f for f in fused if f.document_id not in kept])
     return fused if pool is None else fused[:pool]

@@ -51,14 +51,14 @@ def test_finds_raw_words_in_the_stored_passage_text(mem):
 
 
 def test_stemming_is_off_unless_asked(mem):
-    _, off = _run(mem, "sitting")
+    _, off = _run(mem, "mats")      # the text says "mat"
     assert off == []
-    _, on = _run(mem, "sitting", stemming=True)
+    _, on = _run(mem, "mats", stemming=True)
     assert [c.source for c in on] == ["cat.md"]
 
 
 def test_stop_word_only_question_still_matches(mem):
-    _, out = _run(mem, "the on by")
+    _, out = _run(mem, "the on")
     assert [c.source for c in out] == ["cat.md"]
 
 
@@ -85,3 +85,17 @@ def test_empty_bank_is_empty_without_error(fresh_db):
         out = KeywordChunks().retrieve(QueryPlan(text="anything"), RecallState(conn=conn, bank_id="e"))
     assert out == []
     m.close()
+
+
+def test_keyword_and_floor_union_wired_into_a_recall(mem):
+    from prospecta.channels import DEFAULT_CHANNEL_CONFIG
+    mem.set_channel_config(DEFAULT_CHANNEL_CONFIG + [{"name": "keyword", "weight": 1}])
+    mem.set_recall_config({"rerank": {"enabled": False}, "fusion": {"method": "floor_union", "floor": 3}})
+    mem.recall(["warm mat"], limit=5)
+    with psycopg.connect(mem.database_url) as conn:
+        channels, fusion = conn.execute(
+            "SELECT channels, fusion FROM recall_events WHERE bank_id='b' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    kw = next(c for c in channels if c["name"] == "keyword")
+    assert kw["error"] is None and kw["n"] >= 1
+    assert fusion["method"] == "floor_union" and fusion["floor"] == 3
