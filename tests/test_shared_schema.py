@@ -107,10 +107,12 @@ def test_refuses_when_schema_not_writable(bare_db):
     run_migrations(bare_db, schema="p_ro")
     with psycopg.connect(bare_db, autocommit=True) as c:
         c.execute("DROP ROLE IF EXISTS reader_only")
-        c.execute("CREATE ROLE reader_only LOGIN")
+        c.execute("CREATE ROLE reader_only LOGIN PASSWORD 'reader_only_pw'")
         c.execute("GRANT USAGE ON SCHEMA p_ro TO reader_only")
         c.execute("GRANT USAGE ON SCHEMA public TO reader_only")
-    ro_url = psycopg.conninfo.make_conninfo(bare_db, user="reader_only")
+    ro_url = psycopg.conninfo.make_conninfo(
+        bare_db, user="reader_only", password="reader_only_pw"
+    )
     with pytest.raises(SchemaError, match="not writable"):
         check_schema_writable(ro_url, "p_ro")
     with pytest.raises(SchemaError, match="not writable"):
