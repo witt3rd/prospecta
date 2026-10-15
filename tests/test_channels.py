@@ -147,7 +147,7 @@ def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
     assert all(c["error"] is None and "latency_ms" in c for c in channels)
     assert all(c["n"] >= 1 for c in channels if c["name"] not in ("graph", "meta"))   # no links, no filter
     assert fusion["method"] == "weighted_rrf" and fusion["k"] == 60
-    assert fusion["weights"] == {"dense_chunk": 4.0, "question": 1.0, "graph": 1.0, "meta": 3.0}
+    assert fusion["weights"] == {"dense_chunk": 4.0, "question": 1.0, "graph": 0.0, "meta": 3.0}
     assert len(fusion["pool"]) == 2
     by_channel = {c[0] for c in cands}
     assert by_channel == {"dense_chunk", "question"}  # meta had no filter

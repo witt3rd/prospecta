@@ -60,6 +60,7 @@ class AliasLLM:
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_link_config({"links": True}, bank_id="b")
     for s, t in NOTES.items():
         m.retain(t, source=s, index_text=f"q {s}")
     yield m

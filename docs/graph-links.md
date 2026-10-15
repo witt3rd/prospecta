@@ -1,5 +1,39 @@
 # Links, entities and the graph channel (migration 0006)
 
+**Links are optional and off by default.** A bank writes no link rows (`SEMANTIC`, `TEMPORAL`
+and its `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE` / `NEXT` subtypes, `ENTITY/SHARED_ENTITY`,
+`RELATED_TO`, `CAUSAL`) unless its `link_config` says `"links": true`
+(`Memory.set_link_config({"links": True}, bank_id)`, column `banks.link_config`, migration 0019).
+The setting covers every path: retain, index, `link_document`, `link_pending` and `link_pass`.
+
+Why: a search already answers each question a link stored. Semantic neighbours are a
+nearest-neighbour search over the embeddings, on demand. Temporal neighbours are a date-range
+query. The next chunk is the chunk order. Materialising them as rows grew the table to about
+300 million rows on a 73,000-note bank and about 4 million on a 4,600-note bank, and the library's
+own evaluation measured graph and links moving scores by 0.00 to 0.02.
+
+**Entities stay, with their own setting** (`"entities"`, default true: unchanged). Entity
+extraction, `memory_entities`, `memory_item_entities`, aliases and the join-based entity lookup
+(GraphExpand's hub path) work whether links are on or not; with links off, no `ENTITY` link rows
+are written. Set `"entities": false` to stop extraction too. With both off the linker does nothing
+and writes no link state. A bank that turns links on later builds them for new documents; run
+`prospecta link-pass` or re-link to cover earlier ones.
+
+**The graph channel ships at weight 0** (silent) in `DEFAULT_CHANNEL_CONFIG`; recall works with an
+empty `memory_links` (dense, question, keyword and entity paths are independent of it). Give it a
+weight per bank if the bank builds links.
+
+**`prospecta drop-links [--yes] [--batch N]`** removes a bank's link rows. It runs in small
+transactions of `--batch` rows each (default 10,000), taking row locks only (no table lock; rows
+locked elsewhere are skipped and picked up by the next batch), so it is safe beside retain and
+recall. It prints the rows removed and the space they took (an estimate from the average row of
+`memory_links`, table plus indexes). Without `--yes` it removes nothing, prints the count and the
+estimate, and exits 2. Entities, aliases, link state and the pair cache are kept. A plain `VACUUM`
+lets the table reuse the space; returning it to the disk needs a rewrite (`pg_repack`, or
+`VACUUM FULL` in a window). Nothing in the library runs it on its own.
+
+The rest of this page describes what the linker does when links are on.
+
 The Jev-Mem techniques, Postgres-native (hybrid retrieval design 8.7).
 
 **Tables** (additive; `memory_entities`, `memory_item_entities`, `memory_links`,
@@ -34,7 +68,7 @@ walks two bounded, indexed hops over links in both directions (plus the entity-t
 entities), multiplying by
 decay 0.5, the link type weight (SEMANTIC 1.0, CAUSAL 0.8, TEMPORAL 0.5, ENTITY 0.5) and
 the link confidence; every reached neighbour scoring >= `node_min_rel` (0.4) x the best reached, reported per document. It is **enabled
-in `DEFAULT_CHANNEL_CONFIG` at weight 1** (captain's decision; the design had it dark);
+in `DEFAULT_CHANNEL_CONFIG` at weight 0** (silent; see above);
 set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_hops`, `decay`, `hub`, `hub_cap`, `type_weights`) per bank. Its contribution is to be measured on real questions.
 
 **JevReader** (`recall_config.reader.type = "jev"`, needs `Memory(jev=...)`): Jev's
