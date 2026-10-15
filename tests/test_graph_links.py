@@ -3,6 +3,8 @@ the Linker (typed links, temporal links in SQL, entities), GraphExpand and the
 JevReader. LLM and Jev are stubs; nothing leaves the process."""
 from __future__ import annotations
 
+from tests._stub_embedder import ALL_LINKS, LEGACY_TYPE_WEIGHTS
+
 from prospecta._test_helpers import no_cut
 
 import json
@@ -43,7 +45,7 @@ class EntityLLM:
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     yield m
     m.close()
 
@@ -128,6 +130,7 @@ def pool_of(ids, *names):
 def expand(mem, ids, seeds, limit=None, **params):
     with conn_of(mem) as c:
         st = RecallState(conn=c, bank_id="b", pool=pool_of(ids, *seeds))
+        params["type_weights"] = {**LEGACY_TYPE_WEIGHTS, **params.get("type_weights", {})}
         return GraphExpand(**params).retrieve(QueryPlan(text="q"), st, limit)
 
 
@@ -170,7 +173,7 @@ def test_graph_node_cap_and_seed_exclusion(mem):
 
 def test_graph_default_config_enabled_and_configurable():
     names = {c["name"]: c for c in DEFAULT_CHANNEL_CONFIG}
-    assert names["graph"]["enabled"] and names["graph"]["weight"] == 0   # silent by default
+    assert names["graph"]["enabled"] and names["graph"]["weight"] == 1
     built = {c.name: c for c in build_channels(DEFAULT_CHANNEL_CONFIG)}
     assert built["graph"].channel.kind == "expand"
     assert list(built) == ["dense_chunk", "question", "meta", "graph"]   # filter then expand last
@@ -353,7 +356,7 @@ def test_async_worker_links_after_retain_with_accounting(fresh_db):
                linker=Linker(llm=llm),
                tracer=lambda kind, payload: traces.append((kind, payload)))
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     m.retain("Kelly met Acme.", source="a", index_text="qa")
     m.retain("Acme met Kelly.", source="b", index_text="qb")
     m.wait_for_links()
@@ -671,7 +674,7 @@ def test_only_mutual_or_nearest_pairs_are_judged_and_cache_survives_reruns(fresh
         return out
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
     m.create_bank("b", embedding_dim=4)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     for k in "ABC":
         m.retain(f"{k} body text", source=k, index_text=f"{k} q")
     jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
@@ -713,7 +716,7 @@ def test_link_completeness_setting_per_bank_and_per_linker(fresh_db):
             c.commit()
         m = Memory(database_url=fresh_db, bank_id="b" + uuid.uuid4().hex[:6], llm=None, embed=embed)
         m.create_bank(m.default_bank_id, embedding_dim=4)
-        m.set_link_config({"links": True}, bank_id=m.default_bank_id)
+        m.set_link_config(ALL_LINKS, bank_id=m.default_bank_id)
         if set_bank:
             m.set_recall_config({"link_completeness": set_bank})
         for k in "ABC":
@@ -739,7 +742,7 @@ def test_link_pass_upgrades_connected_to_all_pairs_resumably(fresh_db):
         return [[x / sum(y * y for y in vec[t[0]]) ** 0.5 for x in vec[t[0]]] for t in ts]
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
     m.create_bank("b", embedding_dim=4)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     for k in "ABC":
         m.retain(f"{k} body text", source=k, index_text=f"{k} q")
     jev = JevStub(lambda rel, cand, query: 3 if rel == "semantic" else 0)
@@ -776,7 +779,7 @@ def test_chunk_level_link_from_a_non_first_chunk_all_pairs_vs_connected(fresh_db
             c.commit()
         m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=embed)
         m.create_bank("b", embedding_dim=4)
-        m.set_link_config({"links": True}, bank_id="b")
+        m.set_link_config(ALL_LINKS, bank_id="b")
         m.retain("A first part " * 60 + "\n\n" + "B second part " * 60, source="x",
                  index_text="A q", child_chunks=True)
         m.retain("B other note " * 30, source="y", index_text="B q", child_chunks=True)
@@ -815,7 +818,7 @@ def test_all_pairs_floor_skips_marginal_pairs_loudly_and_keeps_the_nearest(fresh
         return [[x / sum(y * y for y in vec[t.split()[0]]) ** 0.5 for x in vec[t.split()[0]]] for t in ts]
     m = Memory(database_url=fresh_db, bank_id="fl", llm=None, embed=embed)
     m.create_bank("fl", embedding_dim=4)
-    m.set_link_config({"links": True}, bank_id="fl")
+    m.set_link_config(ALL_LINKS, bank_id="fl")
     for k in vec:
         m.retain(f"{k} body text", source=k, index_text=f"{k} q")
     asked = []

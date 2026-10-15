@@ -1,6 +1,6 @@
-"""Linking is off by default (per bank setting turns it on); entities keep their own
-switch; the graph channel is silent by default; `drop-links` removes link rows
-only on request and never locks the table."""
+"""Linking beyond next + causal is opt-in per bank; entity extraction is its own switch,
+off by default; the recall channels do not depend on link rows; `drop-links` removes link
+rows only on request and never locks the table."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ from prospecta._test_helpers import no_cut
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
 from prospecta.stages import LLMResult
-from tests._stub_embedder import EMBED_DIM, stub_embed
+from tests._stub_embedder import ALL_LINKS, EMBED_DIM, stub_embed
 
 
 class EntityLLM:
@@ -49,11 +49,11 @@ def fill(m):
         m.link_document(d)
 
 
-def test_default_writes_no_link_rows_but_keeps_entities(mem):
+def test_default_writes_no_semantic_temporal_or_entity_rows_and_no_entities(mem):
     fill(mem)
-    assert q(mem, "SELECT count(*) FROM memory_links") == 0
-    assert q(mem, "SELECT count(*) FROM memory_entities") >= 2
-    assert q(mem, "SELECT count(*) FROM memory_item_entities") >= 2
+    assert q(mem, "SELECT count(*) FROM memory_links") == 0   # one chunk per note: no NEXT either
+    assert q(mem, "SELECT count(*) FROM memory_entities") == 0
+    assert q(mem, "SELECT count(*) FROM memory_item_entities") == 0
 
 
 def test_default_without_a_linker_step_for_retain_path(mem):
@@ -63,41 +63,37 @@ def test_default_without_a_linker_step_for_retain_path(mem):
 
 
 def test_bank_setting_turns_links_on(mem):
-    mem.set_link_config({"links": True})
+    mem.set_link_config(ALL_LINKS)
     fill(mem)
     assert q(mem, "SELECT count(*) FROM memory_links") > 0
-    assert mem.get_link_config() == {"links": True, "entities": True}
+    assert mem.get_link_config() == ALL_LINKS
 
 
 def test_entities_have_their_own_switch(mem):
-    mem.set_link_config({"links": False, "entities": False})
+    mem.set_link_config({"link_kinds": [], "extract_entities": True})
     fill(mem)
-    assert q(mem, "SELECT count(*) FROM memory_entities") == 0
+    assert q(mem, "SELECT count(*) FROM memory_entities") >= 2
+    assert q(mem, "SELECT count(*) FROM memory_links") == 0
     assert q(mem, "SELECT count(*) FROM memory_links") == 0
 
 
 def test_link_config_validates(mem):
     with pytest.raises(ValueError):
-        mem.set_link_config({"links": "yes"})
+        mem.set_link_config({"extract_entities": "yes"})
     with pytest.raises(ValueError):
         mem.set_link_config({"bogus": True})
 
 
 def test_link_pending_does_not_loop_when_off(mem):
-    mem.set_link_config({"links": False, "entities": False})
+    mem.set_link_config({"link_kinds": [], "extract_entities": False})
     mem.retain("x", source="a", index_text="x")
     mem._linker = Linker(asynchronous=False)
     assert mem.link_pending() == 0
 
 
-def test_graph_default_weight_is_zero():
-    g = {c["name"]: c for c in DEFAULT_CHANNEL_CONFIG}["graph"]
-    assert g["weight"] == 0 and g["enabled"]
-
-
 def test_recall_same_with_and_without_link_rows(mem):
     mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
-    mem.set_link_config({"links": True})
+    mem.set_link_config(ALL_LINKS)
     fill(mem)
     assert q(mem, "SELECT count(*) FROM memory_links") > 0
     with_rows = [(r.source, r.scores.get("dense_chunk"), r.scores.get("question"),
@@ -110,7 +106,7 @@ def test_recall_same_with_and_without_link_rows(mem):
 
 
 def test_drop_links_refuses_without_yes_and_deletes_nothing(mem):
-    mem.set_link_config({"links": True})
+    mem.set_link_config(ALL_LINKS)
     fill(mem)
     n = q(mem, "SELECT count(*) FROM memory_links")
     with pytest.raises(PermissionError):
@@ -119,7 +115,7 @@ def test_drop_links_refuses_without_yes_and_deletes_nothing(mem):
 
 
 def test_drop_links_removes_only_this_banks_links_and_reports(mem):
-    mem.set_link_config({"links": True})
+    mem.set_link_config(ALL_LINKS)
     fill(mem)
     n = q(mem, "SELECT count(*) FROM memory_links")
     ents = q(mem, "SELECT count(*) FROM memory_item_entities")
@@ -134,7 +130,7 @@ def test_cli_drop_links_needs_yes(fresh_db, monkeypatch, capsys):
     from prospecta.cli import __main__ as cli, _common
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_link_config({"links": True})
+    m.set_link_config(ALL_LINKS)
     fill(m)
     n = q(m, "SELECT count(*) FROM memory_links")
     monkeypatch.setattr(_common, "make_memory", lambda a: m)

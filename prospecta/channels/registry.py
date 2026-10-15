@@ -20,16 +20,17 @@ REGISTRY: dict[str, type] = {
 
 # The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
 # is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
-# `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
-# optional and off by default (docs/graph-links.md), and a bank with no link rows
-# returns nothing from it. Set its weight per bank when the bank builds links.
+# `graph` (an expand channel over memory_links) is ENABLED. Its default type weights
+# are CAUSAL 0.8 and NEXT 0.5, every other kind 0: semantic, temporal and entity
+# neighbours are answered by search, so they are not stored (docs/graph-links.md). On a
+# bank with no causal or next rows it returns nothing.
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},
     {"name": "question", "enabled": True, "weight": 1, "params": {}},
-    {"name": "graph", "enabled": True, "weight": 0,
+    {"name": "graph", "enabled": True, "weight": 1,
      "params": {"max_hops": 2, "decay": 0.5,
-                "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
-                                 "TEMPORAL": 0.5, "ENTITY": 0.5}}},
+                "type_weights": {"CAUSAL": 0.8, "NEXT": 0.5, "SEMANTIC": 0.0,
+                                 "TEMPORAL": 0.0, "ENTITY": 0.0}}},
     {"name": "meta", "enabled": True, "weight": 3, "params": {}},
 ]
 

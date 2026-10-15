@@ -1,27 +1,53 @@
 # Links, entities and the graph channel (migration 0006)
 
-**Links are optional and off by default.** A bank writes no link rows (`SEMANTIC`, `TEMPORAL`
-and its `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE` / `NEXT` subtypes, `ENTITY/SHARED_ENTITY`,
-`RELATED_TO`, `CAUSAL`) unless its `link_config` says `"links": true`
-(`Memory.set_link_config({"links": True}, bank_id)`, column `banks.link_config`, migration 0019).
+**Ruling: a link row is stored only for a relation a search cannot answer.** Those are
+`CAUSAL` (causes / caused_by, judged by a model) and `NEXT` (chunk order). The rest is answered
+by search, so it is not stored by default:
+
+- semantic neighbours: a vector nearest-neighbour search, on demand;
+- temporal neighbours (`TEMPORAL`, `PRECEDES`, `SUCCEEDS`, `TEMPORALLY_CLOSE`): a date-range query;
+- entities: term and phrase search.
+
+Materialising those as rows grew the table to about 300 million rows on a 73,000-note bank and
+about 4 million on a 4,600-note bank, and the library's own evaluation measured graph and links
+moving scores by 0.00 to 0.02.
+
+**`link_kinds`** (per bank, `banks.link_config`, migration 0019;
+`Memory.set_link_config({"link_kinds": [...]}, bank_id)`) lists the kinds the linker builds. Values:
+`next`, `causal`, `semantic`, `temporal`, `entity`, `related_to`. **Default: `["next", "causal"]`.**
 The setting covers every path: retain, index, `link_document`, `link_pending` and `link_pass`.
 
-Why: a search already answers each question a link stored. Semantic neighbours are a
-nearest-neighbour search over the embeddings, on demand. Temporal neighbours are a date-range
-query. The next chunk is the chunk order. Materialising them as rows grew the table to about
-300 million rows on a 73,000-note bank and about 4 million on a 4,600-note bank, and the library's
-own evaluation measured graph and links moving scores by 0.00 to 0.02.
+- `next`: `NEXT` between consecutive chunks of a note (SQL, no model call).
+- `causal`: `CAUSAL` links, `causes` and `caused_by`, judged by the injected `judge`. The candidate
+  pairs come from an on-demand vector neighbour search at link time, the same search the
+  semantic step has always used; no `SEMANTIC` row is written for them. A note's candidate list is
+  bounded by that search itself (a relative cosine stop and an absolute floor), not by a cap on stored
+  content, and a pair is judged once (`memory_link_pairs` cache), so link rows grow in proportion
+  to the notes, not with all pairs of the bank. With no `judge`, no causal link is written. The judge still answers all three relation
+  questions for a pair (the pair cache keeps them); only the causal answers are stored.
+- `semantic`: judged `SEMANTIC` rows. `related_to`: the model-free pgvector `RELATED_TO` fallback.
+  `temporal`: `PRECEDES` / `SUCCEEDS` / `TEMPORALLY_CLOSE`. `entity`: `ENTITY/SHARED_ENTITY` rows,
+  which need `extract_entities` too. These four are opt-in and not recommended: search answers them.
+- `[]` builds no link rows.
 
-**Entities stay, with their own setting** (`"entities"`, default true: unchanged). Entity
-extraction, `memory_entities`, `memory_item_entities`, aliases and the join-based entity lookup
-(GraphExpand's hub path) work whether links are on or not; with links off, no `ENTITY` link rows
-are written. Set `"entities": false` to stop extraction too. With both off the linker does nothing
-and writes no link state. A bank that turns links on later builds them for new documents; run
-`prospecta link-pass` or re-link to cover earlier ones.
+**`extract_entities`** (default **false**) is its own switch, independent of `link_kinds`. When off, the
+linker makes no entity model call and leaves `memory_entities`, `memory_item_entities`, the alias
+tables and `memory_alias_state` untouched. When on, entities and aliases are extracted (and
+`backfill_aliases` works) whether or not `entity` is in `link_kinds`; the `ENTITY` link rows exist only
+if `entity` is listed. With no kinds and extraction off the linker does nothing and writes no link
+state.
 
-**The graph channel ships at weight 0** (silent) in `DEFAULT_CHANNEL_CONFIG`; recall works with an
-empty `memory_links` (dense, question, keyword and entity paths are independent of it). Give it a
-weight per bank if the bank builds links.
+**Existing banks are not changed.** Migration 0019 adds a column with an empty default and deletes
+nothing. A bank that already holds `SEMANTIC`, `TEMPORAL` or `ENTITY` rows keeps them; the graph
+channel gives those kinds weight 0 by default, so they add nothing, unless the bank's channel config
+raises `type_weights` (for example `{"SEMANTIC": 1.0}`). Linking is only for new documents; the
+default bank setting changes what is built from now on.
+
+**The graph channel stays enabled** in `DEFAULT_CHANNEL_CONFIG` (weight 1). Its default type weights
+are `CAUSAL` 0.8 and `NEXT` 0.5; every other kind is 0. A link's weight is looked up by its subtype
+first (`NEXT` is stored as link type `TEMPORAL`, subtype `NEXT`), then by its type, and a kind not
+listed weighs 0. With no semantic rows at all it still expands along causal and next links, and with
+no link rows it returns nothing; recall (dense, question, keyword, entity) does not depend on it.
 
 **`prospecta drop-links [--yes] [--batch N]`** removes a bank's link rows. It runs in small
 transactions of `--batch` rows each (default 10,000), taking row locks only (no table lock; rows
@@ -32,7 +58,7 @@ estimate, and exits 2. Entities, aliases, link state and the pair cache are kept
 lets the table reuse the space; returning it to the disk needs a rewrite (`pg_repack`, or
 `VACUUM FULL` in a window). Nothing in the library runs it on its own.
 
-The rest of this page describes what the linker does when links are on.
+The rest of this page describes what each kind does when it is listed in `link_kinds`.
 
 The Jev-Mem techniques, Postgres-native (hybrid retrieval design 8.7).
 
@@ -66,10 +92,10 @@ up again by `link_pending`. Per document:
 **GraphExpand** (`graph`, kind `expand`) seeds from every pool document with RRF >= `seed_min_rel` (0.5) x the best,
 walks two bounded, indexed hops over links in both directions (plus the entity-table join for hub
 entities), multiplying by
-decay 0.5, the link type weight (SEMANTIC 1.0, CAUSAL 0.8, TEMPORAL 0.5, ENTITY 0.5) and
+decay 0.5, the link weight (default CAUSAL 0.8, NEXT 0.5, all other kinds 0) and
 the link confidence; every reached neighbour scoring >= `node_min_rel` (0.4) x the best reached, reported per document. It is **enabled
-in `DEFAULT_CHANNEL_CONFIG` at weight 0** (silent; see above);
-set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_hops`, `decay`, `hub`, `hub_cap`, `type_weights`) per bank. Its contribution is to be measured on real questions.
+in `DEFAULT_CHANNEL_CONFIG`** (see above);
+set `weight` (0 silences it) and `params` (`seed_min_rel`, `node_min_rel`, `max_hops`, `decay`, `hub`, `hub_cap`, `type_weights`) per bank. 
 
 **JevReader** (`recall_config.reader.type = "jev"`, needs `Memory(jev=...)`): Jev's
 `evidence_sufficient`, `continue_useful`, `missing_evidence` as one request decide

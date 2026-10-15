@@ -3,6 +3,8 @@ resolve to the person entity so a query for the person reaches notes that use
 any alias. Stub LLM; a synthetic 9-note set, aliases spread over notes."""
 from __future__ import annotations
 
+from tests._stub_embedder import ALL_LINKS, LEGACY_TYPE_WEIGHTS
+
 import json
 
 import psycopg
@@ -60,7 +62,7 @@ class AliasLLM:
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     for s, t in NOTES.items():
         m.retain(t, source=s, index_text=f"q {s}")
     yield m
@@ -78,7 +80,7 @@ def reached(mem, seed):
     ids = docs(mem)
     with conn_of(mem) as c:
         st = RecallState(conn=c, bank_id="b", pool=pool_of(ids, seed))
-        return {x.source for x in GraphExpand(max_hops=1, type_weights={"TEMPORAL": 0.0}).retrieve(QueryPlan(text="q"), st, 50)}
+        return {x.source for x in GraphExpand(max_hops=1, type_weights={**LEGACY_TYPE_WEIGHTS, "TEMPORAL": 0.0}).retrieve(QueryPlan(text="q"), st, 50)}
 
 
 def test_parse_aliases_tolerant():

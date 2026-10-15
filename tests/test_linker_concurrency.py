@@ -2,6 +2,8 @@
 deadlocks, records failures loudly and link_pending picks them up."""
 from __future__ import annotations
 
+from tests._stub_embedder import ALL_LINKS
+
 import threading
 
 import psycopg
@@ -18,7 +20,7 @@ from tests.test_graph_links import EntityLLM, conn_of, docs
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_link_config({"links": True}, bank_id="b")
+    m.set_link_config(ALL_LINKS, bank_id="b")
     yield m
     m.close()
 
@@ -48,7 +50,7 @@ def test_concurrent_linkers_all_link_without_errors(fresh_db):
     ms = []
     m0 = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m0.create_bank("b", embedding_dim=EMBED_DIM)
-    m0.set_link_config({"links": True}, bank_id="b")
+    m0.set_link_config(ALL_LINKS, bank_id="b")
     _seed(m0, 16)
     for _ in range(4):
         m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed,
@@ -85,11 +87,11 @@ def test_deadlock_is_retried_with_backoff(mem, monkeypatch):
     calls = {"n": 0}
 
     class Flaky(Linker):
-        def _temporal(self, conn, *a):
+        def _temporal(self, conn, *a, **kw):
             calls["n"] += 1
             if calls["n"] < 3:
                 raise psycopg.errors.DeadlockDetected("deadlock detected")
-            return super()._temporal(conn, *a)
+            return super()._temporal(conn, *a, **kw)
 
     mem._linker = Flaky()
     stats = mem.link_document(next(iter(docs(mem).values())))
@@ -101,7 +103,7 @@ def test_failed_step_is_loud_recorded_and_picked_up_by_link_pending(mem, monkeyp
     monkeypatch.setattr("prospecta._linker.time.sleep", lambda s: None)
 
     class Broken(Linker):
-        def _temporal(self, conn, *a):
+        def _temporal(self, conn, *a, **kw):
             raise psycopg.errors.DeadlockDetected("deadlock detected")
 
     mem._linker = Broken()
@@ -181,7 +183,7 @@ def test_eight_writers_link_the_same_set_as_a_serial_run(fresh_db):
     # each pair from the later note only, so the comparison needs the same walks)
     ref = _mk(fresh_db, "s", linker=False)
     ref.create_bank("s", embedding_dim=EMBED_DIM)
-    ref.set_link_config({"links": True}, bank_id="s")
+    ref.set_link_config(ALL_LINKS, bank_id="s")
     for src, text, md in corpus:
         ref.retain(text, source=src, index_text=f"q {src}", metadata=md)
     ref._linker = Linker(llm=EntityLLM(), entity_hub=1000)   # a hub cut depends on arrival order
@@ -196,7 +198,7 @@ def test_eight_writers_link_the_same_set_as_a_serial_run(fresh_db):
     # 8 writers (own Memory each) retain concurrently into bank b ...
     writers = [_mk(fresh_db, "b", linker=False) for _ in range(8)]
     writers[0].create_bank("b", embedding_dim=EMBED_DIM)
-    writers[0].set_link_config({"links": True}, bank_id="b")
+    writers[0].set_link_config(ALL_LINKS, bank_id="b")
 
     def retain(i):
         for src, text, md in corpus[i::8]:
@@ -218,7 +220,7 @@ def test_eight_writers_retaining_with_inline_linking_fail_nothing(fresh_db):
     corpus = _clustered()
     writers = [_mk(fresh_db, "i") for _ in range(8)]
     writers[0].create_bank("i", embedding_dim=EMBED_DIM)
-    writers[0].set_link_config({"links": True}, bank_id="i")
+    writers[0].set_link_config(ALL_LINKS, bank_id="i")
 
     def retain(i):
         for src, text, md in corpus[i::8]:
@@ -234,14 +236,14 @@ def test_same_document_is_linked_once_under_the_advisory_lock(mem):
     inside, peak, lock = [0], [0], threading.Lock()
 
     class Probe(Linker):
-        def _temporal(self, conn, *a):
+        def _temporal(self, conn, *a, **kw):
             with lock:
                 inside[0] += 1
                 peak[0] = max(peak[0], inside[0])
             import time
             time.sleep(0.1)
             try:
-                return super()._temporal(conn, *a)
+                return super()._temporal(conn, *a, **kw)
             finally:
                 with lock:
                     inside[0] -= 1

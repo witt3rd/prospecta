@@ -276,8 +276,9 @@ class Memory:
                 raise ValueError(f"No such bank: {bank_id!r}")
 
     def set_link_config(self, config: dict, bank_id: str | None = None) -> None:
-        """Set a bank's linker switches (banks.link_config). Keys: `links` (default
-        False: write link rows) and `entities` (default True: extract entities and
+        """Set a bank's linker switches (banks.link_config). Keys: `link_kinds` (a list
+        from next, causal, semantic, temporal, entity, related_to; default
+        [next, causal]) and `extract_entities` (default False: extract entities and
         aliases). A key left out keeps its default; see docs/graph-links.md."""
         import json as _json
 

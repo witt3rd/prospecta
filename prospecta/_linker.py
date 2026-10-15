@@ -63,6 +63,8 @@ TEMPORAL_DAYS = 3
 TEMPORAL_MIN_REL = 0.5     # TEMPORALLY_CLOSE: every note within TEMPORAL_DAYS whose closeness 1/(1+days) >= 0.5 x the closest's
 DEADLOCK_RETRIES = 6       # attempts per step on deadlock / serialization failure
 DEADLOCK_BACKOFF_S = 0.05  # first backoff; doubles with jitter
+LINK_KINDS = ("next", "causal", "semantic", "temporal", "entity", "related_to")
+_JUDGED_KINDS = frozenset({"causal", "semantic", "related_to"})   # kinds that need the neighbour search
 ETYPES = {"person", "org", "place", "project", "product", "event", "other"}
 
 _ANCHORS = """
@@ -400,10 +402,10 @@ class Linker:
         calls = calls if calls is not None else []
         stats: dict = {"temporal": 0, "entities": 0, "entity_links": 0,
                        "semantic": 0, "errors": []}
-        links_on, entities_on = bank_link_config(conn, bank_id)
+        kinds, entities_on = bank_link_config(conn, bank_id)
         conn.commit()
-        if not (links_on or entities_on):   # the default: nothing to build, no state row
-            stats["skipped"] = "linking off"
+        if not (kinds or entities_on):   # nothing to build, no state row
+            stats["skipped"] = "no link kinds"
             return stats
         with conn.cursor() as cur:
             cur.execute(_ANCHORS, {"doc": document_id})
@@ -419,12 +421,13 @@ class Linker:
                 return stats
         if anchors:
             steps = []
-            if links_on:
-                steps.append(("temporal", self._temporal))
+            if kinds & {"next", "temporal"}:
+                steps.append(("temporal", lambda *a: self._temporal(*a, kinds=kinds)))
             if entities_on:
-                steps.append(("entities", lambda *a: self._entities(*a, links=links_on)))
-            if links_on:
-                steps.append(("semantic", self._semantic))
+                steps.append(("entities", lambda *a: self._entities(
+                    *a, links="entity" in kinds)))
+            if kinds & _JUDGED_KINDS:   # the neighbour search runs only for a kind that needs it
+                steps.append(("semantic", lambda *a: self._semantic(*a, kinds=kinds)))
             for name, step in steps:
                 try:
                     self._retrying(conn, name, lambda: self._run_step(
@@ -479,13 +482,17 @@ class Linker:
                 delay *= 2
 
     # --------------------------------------------------------------- the steps
-    def _temporal(self, conn, bank_id, doc, anchors, stats, calls):
+    def _temporal(self, conn, bank_id, doc, anchors, stats, calls, kinds=frozenset(LINK_KINDS)):
+        n = 0
         with conn.cursor() as cur:
-            cur.execute(_NEXT, {"bank": bank_id, "doc": doc})
-            n = cur.rowcount
-            cur.execute(_TEMPORAL, {"bank": bank_id, "doc": doc,
-                                    "days": self.temporal_days, "rel": self.temporal_min_rel})
-            stats["temporal"] = n + cur.rowcount
+            if "next" in kinds:
+                cur.execute(_NEXT, {"bank": bank_id, "doc": doc})
+                n = cur.rowcount
+            if "temporal" in kinds:
+                cur.execute(_TEMPORAL, {"bank": bank_id, "doc": doc,
+                                        "days": self.temporal_days, "rel": self.temporal_min_rel})
+                n += cur.rowcount
+        stats["temporal"] = n
 
     def _entities(self, conn, bank_id, doc, anchors, stats, calls, links=True):
         if self.llm is None:
@@ -647,7 +654,8 @@ class Linker:
         out = {"documents": 0, "judged": 0, "cached": 0, "failed": 0, "remaining": 0}
         if mode == "connected" or self.judge is None:   # all-pairs is a superset: nothing to upgrade to
             return out
-        if not bank_link_config(conn, bank_id)[0]:   # links are off for this bank
+        kinds = bank_link_config(conn, bank_id)[0]
+        if not kinds & _JUDGED_KINDS:   # nothing judged is wanted
             conn.commit()
             return out
         conn.commit()
@@ -667,7 +675,7 @@ class Linker:
             try:
                 if anchors:
                     self._retrying(conn, "pass", lambda: self._run_step(
-                        lambda *a: self._semantic(*a, mode=mode), conn, bank_id, doc,
+                        lambda *a: self._semantic(*a, mode=mode, kinds=kinds), conn, bank_id, doc,
                         anchors, stats, calls))
                 if stats["errors"]:
                     raise RuntimeError("; ".join(stats["errors"]))
@@ -834,7 +842,7 @@ class Linker:
         stats["candidates_judged"] = stats.get("candidates_judged", 0) + len(todo)
         return edges
 
-    def _semantic(self, conn, bank_id, doc, anchors, stats, calls, mode=None):
+    def _semantic(self, conn, bank_id, doc, anchors, stats, calls, mode=None, kinds=frozenset(LINK_KINDS)):
         with conn.cursor() as cur:   # the HNSW indexes are on embedding::vector(dim)
             cur.execute("SELECT vector_dims(embedding) FROM memory_items WHERE id = %s",
                         (anchors[0]["id"],))
@@ -872,10 +880,13 @@ class Linker:
                 best[d] = max(best.get(d, 0.0), float(c["cos"]))
         if not best:
             return
+        judged = self.judge is not None and bool(kinds & {"causal", "semantic"})
+        if not judged and "related_to" not in kinds:
+            return   # no judge to ask and no pgvector fallback wanted: nothing could be written
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], str(kv[0])))
         groups = None   # [(me item, candidate items, edges)]
         origin = "jev"
-        if self.judge is not None:
+        if judged:
             try:
                 stats["completeness"] = self._completeness(conn, bank_id, mode)
                 if stats["completeness"] == "all-pairs":   # chunk level: every anchor vs its neighbours
@@ -914,12 +925,26 @@ class Linker:
                         rows.append((src, dst, lt, st, conf, cos) if fwd
                                     else (dst, src, lt, st, conf, cos))
             for src, dst, lt, st, conf, cos in sorted(rows, key=lambda r: r[:4]):
+                if not _kind_wanted(lt, origin, kinds):   # judged and then not stored: the search answers it
+                    continue
                 cur.execute(
                     "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
                     "confidence, origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb) "
                     "ON CONFLICT DO NOTHING",
                     (bank_id, src, dst, lt, st, conf, origin, json.dumps({"cosine": cos})))
                 stats["semantic"] += cur.rowcount
+
+
+def _kind_wanted(link_type: str, origin: str, kinds) -> bool:
+    """Is an edge one of the bank's link kinds? A SEMANTIC edge the judge found is
+    kind `semantic`; one from the model-free pgvector fallback is `related_to`."""
+    if link_type == "SEMANTIC" and origin == "pgvector":
+        return "related_to" in kinds
+    if link_type == "CAUSAL":
+        return "causal" in kinds
+    if link_type == "SEMANTIC":
+        return "semantic" in kinds
+    return False
 
 
 def normalise_text(text: str) -> str:
@@ -1001,7 +1026,7 @@ def parse_aliases(raw: str) -> list[tuple[str, list[str]]]:
 
 # ---------------------------------------------------------------- the worker
 
-LINK_CONFIG_DEFAULTS = {"links": False, "entities": True}
+LINK_CONFIG_DEFAULTS = {"link_kinds": ["next", "causal"], "extract_entities": False}
 
 
 def validate_link_config(config: dict) -> None:
@@ -1010,27 +1035,37 @@ def validate_link_config(config: dict) -> None:
     for k, v in config.items():
         if k not in LINK_CONFIG_DEFAULTS:
             raise ValueError(f"unknown link_config key {k!r}; known: {sorted(LINK_CONFIG_DEFAULTS)}")
-        if not isinstance(v, bool):
-            raise ValueError(f"link_config {k!r} must be true or false")
+    if "extract_entities" in config and not isinstance(config["extract_entities"], bool):
+        raise ValueError("link_config 'extract_entities' must be true or false")
+    if "link_kinds" in config:
+        kinds = config["link_kinds"]
+        if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
+            raise ValueError(f"link_config 'link_kinds' must be a list of {list(LINK_KINDS)}")
+        bad = [k for k in kinds if k not in LINK_KINDS]
+        if bad:
+            raise ValueError(f"unknown link kind {bad}; known: {list(LINK_KINDS)}")
 
 
 def effective_link_config(stored: dict | None) -> dict:
-    return {**LINK_CONFIG_DEFAULTS, **(stored or {})}
+    cfg = {**LINK_CONFIG_DEFAULTS, **(stored or {})}
+    cfg["link_kinds"] = list(cfg["link_kinds"])
+    return cfg
 
 
-def bank_link_config(conn, bank_id: str) -> tuple[bool, bool]:
-    """(links, entities) for a bank: links default OFF, entities default on."""
+def bank_link_config(conn, bank_id: str) -> tuple[frozenset, bool]:
+    """(link kinds, extract entities) for a bank: kinds default to next + causal,
+    entity extraction defaults off."""
     with conn.cursor() as cur:
         cur.execute("SELECT link_config FROM banks WHERE bank_id = %s", (bank_id,))
         row = cur.fetchone()
     cfg = effective_link_config(row[0] if row else None)
-    return bool(cfg["links"]), bool(cfg["entities"])
+    return frozenset(cfg["link_kinds"]), bool(cfg["extract_entities"])
 
 
 def pending_documents(conn, bank_id: str, limit: int) -> list[str]:
     """Documents with items and no finished link state (no row, or a row with
     status 'error': a failed step is retried), oldest first. Empty when the bank
-    has both links and entities off: there is nothing to build."""
+    has no link kinds and entity extraction off: there is nothing to build."""
     if not any(bank_link_config(conn, bank_id)):
         conn.commit()
         return []

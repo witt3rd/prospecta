@@ -244,7 +244,7 @@ def _channel_docs(mem, text, allow):
 
 def _link_all(url):
     _q(url, "INSERT INTO prospecta_shared.memory_links (bank_id, src, dst, link_type, subtype) "
-            "SELECT 'b', a.id, c.id, 'SEMANTIC', 'RELATED_TO' "
+            "SELECT 'b', a.id, c.id, 'CAUSAL', 'LEADS_TO' "
             "FROM prospecta_shared.memory_items a, prospecta_shared.memory_items c "
             "WHERE a.document_id <> c.document_id AND a.kind = 'chunk' AND c.kind = 'chunk'")
 

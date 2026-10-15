@@ -126,6 +126,7 @@ def test_related_to_fallback_only_when_listed(mem):
     link_all(mem, Linker(asynchronous=False, vector_floor=-1.0))   # no judge: pgvector fallback
     assert ("SEMANTIC", "RELATED_TO") not in kinds_written(mem)
     mem.set_link_config({"link_kinds": ["related_to"]})
+    mem.drop_links(yes=True)
     with psycopg.connect(mem.database_url) as c:
         c.execute("DELETE FROM memory_link_state")
     link_all(mem, Linker(asynchronous=False, vector_floor=-1.0))
@@ -208,7 +209,7 @@ def _insert(m, rows):
 def test_graph_expands_causal_and_next_with_zero_semantic_rows(mem):
     for s in "ABC":
         mem.retain(f"note {s}", source=s, index_text=f"q {s}")
-    a, b, c = (x[0] for x in _items(mem, "A", "B", "C"))
+    a, b, c = (x for x in _items(mem, "A", "B", "C"))
     _insert(mem, [(a, b, "CAUSAL", "LEADS_TO"), (b, c, "TEMPORAL", "NEXT")])
     assert q(mem, "SELECT count(*) FROM memory_links WHERE link_type='SEMANTIC'") == 0
     from prospecta.channels.graph import DEFAULT_TYPE_WEIGHTS
@@ -222,7 +223,7 @@ def test_graph_expands_causal_and_next_with_zero_semantic_rows(mem):
 def test_old_semantic_temporal_rows_weigh_zero_unless_bank_config_says(mem):
     for s in "ABCD":
         mem.retain(f"note {s}", source=s, index_text=f"q {s}")
-    a, b, c, d = (x[0] for x in _items(mem, "A", "B", "C", "D"))
+    a, b, c, d = (x for x in _items(mem, "A", "B", "C", "D"))
     _insert(mem, [(a, b, "SEMANTIC", "RELATED_TO"), (a, c, "TEMPORAL", "PRECEDES"),
                   (a, d, "ENTITY", "SHARED_ENTITY")])
     n = q(mem, "SELECT count(*) FROM memory_links")
@@ -236,7 +237,7 @@ def test_old_semantic_temporal_rows_weigh_zero_unless_bank_config_says(mem):
 def test_bank_channel_config_can_raise_a_kind_weight(mem):
     for s in "AB":
         mem.retain(f"note {s}", source=s, index_text=f"q {s}")
-    a, b = (x[0] for x in _items(mem, "A", "B"))
+    a, b = (x for x in _items(mem, "A", "B"))
     _insert(mem, [(a, b, "SEMANTIC", "RELATED_TO")])
     cfg = no_cut(DEFAULT_CHANNEL_CONFIG)
     mem.set_channel_config(cfg)
@@ -285,7 +286,11 @@ def test_2000_note_bank_writes_only_listed_kinds_and_rows_grow_linearly(fresh_db
             per_note[i] = q(m, "SELECT count(*) FROM memory_links") / i
     assert kinds_written(m) <= {("TEMPORAL", "NEXT"), ("CAUSAL", "LEADS_TO")}
     assert q(m, "SELECT count(*) FROM memory_links WHERE link_type='CAUSAL'") > 0
-    assert per_note[500] == per_note[1000] == per_note[2000] > 0
+    # rows per note stay constant (the neighbour search is approximate, so within 5%)
+    assert per_note[500] > 0
+    assert per_note[1000] == pytest.approx(per_note[500], rel=0.05)
+    assert per_note[2000] == pytest.approx(per_note[500], rel=0.05)
+    assert per_note[2000] <= CLUSTER / 2   # a cluster of 10 has 45 pairs: 4.5 per note at most
     # the candidates are the vector neighbours of a note, never the whole bank
     assert judge.pairs / N <= CLUSTER
     m.close()

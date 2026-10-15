@@ -42,3 +42,11 @@ def stub_llm(messages: list[dict], *, json_mode: bool = False) -> str:
     if json_mode:
         return '{"queries": []}'
     return "stub-llm-response"
+
+
+# every link kind and entity extraction: the full linker, as tests of the individual kinds need it
+ALL_LINKS = {"link_kinds": ["next", "causal", "semantic", "temporal", "entity", "related_to"],
+             "extract_entities": True}
+
+# the graph type weights before link kinds were chosen per bank: for tests of rows of every kind
+LEGACY_TYPE_WEIGHTS = {"SEMANTIC": 1.0, "CAUSAL": 0.8, "TEMPORAL": 0.5, "ENTITY": 0.5}

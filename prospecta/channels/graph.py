@@ -10,8 +10,8 @@ only through its own seed's links is not an expansion and is dropped.
 
 params (all optional): seed_min_rel (0.5: every pool document whose RRF >= 0.5 x
 the best is a seed), max_hops (2), decay (0.5), node_min_rel (0.4), hub (30, the Linker's
-ENTITY_HUB), hub_cap (200, holders reached per hub entity), type_weights ({"SEMANTIC":1.0,"CAUSAL":0.8,"TEMPORAL":0.5,
-"ENTITY":0.5}).
+ENTITY_HUB), hub_cap (200, holders reached per hub entity), type_weights ({"CAUSAL":0.8,"NEXT":0.5}; every other
+kind 0; looked up by subtype, then link type).
 """
 from __future__ import annotations
 
@@ -20,7 +20,12 @@ import json
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.db.queries import _meta_param
 
-DEFAULT_TYPE_WEIGHTS = {"SEMANTIC": 1.0, "CAUSAL": 0.8, "TEMPORAL": 0.5, "ENTITY": 0.5}
+# Only the relations a search cannot answer weigh anything by default: CAUSAL, and NEXT
+# (chunk order; stored as link_type TEMPORAL, subtype NEXT). The weight of a link is looked up
+# by its subtype first, then its link type; a kind not listed weighs 0. A bank that still holds
+# SEMANTIC / TEMPORAL / ENTITY rows raises their weights in its channel config.
+DEFAULT_TYPE_WEIGHTS = {"CAUSAL": 0.8, "NEXT": 0.5,
+                        "SEMANTIC": 0.0, "TEMPORAL": 0.0, "ENTITY": 0.0}
 DEFAULT_SEED_MIN_REL = 0.5
 DEFAULT_DECAY = 0.5
 DEFAULT_NODE_MIN_REL = 0.4
@@ -118,10 +123,10 @@ e1 AS (""" + _EDGES.format(frm="s0") + """),
 """ + _HUBS.format(frm="s0", p="a_", skip="", reuse="") + """,
 h1 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 1 AS hops, item AS parent,
-           score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
+           score * %(decay)s * COALESCE(COALESCE(%(tw)s::jsonb ->> subtype, %(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
            ARRAY[subtype || ':' || nid::text] AS via, ARRAY[link_type] AS link_types
     FROM (SELECT * FROM e1 UNION ALL SELECT * FROM a_hubs) e
-    ORDER BY nid, score * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
+    ORDER BY nid, score * COALESCE(COALESCE(%(tw)s::jsonb ->> subtype, %(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
 ),
 best1 AS (
     SELECT COALESCE(max(h.score), 0) AS b
@@ -141,13 +146,13 @@ e2 AS (""" + _EDGES.format(frm="frontier") + """
 ),
 h2 AS (
     SELECT DISTINCT ON (nid) nid AS item, origin_doc, 2 AS hops,
-           score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
+           score * %(decay)s * COALESCE(COALESCE(%(tw)s::jsonb ->> subtype, %(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence AS score,
            via || (subtype || ':' || nid::text) AS via, link_types || link_type AS link_types
     FROM e2, best1
     WHERE nid <> parent
-      AND score * %(decay)s * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence
+      AND score * %(decay)s * COALESCE(COALESCE(%(tw)s::jsonb ->> subtype, %(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence
           >= %(rel)s * best1.b   -- below the final cut whatever the rest of the walk finds
-    ORDER BY nid, score * COALESCE((%(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
+    ORDER BY nid, score * COALESCE(COALESCE(%(tw)s::jsonb ->> subtype, %(tw)s::jsonb ->> link_type)::float8, 0.0) * confidence DESC
 ),
 reached AS (
     SELECT DISTINCT ON (item) item AS item_id, hops, score, via, link_types, origin_doc
