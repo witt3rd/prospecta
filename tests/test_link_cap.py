@@ -78,14 +78,12 @@ def test_two_thousand_similar_notes_have_at_most_n_links_each(fresh_db):
 
 
 def test_the_strongest_links_are_the_ones_kept(fresh_db):
-    m = build(fresh_db, "q", 41, Linker(max_links_per_note=5))
+    m = build(fresh_db, "q", 41, Linker(max_links_per_note=4))
     with psycopg.connect(fresh_db) as c:
         q = str(c.execute("SELECT id FROM documents WHERE source='n00020'").fetchone()[0])
     m.link_document(q)   # the other notes are not linked yet: all have room
     kept = {b if a == "n00020" else a for a, b, _ in pairs(fresh_db, "q")}
-    assert kept == {"n00018", "n00019", "n00021", "n00022", "n00016"} - {"n00016"} | {"n00017"} \
-        or kept == {"n00018", "n00019", "n00021", "n00022", "n00017"} \
-        or kept == {"n00018", "n00019", "n00021", "n00022", "n00023"}
+    assert kept == {"n00018", "n00019", "n00021", "n00022"}
 
 
 def test_a_stronger_link_replaces_the_weakest_of_a_full_note(fresh_db):
