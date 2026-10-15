@@ -69,9 +69,17 @@ def fuse(
     ]
     fused.sort(key=lambda f: (-f.score, f.source, f.document_id))
     if method == "floor_union" and floor > 0:
-        kept = {c.document_id for ch, cands in lists.items()
-                if float(weights.get(ch, 0.0)) > 0
-                for c in sorted(cands, key=lambda c: c.rank)[:floor]}
+        kept: set[str] = set()
+        for ch, cands in lists.items():
+            if float(weights.get(ch, 0.0)) <= 0:
+                continue
+            firsts: list[str] = []      # the first `floor` DISTINCT documents
+            for c in sorted(cands, key=lambda c: c.rank):
+                if c.document_id not in firsts:
+                    firsts.append(c.document_id)
+                    if len(firsts) == floor:
+                        break
+            kept.update(firsts)
         fused = ([f for f in fused if f.document_id in kept]
                  + [f for f in fused if f.document_id not in kept])
     return fused if pool is None else fused[:pool]
