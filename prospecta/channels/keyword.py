@@ -18,17 +18,13 @@ from __future__ import annotations
 import re
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
+from prospecta.db.keyword_index import has_keyword_index, word_vector as _vec
 from prospecta.db.queries import _meta_param
 
 _HEX_PREFIX = re.compile(r"(?=.*\d)[0-9a-f]{6,}")
 
-# ONE word rule for query and passage: Postgres's own parser (versions, paths, file
-# names, dotted names, ids stay whole words), plus the pieces of a path split at
-# slashes so "main.rs" finds "src/main.rs". No stemming unless asked.
-def _vec(cfg: str, expr: str) -> str:
-    return (f"(to_tsvector({cfg}::regconfig, {expr}) || "
-            f"to_tsvector({cfg}::regconfig, translate({expr}, '/\\', '  ')))")
-
+# ONE word rule for query and passage, defined once in db/keyword_index.py (also the
+# stored index's expression).
 _SQL = """
 WITH q AS (SELECT to_tsquery('simple', %(tsq)s) AS tsq)
 SELECT m.id, m.document_id, m.content, m.original_chunk, d.source, m.metadata,
@@ -67,6 +63,7 @@ class KeywordChunks:
             raise ValueError("keyword channel: stemming must be true or false")
         self.stemming = stemming
         self.last_note: str | None = None
+        self.used_index = False
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         self.last_note = None
@@ -83,7 +80,11 @@ class KeywordChunks:
         tsq = " | ".join("'" + t.replace("'", "''") + "'" + (":*" if _HEX_PREFIX.fullmatch(t) else "")
                          for t in terms)
         with state.conn.cursor() as cur:
-            cur.execute(_SQL.replace("__VEC__", _vec("%(cfg)s", "m.original_chunk")), {"cfg": cfg, "tsq": tsq, "bank_id": state.bank_id,
+            # simple config: literal, so the planner can use the stored index; the
+            # stemmed variant (or a bank without a valid index) is the plain scan.
+            cfg_sql = "'simple'" if cfg == "simple" else "%(cfg)s"
+            self.used_index = cfg == "simple" and has_keyword_index(state.conn)
+            cur.execute(_SQL.replace("__VEC__", _vec(cfg_sql, "m.original_chunk")), {"cfg": cfg, "tsq": tsq, "bank_id": state.bank_id,
                                "meta": _meta_param(state.metadata_filter)})
             cols = [c.name for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]

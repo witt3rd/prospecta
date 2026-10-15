@@ -56,6 +56,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ---- migrate (T3) ---------------------------------------------------
     sub.add_parser("migrate", help="Apply pending database migrations")
+    ki = sub.add_parser(
+        "keyword-index",
+        help="Build (or --rebuild) the stored keyword index without blocking writes",
+    )
+    ki.add_argument("--rebuild", action="store_true",
+                    help="Rebuild even if a valid index exists (old one serves until the swap)")
 
     # ---- create-bank (T4) -----------------------------------------------
     cb = sub.add_parser(
@@ -213,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migrate":
         from prospecta.cli import migrate as migrate_cmd
         return migrate_cmd.run(args)
+    if args.command == "keyword-index":
+        from prospecta.cli import migrate as migrate_cmd
+        return migrate_cmd.run_keyword_index(args)
     if args.command == "create-bank":
         from prospecta.cli.bank import run_create_bank
         return run_create_bank(args)

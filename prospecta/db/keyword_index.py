@@ -1,0 +1,75 @@
+"""Stored keyword index: a GIN expression index over memory_items.original_chunk.
+
+The keyword channel's word rule is one SQL expression (`word_vector`): Postgres's
+'simple' text-search parser (stemming off; versions, paths, ids stay whole words)
+plus the pieces of a path split at slashes. The index is built over exactly that
+expression and the channel's query uses exactly that expression, so index and scan
+cannot drift and the database keeps the index current on every write (no
+application code path can forget it).
+
+It is created without blocking writes (CREATE INDEX CONCURRENTLY) by
+`ensure_keyword_index`, which `run_migrations` calls after migration 0018 and
+`prospecta keyword-index` calls on demand. Stemmed queries and banks without a
+valid index use the plain scan with the same expression.
+"""
+from __future__ import annotations
+
+import time
+
+import psycopg
+
+INDEX_NAME = "memory_items_keyword_gin"
+# MIGRATE_LOCK_KEY + 3 (migrate.py uses +0..+2); kept literal to avoid an import cycle.
+_LOCK_KEY = 0x70726F73706563 + 3
+
+
+def word_vector(cfg: str, expr: str) -> str:
+    """The one word rule. `cfg` is a SQL expression for the regconfig."""
+    return (f"(to_tsvector({cfg}::regconfig, {expr}) || "
+            f"to_tsvector({cfg}::regconfig, translate({expr}, '/\\', '  ')))")
+
+
+def indexed_expression() -> str:
+    return word_vector("'simple'", "original_chunk")
+
+
+def has_keyword_index(conn: psycopg.Connection) -> bool:
+    """True when a valid keyword index exists in the connection's schema."""
+    row = conn.execute(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE i.indrelid = to_regclass('memory_items') AND c.relname = %s "
+        "AND i.indisvalid AND i.indisready AND c.relnamespace = "
+        "(SELECT relnamespace FROM pg_class WHERE oid = to_regclass('memory_items'))",
+        (INDEX_NAME,)).fetchone()
+    return row is not None
+
+
+def ensure_keyword_index(database_url: str, *, rebuild: bool = False) -> dict:
+    """Create the keyword index concurrently (writes are never blocked).
+
+    Idempotent. An invalid leftover (an interrupted build) is dropped and rebuilt;
+    `rebuild=True` rebuilds a valid one too, building the new index under a
+    temporary name first so the channel keeps using the old index until the swap.
+    """
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        while not conn.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,)).fetchone()[0]:
+            time.sleep(0.05)
+        try:
+            existed = has_keyword_index(conn)
+            if existed and not rebuild:
+                return {"index": INDEX_NAME, "created": False, "rebuilt": False}
+            expr = indexed_expression()
+            if existed:
+                tmp = INDEX_NAME + "_new"
+                conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{tmp}"')
+                conn.execute(f'CREATE INDEX CONCURRENTLY "{tmp}" '
+                             f"ON memory_items USING GIN (({expr}))")
+                conn.execute(f'DROP INDEX CONCURRENTLY "{INDEX_NAME}"')
+                conn.execute(f'ALTER INDEX "{tmp}" RENAME TO "{INDEX_NAME}"')
+                return {"index": INDEX_NAME, "created": False, "rebuilt": True}
+            conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{INDEX_NAME}"')  # invalid leftover
+            conn.execute(f'CREATE INDEX CONCURRENTLY "{INDEX_NAME}" '
+                         f"ON memory_items USING GIN (({expr}))")
+            return {"index": INDEX_NAME, "created": True, "rebuilt": False}
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
