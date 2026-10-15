@@ -172,8 +172,10 @@ def test_quoted_phrase_mixed_with_loose_words(pmem):
 
 
 def test_quote_edge_cases(pmem):
-    assert _sources(pmem, '"quick brown') == ["adj.md", "scat.md"]  # unbalanced: plain words
-    assert _sources(pmem, '"" quick') == ["adj.md", "scat.md"]      # empty phrase ignored
+    # adj.md and scat.md tie on score; the order between ties is by random id, so the
+    # test fixes it: compare sorted
+    assert sorted(_sources(pmem, '"quick brown')) == ["adj.md", "scat.md"]  # unbalanced: plain words
+    assert sorted(_sources(pmem, '"" quick')) == ["adj.md", "scat.md"]      # empty phrase ignored
 
 
 def test_quoted_phrase_without_index_matches_with_index(pmem):
@@ -190,3 +192,61 @@ def test_quoted_phrase_without_index_matches_with_index(pmem):
         assert ch.used_index is False
     assert {q: _sources(pmem, q) for q in qs} == with_idx
     assert with_idx['"quick brown"'] == ["adj.md"]
+
+
+# --- the adjacency boost is bounded to the top N rows -----------------------------
+
+def test_boost_top_validates_and_defaults():
+    assert KeywordChunks().boost_top == 300
+    assert build_channels([{"name": "keyword", "params": {"boost_top": 5}}])[0].channel.boost_top == 5
+    for bad in (-1, "5", True, 1.5):
+        with pytest.raises(ValueError):
+            KeywordChunks(boost_top=bad)
+
+
+@pytest.fixture
+def many(fresh_db):
+    m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    for i in range(12):
+        m.retain(f"alpha filler{i} beta", source=f"s{i:02d}.md", index_text=f"zzz {i}")
+    m.retain("alpha beta", source="adj.md", index_text="zzz adj")
+    yield m
+    m.close()
+
+
+def _counted_run(mem, text, **params):
+    """Run the channel with every pair check counting its evaluations in a sequence."""
+    import prospecta.channels.keyword as kw
+    with psycopg.connect(mem.database_url, autocommit=True) as c:
+        c.execute("DROP SEQUENCE IF EXISTS evals")
+        c.execute("CREATE SEQUENCE evals")
+    orig = kw._pair_adjacent
+    kw._pair_adjacent = lambda cfg, param: f"(nextval('evals') > 0 AND {orig(cfg, param)})"
+    try:
+        out = _run(mem, text, **params)[1]
+    finally:
+        kw._pair_adjacent = orig
+    with psycopg.connect(mem.database_url) as c:
+        n = c.execute("SELECT last_value, is_called FROM evals").fetchone()
+    return out, (n[0] if n[1] else 0)
+
+
+def test_boost_is_evaluated_for_at_most_top_n_rows_and_keeps_every_hit(many):
+    out, evals = _counted_run(many, "alpha beta", boost_top=5)
+    assert evals == 5                      # one pair, five rows
+    assert len(out) == 13                  # every any-word hit stays
+    out_all, evals_all = _counted_run(many, "alpha beta", boost_top=1000)
+    assert evals_all == 13
+    assert {c.source for c in out} == {c.source for c in out_all}
+
+
+def test_rows_outside_the_top_n_keep_base_order_after_the_boosted_rows(many):
+    out = _run(many, "alpha beta", boost_top=5)[1]
+    assert len(out) == 13
+    base = [c.source for c in _run(many, "alpha beta", boost_top=0)[1]]
+    got = [c.source for c in out]
+    assert set(got[:5]) == set(base[:5])             # the top 5 by base score, reordered
+    assert got[5:] == base[5:]                       # the rest after them, base order
+    out0, evals0 = _counted_run(many, "alpha beta", boost_top=0)
+    assert evals0 == 0 and len(out0) == 13
