@@ -640,11 +640,11 @@ def _search_channels(
             conn=conn, bank_id=bank_id, embed=memory._embed,
             metadata_filter=metadata_filter,
         )
-        fused, tr = run_channels(
-            state, plan, config, k=rrf_k,
-        )
         if recall_cfg is None:
             recall_cfg = read_recall_config(conn, bank_id)
+        fused, tr = run_channels(
+            state, plan, config, k=rrf_k, fusion=(recall_cfg or {}).get("fusion"),
+        )
         if recall_cfg:
             fused, st = run_stages(
                 state, text, fused, config, recall_cfg,

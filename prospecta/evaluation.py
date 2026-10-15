@@ -162,13 +162,34 @@ def score_ranking(ranked: list[str], gold: list[str]) -> dict:
     }
 
 
+def abstention_counts(rows: list[dict]) -> dict:
+    """How often the library abstained (found nothing / said "not in memory") and how
+    often that was wrong. Each row: `abstained` (bool) and `has_gold` (True: a gold
+    note exists, so abstaining is a false abstain; False: nothing to find, so it is
+    right; None: no ground truth, unjudged). The two numbers always come together;
+    `false_abstain` is None only when no row has ground truth; with ground truth
+    and no abstention it is 0."""
+    abst = [r for r in rows if r.get("abstained")]
+    judged = [r for r in rows if r.get("has_gold") is not None]
+    return {"abstained": len(abst),
+            "false_abstain": sum(bool(r["abstained"]) and bool(r["has_gold"])
+                                 for r in judged) if judged else None,
+            "ground_truth": len(judged)}
+
+
+def format_abstention(c: dict) -> str:
+    fa = "n/a" if c["false_abstain"] is None else str(c["false_abstain"])
+    return f"abstained {c['abstained']}, false abstain {fa} (of {c['ground_truth']} questions with ground truth)"
+
+
 def _mean(rows: list[dict], key: str) -> float:
     return sum(r[key] for r in rows) / len(rows) if rows else 0.0
 
 
 def summarize(per_question: list[dict]) -> dict:
     """Aggregate per-question score rows ({gold, gold2?, n_gold, cls}) into means."""
-    out: dict = {"n": len(per_question)}
+    out: dict = {"n": len(per_question),
+                 "abstention": abstention_counts(per_question)}
     for which in ("gold", "gold2"):
         rows = [q[which] for q in per_question if q.get(which)]
         out[which] = {m: _mean(rows, m) for m in METRICS} | {"n": len(rows)}
@@ -298,7 +319,8 @@ def run_variant(memory, questions: list[Question], channel_config: list[dict],
         ranked, st = retrieve(memory, q.text, channel_config, recall_cfg, pool=pool, depth=depth)
         _add_stages(stages, st)
         row = {"id": q.id, "cls": q.cls, "n_gold": len(q.gold),
-               "gold": score_ranking(ranked, q.gold), "top": ranked[:TOP]}
+               "gold": score_ranking(ranked, q.gold), "top": ranked[:TOP],
+               "abstained": not ranked, "has_gold": bool(q.gold) if q.gold else None}
         if q.gold2:
             row["gold2"] = score_ranking(ranked, q.gold2)
         per_q.append(row)
@@ -349,6 +371,8 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
             correct += ok
             cost["judge_cost_usd"] += call["cost_usd"]
             lat["judge_ms"] += call["latency_ms"]
+        row["abstained"] = row["synthesis"].strip().lower().startswith("not in memory")
+        row["has_gold"] = True if q.gold else None
         rows.append(row)
     n = max(len(rows), 1)
     return {
@@ -359,6 +383,7 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
         "cited_gold_rate": sum(r["cited_gold"] for r in rows) / n,
         "not_in_memory": sum(r["synthesis"].strip().lower().startswith("not in memory")
                              for r in rows),
+        "false_abstain": abstention_counts(rows)["false_abstain"],
         **cost, **lat, "mean_recall_synth_ms": lat["recall_synth_ms"] / n,
         "questions": rows,
     }
@@ -440,6 +465,8 @@ def format_report(r: dict) -> str:
              f"{r.get('rerank_min_rel')} x best fused score "
              f"(depth: {r.get('depth', 'standard')})")
     L.append(f"full: {_fmt(r['full']['summary'])}")
+    if r["full"]["summary"].get("abstention"):
+        L.append("retrieval: " + format_abstention(r["full"]["summary"]["abstention"]))
     for c, s in r["full"]["summary"]["by_class"].items():
         L.append(f"  {c} (n={s['n']}): hit@1 {s['hit1']:.2f}  hit@10 {s['hit10']:.2f}  "
                  f"cover@10 {s['cover10']:.2f}")
@@ -457,7 +484,8 @@ def format_report(r: dict) -> str:
     if r.get("synthesis"):
         s = r["synthesis"]
         L.append(f"synthesis: {s['n']} answered, cited a gold note {s['cited_gold_rate']:.2f}, "
-                 f"'not in memory' {s['not_in_memory']}, mean {s['mean_recall_synth_ms']:.0f} ms, "
+                 f"'not in memory' {s['not_in_memory']} (false abstain "
+                 f"{'n/a' if s['false_abstain'] is None else s['false_abstain']}), mean {s['mean_recall_synth_ms']:.0f} ms, "
                  f"synthesis ${s['synthesis_cost_usd']:.4f} "
                  f"({s['synthesis_llm']}, model: {', '.join(s['synthesis_models'])})")
         if s["judged"]:

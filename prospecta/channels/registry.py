@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from prospecta.channels.bm25 import Bm25Chunks
 from prospecta.channels.graph import GraphExpand
+from prospecta.channels.keyword import KeywordChunks
 from prospecta.channels.meta import MetadataScope
 from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks
 
@@ -12,6 +13,7 @@ REGISTRY: dict[str, type] = {
     DenseChunks.name: DenseChunks,
     AnticipatedQuestions.name: AnticipatedQuestions,
     Bm25Chunks.name: Bm25Chunks,
+    KeywordChunks.name: KeywordChunks,
     GraphExpand.name: GraphExpand,
     MetadataScope.name: MetadataScope,
 }

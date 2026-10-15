@@ -23,6 +23,7 @@ from prospecta._scorecut import (HOP_MIN_REL, check_depth, pool_min_rel, POOL_MI
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
+from prospecta.channels.fusion import METHODS as FUSION_METHODS
 from prospecta.channels.recall import run_channels
 
 BATCH_ATTEMPTS = 2             # a failed batch is retried once, then surfaced
@@ -90,11 +91,19 @@ def validate_recall_config(cfg: dict) -> None:
         raise ValueError("recall_config must be an object")
     for key in cfg:
         if key not in ("rerank", "gate", "reader", "evidence", "depth",
-                       "link_completeness"):
+                       "link_completeness", "fusion"):
             raise ValueError(f"unknown recall_config key {key!r}")
     if cfg.get("link_completeness", "all-pairs") not in ("connected", "all-pairs"):
         raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
     check_depth(cfg.get("depth"))
+    fu = cfg.get("fusion", {})
+    if not isinstance(fu, dict) or set(fu) - {"method", "floor"}:
+        raise ValueError("fusion must be an object of method/floor")
+    if fu.get("method", "rrf") not in FUSION_METHODS:
+        raise ValueError(f"fusion.method must be one of {FUSION_METHODS}")
+    if "floor" in fu and (isinstance(fu["floor"], bool) or not isinstance(fu["floor"], int)
+                          or fu["floor"] < 1):
+        raise ValueError("fusion.floor must be an integer >= 1")
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
     if rr.get("stage", "sonnet_listwise") not in STAGES:
         raise ValueError(f"rerank.stage must be one of {STAGES}")

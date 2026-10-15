@@ -105,7 +105,7 @@ def test_verdict_ablation_and_addition_margin():
 def test_ablation_variants():
     rc = {"rerank": {"enabled": True}, "gate": {"enabled": True}, "reader": {"enabled": False}}
     vs = {v["name"]: v for v in ev.ablation_variants(DEFAULT_CHANNEL_CONFIG, rc)}
-    assert set(vs) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "-rerank", "-gate"}
+    assert set(vs) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "+keyword", "-rerank", "-gate"}
     off = [e for e in vs["-question"]["channels"] if e["name"] == "question"][0]
     assert off["enabled"] is False
     assert [e["name"] for e in DEFAULT_CHANNEL_CONFIG if not e.get("enabled", True)] == []
@@ -176,7 +176,7 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     assert stages["stage:rerank_listwise"]["cost_usd"] == pytest.approx(0.002)
     assert "channel:dense_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
     abl = {a["name"]: a for a in rep["ablations"]}
-    assert set(abl) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "-rerank"}
+    assert set(abl) == {"-dense_chunk", "-question", "-meta", "-graph", "+bm25", "+keyword", "-rerank"}
     assert abl["-rerank"]["summary"]["gold"]["hit1"] == 0.0
     assert abl["-rerank"]["earns"] and "gold.hit1" in abl["-rerank"]["because"]
     assert not abl["-question"]["earns"]
@@ -274,3 +274,36 @@ def test_eval_runs_production_path_and_reports_channel_errors(mem):
     bad = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
     bad["full"]["stages"]["channel:dense_chunk"].update(errors=2, last_error="boom: dim")
     assert "ERROR x2: boom: dim" in ev.format_report(bad)
+
+
+# ------------------------------------------------ abstention beside false abstention
+
+def test_abstention_counts_pair_false_abstain_with_ground_truth():
+    rows = [
+        {"id": "a", "abstained": True, "has_gold": True},    # wrong: the note exists
+        {"id": "b", "abstained": True, "has_gold": False},   # right: nothing to find
+        {"id": "c", "abstained": False, "has_gold": True},
+        {"id": "d", "abstained": True, "has_gold": None},    # no ground truth: unjudged
+    ]
+    c = ev.abstention_counts(rows)
+    assert c == {"abstained": 3, "false_abstain": 1, "ground_truth": 3}
+    assert ev.abstention_counts([{"abstained": True, "has_gold": None}]) == {
+        "abstained": 1, "false_abstain": None, "ground_truth": 0}
+
+
+def test_format_abstention_always_shows_both_numbers():
+    assert ev.format_abstention({"abstained": 3, "false_abstain": 1, "ground_truth": 3}) == \
+        "abstained 3, false abstain 1 (of 3 questions with ground truth)"
+    assert "false abstain n/a" in ev.format_abstention(
+        {"abstained": 2, "false_abstain": None, "ground_truth": 0})
+
+
+def test_summary_and_synthesis_report_carry_both_numbers(mem):
+    qs = ev.parse_questions(QUESTIONS_MD)
+    rep = ev.run_eval(mem, qs, synth=True)
+    s = rep["synthesis"]
+    assert {"not_in_memory", "false_abstain"} <= set(s)
+    assert s["false_abstain"] == s["not_in_memory"]       # every question here has a gold note
+    assert {"abstained", "false_abstain"} <= set(rep["full"]["summary"]["abstention"])
+    text = ev.format_report(rep)
+    assert text.count("false abstain") >= 2               # retrieval and synthesis lines

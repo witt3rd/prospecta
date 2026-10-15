@@ -180,3 +180,61 @@ def test_failing_channel_is_recorded_and_others_still_fuse(mem, monkeypatch):
     q = next(c for c in channels if c["name"] == "question")
     assert q["error"] and q["n"] == 0
     assert next(c for c in channels if c["name"] == "dense_chunk")["n"] >= 1
+
+
+# ------------------------------------------ floor-preserving fusion (floor_union)
+
+def _consensus_lists():
+    """Three channels agree on x1..x3; only `kw` holds the answer `gold` (its rank 1)."""
+    agree = ["x1", "x2", "x3", "x4"]
+    lists = {n: [C(d, d, n, i + 1) for i, d in enumerate(agree)] for n in ("a", "b", "c")}
+    lists["kw"] = [C("gold", "gold", "kw", 1)] + [C(d, d, "kw", i + 2) for i, d in enumerate(agree)]
+    return lists
+
+
+def test_rrf_demotes_the_lone_channel_answer_but_floor_union_keeps_it():
+    lists = _consensus_lists()
+    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
+    rrf = [f.document_id for f in fuse(lists, w)]
+    assert rrf.index("gold") >= 4          # the measured defect: buried under the consensus
+    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
+    assert "gold" in out[:4]               # top 3 of every channel: 3 consensus + gold
+    assert set(out) == set(rrf)            # nothing added or dropped, only reordered
+
+
+def test_floor_union_floor_docs_first_then_fused_order():
+    lists = _consensus_lists()
+    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
+    rrf = [f.document_id for f in fuse(lists, w)]
+    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
+    floor = {"x1", "x2", "x3", "gold"}
+    assert set(out[:4]) == floor
+    assert out[:4] == [d for d in rrf if d in floor]   # floor block keeps fused order
+    assert out[4:] == [d for d in rrf if d not in floor]
+
+
+def test_floor_union_ignores_zero_weight_channels_and_floor_zero_is_rrf():
+    lists = _consensus_lists()
+    w = {"a": 1, "b": 1, "c": 1, "kw": 0}
+    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
+    assert "gold" not in out
+    w["kw"] = 1
+    assert fuse(lists, w, method="floor_union", floor=0) == fuse(lists, w)
+
+
+def test_fuse_rejects_unknown_method_and_default_is_rrf():
+    with pytest.raises(ValueError):
+        fuse({"a": []}, {"a": 1}, method="nope")
+    lists = _consensus_lists()
+    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
+    assert fuse(lists, w) == fuse(lists, w, method="rrf")
+
+
+def test_recall_config_fusion_setting_validates():
+    from prospecta.stages import validate_recall_config, DEFAULT_RECALL_CONFIG
+    validate_recall_config({"fusion": {"method": "floor_union", "floor": 3}})
+    validate_recall_config({"fusion": {"method": "rrf"}})
+    assert "fusion" not in DEFAULT_RECALL_CONFIG       # not the default
+    for bad in ({"method": "x"}, {"floor": 0}, {"floor": True}, {"floor": "3"}, "rrf"):
+        with pytest.raises(ValueError):
+            validate_recall_config({"fusion": bad})
