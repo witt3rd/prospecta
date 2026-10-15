@@ -29,6 +29,28 @@ up again by `link_pending`. Per document:
   One `score` questions (score/3 >= 0.6 makes a link, `origin='jev'`). Each unordered pair is judged once and cached in `memory_link_pairs` (migration 0016; A->B and B->A share it, SEMANTIC writes both directions; re-runs ask nothing), and one request carries up to 96 questions (32 candidates x 3 relations) within an estimated 45,000 input tokens (`JevRelationJudge(max_questions_per_call, max_input_tokens, relations_per_call)`; a 400 `max_tokens_exceeded` halves and retries); without one, or if
   Jev fails, neighbours with cosine >= 0.75 become `RELATED_TO` (`origin='pgvector'`).
 
+**Links per note are bounded when they are built** (`Linker(max_links_per_note=50)`, env
+`PROSPECTA_MAX_LINKS_PER_NOTE` for the CLI, `0` = unbounded as before). Without a bound a note
+was linked to every sufficiently similar note, and (`TEMPORALLY_CLOSE`) to every note dated the same
+day, so the link table grew with the square of the bank (`python scripts/link_growth.py` counts it
+on a synthetic bank of 1,000, 4,000 and 16,000 notes). Now, per note and per family (similarity
+links: `origin` jev/pgvector, any relation; `TEMPORALLY_CLOSE` links), a link between two notes counts
+once whatever its direction or relation, its strength is (confidence, cosine), and:
+- candidates are cut to the nearest `2 x max_links_per_note`, so linking a note does not read the bank;
+- the strongest links are written first and a link that does not fit is never created (counted in the
+  link stats as `semantic_over_cap`);
+- the other note of a link counts too: a new link goes in only if that note has room, or is exactly
+  at its cap and the new link is stronger than its weakest, which it then replaces;
+- a note already over its cap (linked before this setting) only refuses new links: stored links are
+  never removed by linking. Equal strengths are broken by document source, then id, so two runs agree.
+
+`prospecta trim-links [--keep N] [--dry-run]` trims an existing bank to the strongest `N` per note
+(default as above). It visits the over-cap notes most-linked first, one small transaction each, deleting
+that note's weakest links by key: row locks only, no table lock, safe beside retain and the linker, and
+re-runnable. It prints the notes and rows it removed and the space those rows take (an estimate from
+the average row of `memory_links`, table plus indexes). A plain `VACUUM` lets the table reuse the space;
+returning it to the disk needs a rewrite (`pg_repack`, or `VACUUM FULL` in a window).
+
 **GraphExpand** (`graph`, kind `expand`) seeds from every pool document with RRF >= `seed_min_rel` (0.5) x the best,
 walks two bounded, indexed hops over links in both directions (plus the entity-table join for hub
 entities), multiplying by

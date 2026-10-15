@@ -197,6 +197,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Accepted for clarity: a pass always resumes (link state + pair cache)")
     lp.add_argument("--limit", type=int, default=None, help="Documents in this run (default all)")
 
+    # ---- trim-links -----------------------------------------------------
+    tl = sub.add_parser(
+        "trim-links",
+        help="Trim the bank to the strongest N similarity links per note, without locking it")
+    tl.add_argument("--keep", type=int, default=None,
+                    help="Links kept per note (default PROSPECTA_MAX_LINKS_PER_NOTE, else 50)")
+    tl.add_argument("--dry-run", action="store_true", help="Count what would go; delete nothing")
+
     # ---- backup / restore ----------------------------------------------
     bk = sub.add_parser("backup", help="pg_dump the database to a file")
     bk.add_argument("path", type=Path)
@@ -258,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "link-pass":
         from prospecta.cli.link_pass import cmd_link_pass
         return cmd_link_pass(args)
+    if args.command == "trim-links":
+        from prospecta.cli.trim_links import cmd_trim_links
+        return cmd_trim_links(args)
     if args.command == "backup":
         from prospecta.cli.backup import cmd_backup
         return cmd_backup(args)

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from uuid import UUID
 import logging
 import re
 import random
@@ -38,6 +39,10 @@ from prospecta.channels.graph import ENTITY_HUB
 from prospecta.stages import (
     CHARS_PER_TOKEN, JEV_MODEL, JEV_TIMEOUT_S, fit_passage,
     JevTransport, call_llm, parse_json_object, totals,
+)
+
+from prospecta._linkcap import (
+    DEFAULT_MAX_LINKS_PER_NOTE, Sources, delete_pairs, f32, make_room, pair_strengths,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,7 +90,7 @@ ON CONFLICT DO NOTHING
 
 # Temporal links between the representative item of this note and its
 # chronological neighbours of the same person; dates from prospecta_doc_date.
-_TEMPORAL = """
+_TEMPORAL_HEAD = """
 WITH me AS (
     SELECT d.id, d.bank_id, d.created_at,
            prospecta_doc_date(d.document_metadata, d.created_at, d.created_on) AS dt,
@@ -115,12 +120,15 @@ rep AS (   -- one representative item per note: the first anchor
                    UNION SELECT id FROM nxt UNION SELECT id FROM near)
     ORDER BY d.id, (m.kind = 'chunk') DESC, m.ordinal NULLS LAST, m.id
 ),
-edges(a, b, subtype, conf) AS (
+"""
+
+_TEMPORAL = _TEMPORAL_HEAD + """edges(a, b, subtype, conf) AS (
     SELECT p.id, me.id, 'PRECEDES', 1.0::real FROM prev p, me
     UNION ALL SELECT me.id, p.id, 'SUCCEEDS', 1.0 FROM prev p, me
     UNION ALL SELECT me.id, n.id, 'PRECEDES', 1.0 FROM nxt n, me
     UNION ALL SELECT n.id, me.id, 'SUCCEEDS', 1.0 FROM nxt n, me
     UNION ALL SELECT me.id, c.id, 'TEMPORALLY_CLOSE', (1.0 / (1 + c.days))::real FROM near c, me
+    WHERE %(close)s
 )
 INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, confidence, origin, evidence)
 SELECT %(bank)s, ra.item, rb.item, 'TEMPORAL', e.subtype, e.conf, 'sql',
@@ -128,6 +136,16 @@ SELECT %(bank)s, ra.item, rb.item, 'TEMPORAL', e.subtype, e.conf, 'sql',
 FROM edges e JOIN rep ra ON ra.doc = e.a JOIN rep rb ON rb.doc = e.b
 ORDER BY ra.item, rb.item, e.subtype
 ON CONFLICT DO NOTHING
+"""
+
+# the TEMPORALLY_CLOSE links of this note, strongest (closest) first, for the Linker's cap
+_TEMPORAL_CLOSE = _TEMPORAL_HEAD.rstrip().rstrip(",") + """
+SELECT ra.item, rb.item, rb.doc, (1.0 / (1 + c.days))::real,
+       (SELECT person FROM me)
+FROM near c JOIN rep rb ON rb.doc = c.id JOIN rep ra ON ra.doc = (SELECT id FROM me)
+JOIN documents d ON d.id = c.id
+ORDER BY 4 DESC, d.source NULLS FIRST, c.id
+LIMIT %(limit)s
 """
 
 _SHARED_ENTITY = """
@@ -373,6 +391,7 @@ class Linker:
     judge_nearest: int = JUDGE_NEAREST      # ... always its nearest few, the rest only if mutual
     judge_floor_frac: float = JUDGE_FLOOR_FRAC   # all-pairs relative floor (see anchor_floor); 0 judges every qualifying pair
     link_completeness: str | None = None    # 'all-pairs' | 'connected'; None = the bank's recall_config, else 'all-pairs'
+    max_links_per_note: int = DEFAULT_MAX_LINKS_PER_NOTE   # similarity links a note may hold, both directions counted once; 0 = unbounded
     asynchronous: bool = True      # Memory runs it on a worker thread after retain
 
     # ------------------------------------------------------------ one document
@@ -472,9 +491,26 @@ class Linker:
         with conn.cursor() as cur:
             cur.execute(_NEXT, {"bank": bank_id, "doc": doc})
             n = cur.rowcount
-            cur.execute(_TEMPORAL, {"bank": bank_id, "doc": doc,
-                                    "days": self.temporal_days, "rel": self.temporal_min_rel})
-            stats["temporal"] = n + cur.rowcount
+            args = {"bank": bank_id, "doc": doc, "days": self.temporal_days,
+                    "rel": self.temporal_min_rel, "close": self.max_links_per_note <= 0}
+            cur.execute(_TEMPORAL, args)
+            n += cur.rowcount
+            if self.max_links_per_note > 0:   # TEMPORALLY_CLOSE: only the closest, within the cap
+                cur.execute(_TEMPORAL_CLOSE, dict(args, limit=2 * self.max_links_per_note))
+                rows = [(a, b, "TEMPORAL", "TEMPORALLY_CLOSE", float(conf), float(conf), od, person)
+                        for a, b, od, conf, person in cur.fetchall()]
+                owner = {}
+                for r in rows:
+                    owner[r[0]], owner[r[1]] = doc, r[6]
+                for r in self._within_cap(cur, bank_id, doc, [x[:6] for x in rows], owner, stats, "temporal"):
+                    person = next(x[7] for x in rows if x[1] == r[1])
+                    cur.execute(
+                        "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, confidence, "
+                        "origin, evidence) VALUES (%s,%s,%s,%s,%s,%s,'sql',%s::jsonb) "
+                        "ON CONFLICT DO NOTHING",
+                        (bank_id, r[0], r[1], r[2], r[3], r[4], json.dumps({"person": person})))
+                    n += cur.rowcount
+            stats["temporal"] = n
 
     def _entities(self, conn, bank_id, doc, anchors, stats, calls):
         if self.llm is None:
@@ -849,7 +885,8 @@ class Linker:
                 return rows if len(rows) >= n else query(True)
             cands, examined = neighbours_until_drop(
                 fetch, lambda c: float(c["cos"]), self.neighbour_min_rel,
-                floor=self.neighbour_min_cos)
+                floor=self.neighbour_min_cos,
+                limit=2 * self.max_links_per_note if self.max_links_per_note > 0 else None)
             stats["candidates_examined"] = stats.get("candidates_examined", 0) + examined
             per_anchor.append((a, cands))
             for c in cands:
@@ -888,6 +925,10 @@ class Linker:
                                    for i, c in enumerate(cands) if c["cos"] >= self.vector_floor])]
         with conn.cursor() as cur:
             rows = []
+            owner = {}   # item -> its note, to tell which note a link reaches
+            for me_item, cands, _edges in groups:
+                owner[me_item["id"]] = doc
+                owner.update((c["id"], c["document_id"]) for c in cands)
             for _me, cands, edges in groups:
                 for e in edges:   # SEMANTIC is symmetric: one judgment writes both directions
                     src, dst, lt, st, conf, rank = e[:6]
@@ -898,6 +939,8 @@ class Linker:
                     else:
                         rows.append((src, dst, lt, st, conf, cos) if fwd
                                     else (dst, src, lt, st, conf, cos))
+            if self.max_links_per_note > 0:
+                rows = self._within_cap(cur, bank_id, doc, rows, owner, stats)
             for src, dst, lt, st, conf, cos in sorted(rows, key=lambda r: r[:4]):
                 cur.execute(
                     "INSERT INTO memory_links (bank_id, src, dst, link_type, subtype, "
@@ -907,6 +950,45 @@ class Linker:
                 stats["semantic"] += cur.rowcount
 
 
+    def _within_cap(self, cur, bank_id, doc, rows, owner, stats, family="similarity"):
+        """The rows to write so that no note passes `max_links_per_note` similarity links
+        (see prospecta._linkcap). Strongest first; a link that does not fit is never created."""
+        cap = self.max_links_per_note
+        doc = UUID(str(doc))
+        owner = {k: UUID(str(v)) for k, v in owner.items()}
+        by_note: dict = {}
+        for r in rows:
+            other = owner[r[1]] if owner[r[0]] == doc else owner[r[0]]
+            by_note.setdefault(other, []).append(r)
+        strength = {o: (max(f32(r[4]) for r in rs), max(float(r[5]) for r in rs))
+                    for o, rs in by_note.items()}
+        src = Sources(cur)
+        src.load(list(by_note) + [doc])
+        mine = pair_strengths(cur, bank_id, doc, family)
+        keep: list = []
+        for o in sorted(by_note, key=lambda o: (-strength[o][0], -strength[o][1], src.key(o))):
+            if o in mine:
+                keep += by_note[o]   # already linked: counts once, fills any missing relation
+                continue
+            ok_me, vic_me = make_room(mine, strength[o], cap, src)
+            if not ok_me:
+                stats["semantic_over_cap"] = stats.get("semantic_over_cap", 0) + 1
+                continue
+            theirs = pair_strengths(cur, bank_id, o, family)
+            ok_o, vic_o = make_room(theirs, strength[o], cap, src)
+            if not ok_o:
+                stats["semantic_over_cap"] = stats.get("semantic_over_cap", 0) + 1
+                continue
+            if vic_me is not None:
+                delete_pairs(cur, bank_id, doc, [vic_me], family=family)
+                del mine[vic_me]
+            if vic_o is not None:
+                delete_pairs(cur, bank_id, o, [vic_o], family=family)
+            mine[o] = strength[o]
+            keep += by_note[o]
+        return keep
+
+
 def normalise_text(text: str) -> str:
     """Text modulo YAML frontmatter, whitespace and case."""
     t = re.sub(r"\A\s*---\n.*?\n---\s*(\n|\Z)", "", text or "", flags=re.S)
@@ -914,11 +996,13 @@ def normalise_text(text: str) -> str:
 
 
 def neighbours_until_drop(fetch, score, rel: float,
-                          page: int = NEIGHBOUR_PAGE, floor: float = 0.0) -> tuple[list, int]:
+                          page: int = NEIGHBOUR_PAGE, floor: float = 0.0,
+                          limit: int | None = None) -> tuple[list, int]:
     """Candidates from `fetch(n)` (best first, an HNSW top-n): the leading rows
     with score >= rel x the best, ending at the first marginal drop larger than
     (1 - rel) x the best and >= the absolute `floor`. Grows n (doubling) only until that stop is decided, so
-    the rows touched per anchor do not grow with the bank. Returns
+    the rows touched per anchor do not grow with the bank. With `limit`, at most that many
+    (the best) are returned and the fetch stops growing there. Returns
     (qualifying rows, rows examined)."""
     n = page
     while True:
@@ -929,8 +1013,12 @@ def neighbours_until_drop(fetch, score, rel: float,
         if best < floor:
             return [], len(rows)
         if rel <= 0 or best <= 0:
-            if len(rows) < n:
-                return [r for r in rows if score(r) >= floor], len(rows)
+            if limit or len(rows) < n:
+                keep = [r for r in rows if score(r) >= floor]
+                if limit and len(keep) >= limit:
+                    return keep[:limit], len(rows)
+                if len(rows) < n:
+                    return keep, len(rows)
         else:
             cut, gap = max(rel * best, floor), (1 - rel) * best
             out = [rows[0]]
@@ -938,6 +1026,10 @@ def neighbours_until_drop(fetch, score, rel: float,
                 if score(r) < cut or score(prev) - score(r) > gap:
                     return out, len(rows)
                 out.append(r)
+                if limit and len(out) >= limit:
+                    return out, len(rows)
+            if limit and len(out) >= limit:
+                return out[:limit], len(rows)
             if len(rows) < n:
                 return out, len(rows)
         n *= 2
