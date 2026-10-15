@@ -20,14 +20,13 @@ REGISTRY: dict[str, type] = {
 
 # The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
 # is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
-# `graph` (the Jev-Mem techniques as an expand channel over memory_links) ships
-# ENABLED here, by the captain's decision (the design had it dark at weight 0);
-# its weight is configurable per bank and is to be measured on real questions.
-# On a bank whose items have no links yet it returns nothing.
+# `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
+# optional and off by default (docs/graph-links.md), and a bank with no link rows
+# returns nothing from it. Set its weight per bank when the bank builds links.
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},
     {"name": "question", "enabled": True, "weight": 1, "params": {}},
-    {"name": "graph", "enabled": True, "weight": 1,
+    {"name": "graph", "enabled": True, "weight": 0,
      "params": {"max_hops": 2, "decay": 0.5,
                 "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
                                  "TEMPORAL": 0.5, "ENTITY": 0.5}}},

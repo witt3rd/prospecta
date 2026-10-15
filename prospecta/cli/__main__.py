@@ -197,6 +197,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Accepted for clarity: a pass always resumes (link state + pair cache)")
     lp.add_argument("--limit", type=int, default=None, help="Documents in this run (default all)")
 
+    # ---- drop-links -----------------------------------------------------
+    dl = sub.add_parser(
+        "drop-links",
+        help="Remove the link rows of the bank (row locks only; needs --yes)")
+    dl.add_argument("--yes", action="store_true", help="Really remove them")
+    dl.add_argument("--batch", type=int, default=10000, help="Rows per transaction")
+
     # ---- backup / restore ----------------------------------------------
     bk = sub.add_parser("backup", help="pg_dump the database to a file")
     bk.add_argument("path", type=Path)
@@ -258,6 +265,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "link-pass":
         from prospecta.cli.link_pass import cmd_link_pass
         return cmd_link_pass(args)
+    if args.command == "drop-links":
+        from prospecta.cli.drop_links import cmd_drop_links
+        return cmd_drop_links(args)
     if args.command == "backup":
         from prospecta.cli.backup import cmd_backup
         return cmd_backup(args)

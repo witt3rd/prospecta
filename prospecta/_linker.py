@@ -400,6 +400,11 @@ class Linker:
         calls = calls if calls is not None else []
         stats: dict = {"temporal": 0, "entities": 0, "entity_links": 0,
                        "semantic": 0, "errors": []}
+        links_on, entities_on = bank_link_config(conn, bank_id)
+        conn.commit()
+        if not (links_on or entities_on):   # the default: nothing to build, no state row
+            stats["skipped"] = "linking off"
+            return stats
         with conn.cursor() as cur:
             cur.execute(_ANCHORS, {"doc": document_id})
             anchors = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
@@ -413,8 +418,14 @@ class Linker:
                 stats["skipped"] = "document gone"
                 return stats
         if anchors:
-            for name, step in (("temporal", self._temporal), ("entities", self._entities),
-                               ("semantic", self._semantic)):
+            steps = []
+            if links_on:
+                steps.append(("temporal", self._temporal))
+            if entities_on:
+                steps.append(("entities", lambda *a: self._entities(*a, links=links_on)))
+            if links_on:
+                steps.append(("semantic", self._semantic))
+            for name, step in steps:
                 try:
                     self._retrying(conn, name, lambda: self._run_step(
                         step, conn, bank_id, document_id, anchors, stats, calls))
@@ -476,7 +487,7 @@ class Linker:
                                     "days": self.temporal_days, "rel": self.temporal_min_rel})
             stats["temporal"] = n + cur.rowcount
 
-    def _entities(self, conn, bank_id, doc, anchors, stats, calls):
+    def _entities(self, conn, bank_id, doc, anchors, stats, calls, links=True):
         if self.llm is None:
             return
         with conn.cursor() as cur:
@@ -520,7 +531,7 @@ class Linker:
         with conn.cursor() as cur:
             touched.add(doc)
             stats["entity_links"] = 0
-            for d in sorted(touched):   # this note, and notes whose mentions an alias moved
+            for d in sorted(touched if links else ()):   # this note, and notes whose mentions an alias moved
                 cur.execute(_SHARED_ENTITY, {"bank": bank_id, "doc": d, "cap": self.entity_hub})
                 stats["entity_links"] += cur.rowcount
             cur.execute(
@@ -636,6 +647,10 @@ class Linker:
         out = {"documents": 0, "judged": 0, "cached": 0, "failed": 0, "remaining": 0}
         if mode == "connected" or self.judge is None:   # all-pairs is a superset: nothing to upgrade to
             return out
+        if not bank_link_config(conn, bank_id)[0]:   # links are off for this bank
+            conn.commit()
+            return out
+        conn.commit()
         todo_sql = ("FROM memory_link_state s WHERE s.bank_id = %s "
                     "AND s.stats->>'completeness' IS DISTINCT FROM %s")
         with conn.cursor() as cur:
@@ -986,9 +1001,40 @@ def parse_aliases(raw: str) -> list[tuple[str, list[str]]]:
 
 # ---------------------------------------------------------------- the worker
 
+LINK_CONFIG_DEFAULTS = {"links": False, "entities": True}
+
+
+def validate_link_config(config: dict) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("link_config must be an object")
+    for k, v in config.items():
+        if k not in LINK_CONFIG_DEFAULTS:
+            raise ValueError(f"unknown link_config key {k!r}; known: {sorted(LINK_CONFIG_DEFAULTS)}")
+        if not isinstance(v, bool):
+            raise ValueError(f"link_config {k!r} must be true or false")
+
+
+def effective_link_config(stored: dict | None) -> dict:
+    return {**LINK_CONFIG_DEFAULTS, **(stored or {})}
+
+
+def bank_link_config(conn, bank_id: str) -> tuple[bool, bool]:
+    """(links, entities) for a bank: links default OFF, entities default on."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT link_config FROM banks WHERE bank_id = %s", (bank_id,))
+        row = cur.fetchone()
+    cfg = effective_link_config(row[0] if row else None)
+    return bool(cfg["links"]), bool(cfg["entities"])
+
+
 def pending_documents(conn, bank_id: str, limit: int) -> list[str]:
     """Documents with items and no finished link state (no row, or a row with
-    status 'error': a failed step is retried), oldest first."""
+    status 'error': a failed step is retried), oldest first. Empty when the bank
+    has both links and entities off: there is nothing to build."""
+    if not any(bank_link_config(conn, bank_id)):
+        conn.commit()
+        return []
+    conn.commit()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT d.id::text FROM documents d "
