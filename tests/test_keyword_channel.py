@@ -118,3 +118,75 @@ def test_identifier_shapes_are_findable(fresh_db, query):
     finally:
         m.close()
     assert [c.source for c in out] == ["ids.md"]
+
+
+# --- phrase matching and the adjacency boost -------------------------------------
+
+PHRASE_TEXTS = {
+    "adj.md": "The quick brown fox jumps over the lazy dog.",
+    "scat.md": "A brown dog, very quick, watched the fox.",
+    "rel.md": "Deploy v1.2.3 from src/main.rs now.",
+    "apart.md": "Version v1.2.3 shipped; src is old and main.rs is elsewhere.",
+}
+
+
+@pytest.fixture
+def pmem(fresh_db):
+    m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    for src, t in PHRASE_TEXTS.items():
+        m.retain(t, source=src, index_text="zzz " + src)
+    yield m
+    m.close()
+
+
+def _sources(mem, text, **params):
+    return [c.source for c in _run(mem, text, **params)[1]]
+
+
+def test_quoted_phrase_finds_only_adjacent_in_order(pmem):
+    assert _sources(pmem, '"quick brown"') == ["adj.md"]
+    assert _sources(pmem, '"brown quick"') == []          # order matters
+    assert _sources(pmem, '"quick fox"') == []            # a word between
+
+
+def test_quoted_phrase_with_version_and_path(pmem):
+    assert _sources(pmem, '"deploy v1.2.3"') == ["rel.md"]
+    assert _sources(pmem, '"v1.2.3 from src/main.rs now"') == ["rel.md"]
+    assert _sources(pmem, '"src/main.rs"') == ["rel.md"]  # not src ... main.rs apart
+
+
+def test_unquoted_query_keeps_every_any_word_hit_and_ranks_adjacent_first(pmem):
+    got = _sources(pmem, "quick brown")
+    assert got == ["adj.md", "scat.md"]
+    assert set(_sources(pmem, "quick brown deploy")) == {"adj.md", "scat.md", "rel.md"}
+    assert _sources(pmem, "quick brown deploy")[0] == "adj.md"
+
+
+def test_adjacent_ranks_above_scattered_for_paths_too(pmem):
+    assert _sources(pmem, "src main.rs") == ["rel.md", "apart.md"]
+
+
+def test_quoted_phrase_mixed_with_loose_words(pmem):
+    assert _sources(pmem, 'dog "quick brown"') == ["adj.md"]     # phrase is required
+
+
+def test_quote_edge_cases(pmem):
+    assert _sources(pmem, '"quick brown') == ["adj.md", "scat.md"]  # unbalanced: plain words
+    assert _sources(pmem, '"" quick') == ["adj.md", "scat.md"]      # empty phrase ignored
+
+
+def test_quoted_phrase_without_index_matches_with_index(pmem):
+    import psycopg as pg
+    from prospecta.db.keyword_index import INDEX_NAME
+    qs = ['"quick brown"', '"src/main.rs"', '"v1.2.3 from src/main.rs now"',
+          "quick brown", "src main.rs", 'dog "quick brown"']
+    with_idx = {q: _sources(pmem, q) for q in qs}
+    with pg.connect(pmem.database_url, autocommit=True) as c:
+        c.execute(f'DROP INDEX "{INDEX_NAME}"')
+    with pg.connect(pmem.database_url) as c:
+        ch = KeywordChunks()
+        ch.retrieve(QueryPlan(text='"quick brown"'), RecallState(conn=c, bank_id="b"))
+        assert ch.used_index is False
+    assert {q: _sources(pmem, q) for q in qs} == with_idx
+    assert with_idx['"quick brown"'] == ["adj.md"]
