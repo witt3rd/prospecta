@@ -107,6 +107,9 @@ def run_migrations(database_url: str, schema: str | None = None) -> dict:
         finish_0004(database_url)
     if 5 in current or 5 in applied:
         finish_0005(database_url)
+    if 18 in current or 18 in applied:
+        from prospecta.db.keyword_index import ensure_keyword_index
+        ensure_keyword_index(database_url)
 
     return {"applied": applied, "skipped": skipped}
 
