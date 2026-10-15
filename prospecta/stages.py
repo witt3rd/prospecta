@@ -33,7 +33,8 @@ JEV_INPUT_BYTES = 60_000
 JEV_PASSAGE_MAX_BYTES = JEV_INPUT_BYTES - 5_000   # physical: one passage must fit a 60 KB request beside its task text and criteria
 JEV_TIMEOUT_S = 10.0
 JEV_GATE_THRESHOLD = 2.95
-JEV_MODEL = "typesafe/jev-1.13"
+JEV_MODEL_PREVIOUS = "typesafe/jev-1.13"
+JEV_MODEL = os.environ.get("PROSPECTA_JEV_MODEL") or "typesafe/jev-1.14"
 JEV_URL = "https://openrouter.ai/api/v1/systemone"
 # Copied from spire-venue server/library-rank.ts (CRITERIA, :44-49; the record
 # variant's TASK, :52), as cited in the verified wire-shape note.
@@ -404,7 +405,7 @@ def openrouter_jev_transport(api_key: str | None = None,
 
 
 class JevScore:
-    """Verified System One shape (POST /v1/systemone, model typesafe/jev-1.13):
+    """Verified System One shape (POST /v1/systemone, model typesafe/jev-1.14):
     body {model, state:{query}, questions:{p0.. : {type:"score", instructions,
     criteria}}}; at most 16 candidates (we send 15, so a pool of 30 is two
     parallel requests), 60 KB per request, 10 s timeout. The answer must hold

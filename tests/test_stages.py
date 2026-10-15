@@ -157,7 +157,7 @@ def fake_jev(scores, calls=None, fail=False, key="test-key"):
     {model, state, questions}; answers keyed by question id."""
     def transport(req, timeout):
         assert set(req) == {"model", "state", "questions"}
-        assert req["model"] == "typesafe/jev-1.13"
+        assert req["model"] == "typesafe/jev-1.14"
         if calls is not None:
             calls.append(req)
         if fail:
