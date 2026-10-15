@@ -274,3 +274,36 @@ def test_eval_runs_production_path_and_reports_channel_errors(mem):
     bad = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
     bad["full"]["stages"]["channel:dense_chunk"].update(errors=2, last_error="boom: dim")
     assert "ERROR x2: boom: dim" in ev.format_report(bad)
+
+
+# ------------------------------------------------ abstention beside false abstention
+
+def test_abstention_counts_pair_false_abstain_with_ground_truth():
+    rows = [
+        {"id": "a", "abstained": True, "has_gold": True},    # wrong: the note exists
+        {"id": "b", "abstained": True, "has_gold": False},   # right: nothing to find
+        {"id": "c", "abstained": False, "has_gold": True},
+        {"id": "d", "abstained": True, "has_gold": None},    # no ground truth: unjudged
+    ]
+    c = ev.abstention_counts(rows)
+    assert c == {"abstained": 3, "false_abstain": 1, "ground_truth": 3}
+    assert ev.abstention_counts([{"abstained": True, "has_gold": None}]) == {
+        "abstained": 1, "false_abstain": None, "ground_truth": 0}
+
+
+def test_format_abstention_always_shows_both_numbers():
+    assert ev.format_abstention({"abstained": 3, "false_abstain": 1, "ground_truth": 3}) == \
+        "abstained 3, false abstain 1 (of 3 with ground truth)"
+    assert "false abstain n/a" in ev.format_abstention(
+        {"abstained": 2, "false_abstain": None, "ground_truth": 0})
+
+
+def test_summary_and_synthesis_report_carry_both_numbers(mem):
+    qs = ev.parse_questions(QUESTIONS_MD)
+    rep = ev.run_eval(mem, qs, synth=True)
+    s = rep["synthesis"]
+    assert {"not_in_memory", "false_abstain"} <= set(s)
+    assert s["false_abstain"] == s["not_in_memory"]       # every question here has a gold note
+    assert {"abstained", "false_abstain"} <= set(rep["full"]["summary"]["abstention"])
+    text = ev.format_report(rep)
+    assert text.count("false abstain") >= 2               # retrieval and synthesis lines
