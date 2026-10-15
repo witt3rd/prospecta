@@ -238,3 +238,12 @@ def test_recall_config_fusion_setting_validates():
     for bad in ({"method": "x"}, {"floor": 0}, {"floor": True}, {"floor": "3"}, "rrf"):
         with pytest.raises(ValueError):
             validate_recall_config({"fusion": bad})
+
+
+def test_floor_union_floor_is_distinct_documents_per_channel():
+    lists = {"a": [C("d1", "i1", "a", 1), C("d1", "i2", "a", 2), C("d2", "i3", "a", 3),
+                   C("d3", "i4", "a", 4), C("m", "i5", "a", 5)],
+             "b": [C("e1", "j1", "b", 1), C("e2", "j2", "b", 2), C("e3", "j3", "b", 3),
+                   C("m", "j4", "b", 4)]}
+    out = [f.document_id for f in fuse(lists, {"a": 1, "b": 1}, method="floor_union", floor=3)]
+    assert out.index("d3") < out.index("m")      # a's third DISTINCT doc is in the floor

@@ -10,10 +10,11 @@ from prospecta.memory import Memory
 from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 
 
-def test_terms_are_raw_lowercase_unstemmed_and_keep_stop_words():
-    assert keyword_terms("The Cats were sitting, on mats!") == [
-        "the", "cats", "were", "sitting", "on", "mats"]
-    assert keyword_terms("  ?! ") == []
+def test_terms_are_raw_lowercase_unstemmed_and_keep_stop_words(mem):
+    with psycopg.connect(mem.database_url) as conn:
+        assert keyword_terms(conn, "The Cats were sitting, on mats!") == [
+            "the", "cats", "were", "sitting", "on", "mats"]
+        assert keyword_terms(conn, "  ?! ") == []
 
 
 def test_registered_off_by_default_and_params_validate():
@@ -99,3 +100,21 @@ def test_keyword_and_floor_union_wired_into_a_recall(mem):
     kw = next(c for c in channels if c["name"] == "keyword")
     assert kw["error"] is None and kw["n"] >= 1
     assert fusion["method"] == "floor_union" and fusion["floor"] == 3
+
+
+@pytest.mark.parametrize("query", [
+    "v1.2.3", "src/main.rs", "main.rs", "3fa9c2d41b7e", "3fa9c2", "config.yaml",
+    "PROSPECTA_DB_POOL_MAX", "max_connections", "ECONNRESET", "ABC-123", "PR-66",
+    "0123456789ab"])
+def test_identifier_shapes_are_findable(fresh_db, query):
+    m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.retain("Released v1.2.3 from src/main.rs; see config.yaml, id 3fa9c2d41b7e, "
+             "PROSPECTA_DB_POOL_MAX max_connections ECONNRESET ABC-123 PR-66 0123456789ab.",
+             source="ids.md", index_text="zzz")
+    m.retain("Unrelated gardening note about tomatoes.", source="other.md", index_text="zzz")
+    try:
+        _, out = _run(m, query)
+    finally:
+        m.close()
+    assert [c.source for c in out] == ["ids.md"]

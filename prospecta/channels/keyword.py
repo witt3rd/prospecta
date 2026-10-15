@@ -20,15 +20,22 @@ import re
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.db.queries import _meta_param
 
-_WORD = re.compile(r"[^\W_]+")
+_HEX_PREFIX = re.compile(r"(?=.*\d)[0-9a-f]{6,}")
+
+# ONE word rule for query and passage: Postgres's own parser (versions, paths, file
+# names, dotted names, ids stay whole words), plus the pieces of a path split at
+# slashes so "main.rs" finds "src/main.rs". No stemming unless asked.
+def _vec(cfg: str, expr: str) -> str:
+    return (f"(to_tsvector({cfg}::regconfig, {expr}) || "
+            f"to_tsvector({cfg}::regconfig, translate({expr}, '/\\', '  ')))")
 
 _SQL = """
-WITH q AS (SELECT to_tsquery(%(cfg)s::regconfig, %(tsq)s) AS tsq)
+WITH q AS (SELECT to_tsquery('simple', %(tsq)s) AS tsq)
 SELECT m.id, m.document_id, m.content, m.original_chunk, d.source, m.metadata,
-       ts_rank_cd(to_tsvector(%(cfg)s::regconfig, m.original_chunk), q.tsq) AS score
+       ts_rank_cd(__VEC__, q.tsq) AS score
 FROM memory_items m JOIN documents d ON d.id = m.document_id, q
 WHERE m.bank_id = %(bank_id)s
-  AND to_tsvector(%(cfg)s::regconfig, m.original_chunk) @@ q.tsq
+  AND __VEC__ @@ q.tsq
   AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
   AND (%(meta)s::jsonb->'_allow' IS NULL OR (
         (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
@@ -41,9 +48,13 @@ ORDER BY score DESC, m.id
 _COUNT_SQL = "SELECT count(*) FROM memory_items WHERE bank_id = %s"
 
 
-def keyword_terms(text: str) -> list[str]:
-    """The question's raw words, lower-cased, in order (no stemming, no stop words dropped)."""
-    return [w.lower() for w in _WORD.findall(text)]
+def keyword_terms(conn, text: str, stemming: bool = False) -> list[str]:
+    """The question's words by the same rule as the stored passages, in order."""
+    cfg = "'english'" if stemming else "'simple'"
+    with conn.cursor() as cur:
+        cur.execute("SELECT lexeme FROM unnest(" + _vec(cfg, "%s") .replace("%s", "%(t)s") + ")"
+                    " ORDER BY positions", {"t": text})
+        return list(dict.fromkeys(r[0] for r in cur.fetchall()))
 
 
 class KeywordChunks:
@@ -59,7 +70,7 @@ class KeywordChunks:
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         self.last_note = None
-        terms = list(dict.fromkeys(keyword_terms(plan.text)))
+        terms = keyword_terms(state.conn, plan.text, self.stemming)
         with state.conn.cursor() as cur:
             cur.execute(_COUNT_SQL, (state.bank_id,))
             passages = cur.fetchone()[0]
@@ -69,9 +80,10 @@ class KeywordChunks:
             raise ValueError("keyword channel: the question has no usable words "
                              f"(bank has {passages} passages)")
         cfg = "english" if self.stemming else "simple"
-        tsq = " | ".join("'" + t.replace("'", "''") + "'" for t in terms)
+        tsq = " | ".join("'" + t.replace("'", "''") + "'" + (":*" if _HEX_PREFIX.fullmatch(t) else "")
+                         for t in terms)
         with state.conn.cursor() as cur:
-            cur.execute(_SQL, {"cfg": cfg, "tsq": tsq, "bank_id": state.bank_id,
+            cur.execute(_SQL.replace("__VEC__", _vec("%(cfg)s", "m.original_chunk")), {"cfg": cfg, "tsq": tsq, "bank_id": state.bank_id,
                                "meta": _meta_param(state.metadata_filter)})
             cols = [c.name for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
