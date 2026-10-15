@@ -28,6 +28,11 @@ so Postgres uses the index and keeps it current on every write.
 - An unquoted multi-word question still returns every any-word hit; passages that hold
   more adjacent pairs of its words (in the question's order) rank above ones with the
   words scattered, and the score includes one point per adjacent pair (at most 16 pairs).
+- The boost is computed only for the top N passages by the any-word score
+  (`"params": {"boost_top": N}`, default 300; 0 turns it off). Those are ordered by
+  boost, then score; the remaining hits follow in any-word order, none dropped. The
+  boost checks the word-rule vector (built once per boosted row) against the pair, so
+  on a 60,000-passage bank it costs at most about 1.1x the unboosted query.
 - The stored index narrows candidates for phrases too; adjacency is then checked on
   the two parts of the word rule separately, so with or without the index the results
   are identical.

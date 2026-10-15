@@ -29,25 +29,43 @@ from prospecta.db.queries import _meta_param
 
 _QUOTED = re.compile(r'"([^"]*)"')
 _MAX_PAIRS = 16
+DEFAULT_BOOST_TOP = 300   # rows (by any-word score) that get the adjacency boost
 
 _HEX_PREFIX = re.compile(r"(?=.*\d)[0-9a-f]{6,}")
 
 # ONE word rule for query and passage, defined once in db/keyword_index.py (also the
 # stored index's expression).
 _SQL = """
-WITH q AS (SELECT to_tsquery('simple', %(tsq)s) AS tsq)
-SELECT m.id, m.document_id, m.content, m.original_chunk, d.source, m.metadata,
-       ts_rank_cd(__VEC__, q.tsq) + (__ADJ__) AS score
-FROM memory_items m JOIN documents d ON d.id = m.document_id, q
-WHERE m.bank_id = %(bank_id)s
-  AND __VEC__ @@ q.tsq__PHRASES__
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-ORDER BY (__ADJ__)::int DESC, score DESC, m.id
+WITH q AS (SELECT to_tsquery('simple', %(tsq)s) AS tsq),
+base AS (
+  SELECT m.id, m.document_id, m.content, m.original_chunk, d.source, m.metadata,
+         ts_rank_cd(__VEC__, q.tsq) AS base_score
+  FROM memory_items m JOIN documents d ON d.id = m.document_id, q
+  WHERE m.bank_id = %(bank_id)s
+    AND __VEC__ @@ q.tsq__PHRASES__
+    AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
+    AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+          (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
+              (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+          AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
+              (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
+),
+ranked AS (
+  SELECT base.*, row_number() OVER (ORDER BY base_score DESC, id) AS rn FROM base
+),
+boosted AS MATERIALIZED (
+  -- the adjacency boost is evaluated for the top %(boost_top)s rows only; CASE
+  -- keeps the expression from being evaluated for the others
+  SELECT ranked.*, (CASE WHEN rn <= %(boost_top)s THEN __ADJ__ ELSE 0 END) AS adj,
+         (rn <= %(boost_top)s) AS in_top
+  FROM ranked
+  CROSS JOIN LATERAL (SELECT CASE WHEN rn <= %(boost_top)s
+                                  THEN __VEC_R__ END AS v OFFSET 0) wv
+)
+SELECT id, document_id, content, original_chunk, source, metadata,
+       base_score + adj AS score
+FROM boosted
+ORDER BY in_top DESC, adj DESC, base_score DESC, id
 """
 
 _COUNT_SQL = "SELECT count(*) FROM memory_items WHERE bank_id = %s"
@@ -79,6 +97,14 @@ def _adjacent(cfg_sql: str, param: str) -> str:
             f" @@ phraseto_tsquery({cfg_sql}::regconfig, translate(%({param})s, '/\\', '  ')))")
 
 
+def _pair_adjacent(cfg_sql: str, param: str) -> str:
+    """Adjacency for the boost: the stored word-rule vector (the index's expression)
+    against the phrase, both spellings of the pair. `wv.v` is that vector, built once per boosted row."""
+    vec = "wv.v"
+    return (f"({vec} @@ (phraseto_tsquery({cfg_sql}::regconfig, %({param})s)"
+            f" || phraseto_tsquery({cfg_sql}::regconfig, translate(%({param})s, '/\\', '  '))))")
+
+
 def _phrase_sql(cfg_sql: str, phrases: list[str], loose: list[str], params: dict) -> tuple[str, str]:
     """(extra WHERE clauses, adjacency score expression)."""
     where = ""
@@ -90,8 +116,8 @@ def _phrase_sql(cfg_sql: str, phrases: list[str], loose: list[str], params: dict
         if a == b or i >= _MAX_PAIRS:
             continue
         params[f"pr{i}"] = f"{a} {b}"
-        pairs.append(f"({_adjacent(cfg_sql, f'pr{i}')})::int")
-    return where, (" + ".join(pairs) if pairs else "0::int")
+        pairs.append(f"{_pair_adjacent(cfg_sql, f'pr{i}')}::int")
+    return where, (" + ".join(pairs) if pairs else "0")
 
 
 def _word_sequence(conn, text: str, cfg_sql: str) -> list[str]:
@@ -108,9 +134,12 @@ class KeywordChunks:
     kind = "recall"
     takes_params = True
 
-    def __init__(self, stemming: bool = False, **_ignored):
+    def __init__(self, stemming: bool = False, boost_top: int = DEFAULT_BOOST_TOP, **_ignored):
         if not isinstance(stemming, bool):
             raise ValueError("keyword channel: stemming must be true or false")
+        if isinstance(boost_top, bool) or not isinstance(boost_top, int) or boost_top < 0:
+            raise ValueError("keyword channel: boost_top must be a non-negative integer")
+        self.boost_top = boost_top
         self.stemming = stemming
         self.last_note: str | None = None
         self.used_index = False
@@ -132,11 +161,12 @@ class KeywordChunks:
         phrases, rest = split_phrases(plan.text)
         cfg_lit = "'simple'" if cfg == "simple" else "%(cfg)s"
         params = {"cfg": cfg, "tsq": tsq, "bank_id": state.bank_id,
-                  "meta": _meta_param(state.metadata_filter)}
+                  "meta": _meta_param(state.metadata_filter), "boost_top": self.boost_top}
         phrases = [p for p in phrases if _word_sequence(state.conn, p, "'simple'" if cfg == "simple" else f"'{cfg}'")]
         loose = _word_sequence(state.conn, rest, "'simple'" if cfg == "simple" else f"'{cfg}'")
         where, adj = _phrase_sql(cfg_lit, phrases, loose, params)
         sql = (_SQL.replace("__PHRASES__", where).replace("__ADJ__", adj)
+               .replace("__VEC_R__", _vec(cfg_lit, "ranked.original_chunk"))
                .replace("__VEC__", _vec(cfg_lit, "m.original_chunk")))
         with state.conn.cursor() as cur:
             # simple config: literal, so the planner can use the stored index; the
