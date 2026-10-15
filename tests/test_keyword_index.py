@@ -17,7 +17,8 @@ TEXTS = {
     "d.md": "Nothing relevant, just cats.",
 }
 QUERIES = ["v1.2.3", "main.rs", "src/main.rs", "config.yaml", "PROSPECTA_DB_POOL_MAX",
-           "ABC-123", "3f9a1c", "cats and dogs", "zzzunseen"]
+           "ABC-123", "3f9a1c", "cats and dogs", "zzzunseen",
+           '"v1.2.3 from src/main.rs"', '"from src"', 'using "config.yaml" today']
 
 
 @pytest.fixture

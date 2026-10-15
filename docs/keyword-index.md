@@ -18,3 +18,16 @@ so Postgres uses the index and keeps it current on every write.
   which path ran.
 - **Cost:** disk and write cost grow with text size. The index is shared by all banks in the
   database; the bank filter is applied after the index lookup.
+
+## Phrases and adjacency
+
+- `"double quoted text"` is an exact phrase (words adjacent, in order; `phraseto_tsquery`
+  under the same `simple` configuration and word rule, so `v1.2.3` and `src/main.rs`
+  work inside it). With quotes present only passages holding every phrase are returned;
+  unquoted words still add to the rank. An unbalanced quote or an empty `""` is plain text.
+- An unquoted multi-word question still returns every any-word hit; passages that hold
+  more adjacent pairs of its words (in the question's order) rank above ones with the
+  words scattered, and the score includes one point per adjacent pair (at most 16 pairs).
+- The stored index narrows candidates for phrases too; adjacency is then checked on
+  the two parts of the word rule separately, so with or without the index the results
+  are identical.
