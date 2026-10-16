@@ -36,7 +36,7 @@ mem.set_recall_config({
   `Memory(jev=JevScore(openrouter_jev_transport()))` (key from `OPENROUTER_API_KEY`).
   Wire shape (verified against Spire's `library-rank.ts`, rung's `jev.rs` and
   Jev-Mem's recorded live exchanges): `POST https://openrouter.ai/api/v1/systemone`,
-  model `typesafe/jev-1.13`, body exactly `{model, state:{query}, questions:{p0..:
+  model `typesafe/jev-1.14` (override with `PROSPECTA_JEV_MODEL`; previous default `typesafe/jev-1.13`), body exactly `{model, state:{query}, questions:{p0..:
   {type:"score", instructions:{task, kind, title, text}, criteria}}}` with the
   four-string 0..3 legend and the record `task` copied from `library-rank.ts`;
   the reply's `answers` must hold exactly the asked ids, each a finite score in
