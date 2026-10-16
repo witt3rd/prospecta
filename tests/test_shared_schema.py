@@ -74,7 +74,7 @@ def test_migrations_touch_only_the_schema(bare_db):
     assert any(n == "prospecta_shared" and r == "prospecta_schema_version" for n, r in rels)
     assert all(n == "prospecta_shared" for n, _ in funcs), funcs
     assert exts == ["plpgsql", "vector"] or sorted(exts) == ["plpgsql", "vector"]
-    assert get_schema_version(bare_db, schema="prospecta_shared") == 18
+    assert get_schema_version(bare_db, schema="prospecta_shared") == 19
     assert get_schema_version(bare_db) is None          # nothing in public
     again = run_migrations(bare_db, schema="prospecta_shared")
     assert again["applied"] == []
@@ -100,7 +100,7 @@ def test_env_schema_is_used(bare_db, monkeypatch):
     m = Memory(database_url=bare_db, bank_id="b", embed=stub_embed)
     assert m.schema == "p_env"
     m.close()
-    assert get_schema_version(bare_db, schema="p_env") == 18
+    assert get_schema_version(bare_db, schema="p_env") == 19
 
 
 def test_refuses_when_schema_not_writable(bare_db):

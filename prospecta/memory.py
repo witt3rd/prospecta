@@ -275,6 +275,47 @@ class Memory:
             if cur.rowcount == 0:
                 raise ValueError(f"No such bank: {bank_id!r}")
 
+    def set_link_config(self, config: dict, bank_id: str | None = None) -> None:
+        """Set a bank's linker switches (banks.link_config). Keys: `links` (default
+        False: write link rows) and `entities` (default True: extract entities and
+        aliases). A key left out keeps its default; see docs/graph-links.md."""
+        import json as _json
+
+        from prospecta._linker import validate_link_config
+        validate_link_config(config)
+        bank_id = bank_id or self._default_bank_id
+        validate_bank_id(bank_id)
+        with self._pool.cursor() as cur:
+            cur.execute(
+                "UPDATE banks SET link_config = %s::jsonb, updated_at = now() "
+                "WHERE bank_id = %s", (_json.dumps(config), bank_id))
+            if cur.rowcount == 0:
+                raise ValueError(f"No such bank: {bank_id!r}")
+
+    def get_link_config(self, bank_id: str | None = None) -> dict:
+        """The bank's effective linker switches, defaults filled in."""
+        from prospecta._linker import effective_link_config
+        bank_id = bank_id or self._default_bank_id
+        with self._pool.cursor() as cur:
+            cur.execute("SELECT link_config FROM banks WHERE bank_id = %s", (bank_id,))
+            row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"No such bank: {bank_id!r}")
+        return effective_link_config(row[0])
+
+    def drop_links(self, bank_id: str | None = None, *, yes: bool = False,
+                   batch: int = 10000) -> dict:
+        """Remove the link rows (memory_links) of a bank, in small transactions
+        (row locks only: no table lock, safe beside retain and recall). Entities,
+        aliases, link state and the pair cache are kept. Refuses (PermissionError)
+        unless `yes=True`. Returns {"rows", "bytes"}: rows removed and the space
+        they took (estimate: average row of the table plus its indexes)."""
+        from prospecta._linkdrop import drop_links
+        bank_id = bank_id or self._default_bank_id
+        validate_bank_id(bank_id)
+        with self._pool.dedicated() as conn:
+            return drop_links(conn, bank_id, yes=yes, batch=batch)
+
     def _emit_stage_calls(self, traces: "list[dict]") -> None:
         """One llm_call event per model call a recall stage made."""
         for t in traces:

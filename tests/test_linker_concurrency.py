@@ -18,6 +18,7 @@ from tests.test_graph_links import EntityLLM, conn_of, docs
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_link_config({"links": True}, bank_id="b")
     yield m
     m.close()
 
@@ -47,6 +48,7 @@ def test_concurrent_linkers_all_link_without_errors(fresh_db):
     ms = []
     m0 = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
     m0.create_bank("b", embedding_dim=EMBED_DIM)
+    m0.set_link_config({"links": True}, bank_id="b")
     _seed(m0, 16)
     for _ in range(4):
         m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed,
@@ -179,6 +181,7 @@ def test_eight_writers_link_the_same_set_as_a_serial_run(fresh_db):
     # each pair from the later note only, so the comparison needs the same walks)
     ref = _mk(fresh_db, "s", linker=False)
     ref.create_bank("s", embedding_dim=EMBED_DIM)
+    ref.set_link_config({"links": True}, bank_id="s")
     for src, text, md in corpus:
         ref.retain(text, source=src, index_text=f"q {src}", metadata=md)
     ref._linker = Linker(llm=EntityLLM(), entity_hub=1000)   # a hub cut depends on arrival order
@@ -193,6 +196,7 @@ def test_eight_writers_link_the_same_set_as_a_serial_run(fresh_db):
     # 8 writers (own Memory each) retain concurrently into bank b ...
     writers = [_mk(fresh_db, "b", linker=False) for _ in range(8)]
     writers[0].create_bank("b", embedding_dim=EMBED_DIM)
+    writers[0].set_link_config({"links": True}, bank_id="b")
 
     def retain(i):
         for src, text, md in corpus[i::8]:
@@ -214,6 +218,7 @@ def test_eight_writers_retaining_with_inline_linking_fail_nothing(fresh_db):
     corpus = _clustered()
     writers = [_mk(fresh_db, "i") for _ in range(8)]
     writers[0].create_bank("i", embedding_dim=EMBED_DIM)
+    writers[0].set_link_config({"links": True}, bank_id="i")
 
     def retain(i):
         for src, text, md in corpus[i::8]:
