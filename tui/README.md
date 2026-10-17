@@ -65,10 +65,10 @@ what `cargo build` needs; builds offline via the committed `.sqlx/` cache.
 | # | Tab | What it shows |
 |---|-----|---------------|
 | 1 | **banks** | All banks with per-bank counts; `Enter` drills into documents |
-| 2 | **docs** | Documents in a bank → `Enter` descends into a document's `memory_items` (its chunks; a legacy bank may also hold question items) |
-| 3 | **events** | Live tail across the five event tables (retain, recall, formulate, llm_calls, sweep passes); `Enter` on a recall/retain row opens the full **thread** (the preceding formulate event — present only on the legacy question path — then recall, synthesis and the llm_calls of the ±10 s window; or retain → document → items → the `index_text` call, present only when a model wrote questions) |
-| 4 | **dashboard** | Per-bank 24h health: substrate counts, retain/recall rates, latency, the `parse_fallback` signal of the legacy formulate path, per-purpose llm_calls, and the **sweep status** panel (latest pass per corpus, ok/error/running + age) |
-| 5 | **search** | Free-text over the two stemmed lexical columns — `content_tsv` (the item's `content`: the chunk text, or the question of a legacy question item) and `body_tsv` (the source chunk). Each hit is labelled `both` / `question` / `body`; for a chunk item the two are the same text, so it is `both`. This is **not** Stage 1: no embedding, no exact retriever, no rerank. Use `prospecta search` for the production path. `R` opens the **retain** form |
+| 2 | **docs** | Documents in a bank → `Enter` descends into a document's `memory_items` (its chunks; an older bank may also hold question items) |
+| 3 | **events** | Live tail across the five event tables (retain, recall, formulate, llm_calls, sweep passes); `Enter` on a recall/retain row opens the full **thread** (the preceding formulate event — then recall, synthesis and the llm_calls of the ±10 s window; or retain → document → items → the `index_text` call: both only in rows written before those calls were removed) |
+| 4 | **dashboard** | Per-bank 24h health: substrate counts, retain/recall rates, latency, the `parse_fallback` signal of the removed formulate path (empty on a new database), per-purpose llm_calls, and the **sweep status** panel (latest pass per corpus, ok/error/running + age) |
+| 5 | **search** | Free-text over the two stemmed lexical columns — `content_tsv` (the item's `content`: the chunk text, or the question of an older bank's question item) and `body_tsv` (the source chunk). Each hit is labelled `both` / `question` / `body`; for a chunk item the two are the same text, so it is `both`. This is **not** Stage 1: no embedding, no exact retriever, no rerank. Use `prospecta search` for the production path. `R` opens the **retain** form |
 
 ## Keybindings
 
@@ -106,9 +106,8 @@ deployed:
 
 `retain` makes no model call, so a fully **offline, keyless** retain needs only
 `PROSPECTA_EMBEDDER=sentence-transformers` (see the library README's
-"Offline / keyless retain" section). Leave the form's `index_text` field empty
-for a bank created fresh: a note with `index_text` is written as question items
-*instead of* chunks, which `hybrid_chunk` does not search.
+"Offline / keyless retain" section). The form writes the note as chunks, like
+every other write.
 
 The form reports the honest CLI outcome: the document UUID on success, or the
 verbatim CLI error on failure. It never fabricates success.

@@ -27,9 +27,6 @@ pub struct RetainArgs {
     pub source: Option<String>,
     /// Comma-separated tag string (passed through to `--tags`).
     pub tags: Option<String>,
-    /// `--index-text` overrides (repeatable). When non-empty, the CLI skips
-    /// LLM index_text generation (P4) — this is the fully-offline retain path.
-    pub index_text: Vec<String>,
 }
 
 /// Result of a retain shell-out — the honest outcome contract: we report what
@@ -75,11 +72,6 @@ pub async fn retain(args: &RetainArgs) -> std::io::Result<RetainOutcome> {
     if let Some(t) = &args.tags {
         if !t.trim().is_empty() {
             cmd.arg("--tags").arg(t);
-        }
-    }
-    for it in &args.index_text {
-        if !it.trim().is_empty() {
-            cmd.arg("--index-text").arg(it);
         }
     }
 

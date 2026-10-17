@@ -65,10 +65,10 @@ struct Cli {
     #[arg(long, value_name = "BANK:QUERY")]
     dump_search: Option<String>,
 
-    /// Exercise the retain shell-out for a "BANK:CONTENT" pair and exit. The
-    /// index_text is auto-derived ("verifier: <content>") so it runs offline
-    /// when PROSPECTA_EMBEDDER=sentence-transformers. Prints the honest CLI
-    /// outcome (document_id or stderr). Verifier in the --dump-* family.
+    /// Exercise the retain shell-out for a "BANK:CONTENT" pair and exit. It
+    /// runs offline when PROSPECTA_EMBEDDER=sentence-transformers (a write
+    /// calls no model). Prints the honest CLI outcome (document_id or
+    /// stderr). Verifier in the --dump-* family.
     #[arg(long, value_name = "BANK:CONTENT")]
     dump_retain: Option<String>,
 }
@@ -353,7 +353,6 @@ async fn main() -> Result<()> {
             content: content.to_string(),
             source: Some("dump-retain-verifier".to_string()),
             tags: None,
-            index_text: vec![format!("verifier: {content}")],
         };
         let out = prospecta_tui::shell::retain(&args)
             .await
