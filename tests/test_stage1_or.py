@@ -13,9 +13,8 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from prospecta.db.queries import (
-    STAGE1_STEM_OR_TERMS, _stage1_statement, has_websearch_operators, stage1_search,
-)
+from prospecta.db import queries
+from prospecta.db.queries import _stage1_statement, has_websearch_operators, stage1_search
 from prospecta.memory import Memory
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
@@ -185,23 +184,22 @@ def test_the_statement_uses_the_or_form_only_without_operators():
 
 
 # --------------------------------------------------------------------------
-# a long question uses its longest words only
+# a long question uses every one of its words (no cap, nothing dropped silently)
 # --------------------------------------------------------------------------
 
-def test_the_or_keeps_the_longest_words_up_to_stem_or_terms(mem):
-    mem.retain("A cat sat here.", source="cat.md")
-    mem.retain("The crocodile slept.", source="croc.md")
-    q = "elephants crocodile cat"
-    assert matched(search(mem, q), "stem_rank") == {"cat.md", "croc.md"}              # three words: none dropped
-    assert matched(search(mem, q, stem_or_terms=2), "stem_rank") == {"croc.md"}       # 'cat' is the shortest
-    assert matched(search(mem, q, stem_or_terms=1), "stem_rank") == {"croc.md"}
-
-
-def test_by_default_nine_words_use_the_eight_longest(mem):
-    assert STAGE1_STEM_OR_TERMS == 8
-    words = ["qw" * (n // 2) + "q" * (n % 2) for n in range(3, 12)]      # 9 words of 3..11 letters
+def test_every_word_of_a_long_question_is_used(mem):
+    """There is no cap on the words of the OR: a word is never dropped for being short
+    (the old rule kept the 8 longest and ignored the rest without a word)."""
+    words = ["qw" * (n // 2) + "q" * (n % 2) for n in range(3, 21)]      # 18 words of 3..20 letters (under the 20 stemmed slots)
     for n, w in enumerate(words):
         mem.retain(f"Note holding {w} only.", source=f"w{n + 3}.md")
-    rows = search(mem, " ".join(words))
-    assert matched(rows, "stem_rank") == {f"w{n}.md" for n in range(4, 12)}        # the 3-letter word is dropped
-    assert matched(search(mem, " ".join(words[:8])), "stem_rank") == {f"w{n}.md" for n in range(3, 11)}
+    assert matched(search(mem, " ".join(words)), "stem_rank") == {f"w{n}.md" for n in range(3, 21)}
+
+
+def test_there_is_no_word_cap_in_the_statement_or_the_api(mem):
+    assert not hasattr(queries, "STAGE1_STEM_OR_TERMS")
+    sql, params = _stage1_statement(bank_id="b", query_text="a long plain question here",
+                                    query_embedding=[0.1] * 4)
+    assert "stem_or_terms" not in params and "stem_or_terms" not in sql
+    with pytest.raises(TypeError):
+        _stage1_statement(bank_id="b", query_text="x", query_embedding=[0.1] * 4, stem_or_terms=2)

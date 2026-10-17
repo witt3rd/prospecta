@@ -959,7 +959,6 @@ STAGE1_SEMANTIC_LIMIT = 25
 STAGE1_STEMMED_LIMIT = 20
 STAGE1_EXACT_LIMIT = 20
 STAGE1_FUSED_LIMIT = 50
-STAGE1_STEM_OR_TERMS = 8
 STAGE1_HNSW_EF_SEARCH = 100
 STAGE1_HEADLINE_OPTIONS = ('StartSel=<<, StopSel=>>, MaxWords=35, MinWords=15, '
                            'MaxFragments=2, FragmentDelimiter=" … "')
@@ -1057,13 +1056,12 @@ ORDER BY f.rrf_score DESC, c.id
 # only a chunk holding every one of its words. The words come out of the parser
 # (to_tsvector: stemmed, stop words gone), never out of the text, and each is quoted for
 # tsquery (the backslash and the single quote doubled), so no text can add an operator.
-# At most STAGE1_STEM_OR_TERMS words are used, the longest first (word length tracks
-# rarity): cover-density ranking costs more per row with every query word, so an uncapped
-# long brief would rank most of the bank at tens of microseconds a row.
+# Every word is used: there is no cap (a cap dropped words without saying so); a longer
+# question costs more per matching row (docs/exact-tsv.md has the measured cost).
 _STEM_OR = r"""(SELECT COALESCE(string_agg(t.quoted, ' | '), '')::tsquery FROM (
           SELECT '''' || replace(replace(w.lexeme, '\', '\\'), '''', '''''') || '''' AS quoted
           FROM unnest(to_tsvector('english', %(qt)s)) AS w
-          ORDER BY length(w.lexeme) DESC, w.lexeme LIMIT %(stem_or_terms)s) t)"""
+          ORDER BY w.lexeme) t)"""
 _STEM_WEBSEARCH = "websearch_to_tsquery('english', %(qt)s)"
 # The documented search-box operators: a straight double quote, a standalone OR, a word led
 # by a hyphen (-exclude).
@@ -1083,7 +1081,6 @@ def _stage1_statement(
     metadata_filter: dict | None = None,
     semantic_limit: int = STAGE1_SEMANTIC_LIMIT, stemmed_limit: int = STAGE1_STEMMED_LIMIT,
     exact_limit: int = STAGE1_EXACT_LIMIT, fused_limit: int = STAGE1_FUSED_LIMIT,
-    stem_or_terms: int = STAGE1_STEM_OR_TERMS,
 ) -> tuple[str, dict]:
     sql = (_STAGE1_SQL
            .replace("__STEM__", _STEM_WEBSEARCH if has_websearch_operators(query_text) else _STEM_OR)
@@ -1098,7 +1095,6 @@ def _stage1_statement(
         "meta": _meta_param(metadata_filter), "headline": STAGE1_HEADLINE_OPTIONS,
         "semantic_limit": int(semantic_limit), "stemmed_limit": int(stemmed_limit),
         "exact_limit": int(exact_limit), "fused_limit": int(fused_limit),
-        "stem_or_terms": int(stem_or_terms),
     }
     return sql, params
 
@@ -1171,7 +1167,7 @@ def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query)
     before its slots are cut. `query_text` is read by websearch_to_tsquery:
     "exact phrase", OR, -exclude. A plain question (no such operator, see
     has_websearch_operators) is read by the stemmed retriever as the OR of its stemmed
-    words, the `stem_or_terms` longest at most (default 8), ranked by ts_rank_cd; the
+    words (all of them: no cap), ranked by ts_rank_cd; the
     exact retriever always keeps websearch semantics (AND). The semantic retriever reads at least
     `hnsw_ef_search` index candidates and keeps scanning (pgvector iterative scan)
     until its slots are full.

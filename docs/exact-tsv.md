@@ -104,8 +104,26 @@ in 12% of the chunks 1.1 s to 0.09 s, one in 40% of them 3.9 s to 0.32 s; select
 
 ## The plain-question OR (stemmed retriever) and its cost
 
-A plain question is read by the stemmed retriever as the OR of its stemmed words (at most the 8
-longest; `docs/postgres-hybrid.md` section 3). That ranks every chunk holding any of them, so a
-question of common content words costs about the same as the common-word queries above, and the cap
-keeps a long brief from ranking the bank with dozens of terms (40 mid-frequency words: 4.3 s uncapped,
-0.3 s capped, on the synthetic bank).
+A plain question is read by the stemmed retriever as the OR of **all** its stemmed words
+(`docs/postgres-hybrid.md` section 3). There is no cap: an earlier version kept the 8 longest words and
+dropped the rest without a word, and that silent loss is gone. The OR ranks every chunk holding any of
+the words (`ts_rank_cd`, a few microseconds a matching chunk, and more with every extra word), so the
+cost depends on how common the words are and how many there are.
+
+Measured on the 73,000-chunk synthetic bank (Zipf words, container Postgres 16 on host x; p50 and max
+of 9 warm runs, server-side `EXPLAIN ANALYZE` execution time; the client-side time is within 10%):
+
+| plain question | server p50 | server max |
+|---|---|---|
+| 8 mid-frequency words (what the cap allowed) | 0.32 s | 0.37 s |
+| 20 rare words (each in under 1% of the chunks) | 0.31 s | 0.40 s |
+| 20 words: 14 of mixed frequency and 6 stop words | 0.29 s | 0.35 s |
+| **20 mid-frequency words** (each in a few percent of the chunks) | **1.41 s** | 2.66 s |
+| 20 very common non-stop words (the worst case) | 3.16 s | 3.58 s |
+| 40 mid-frequency words | 4.22 s | 5.91 s |
+
+So a 20-word question is fine when its words are mixed or rare (about 0.3 s, like a short one), and slow,
+over a second, when most of its words are common content words; a long list of common words costs
+seconds. This is not capped here: whether to bound it (and how) is a product decision. The automatic
+recall of `docs/postgres-hybrid.md` section 1 feeds the stemmed retriever a short `query` per search, so
+the words per OR stay few there.
