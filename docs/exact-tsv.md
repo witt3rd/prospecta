@@ -25,10 +25,14 @@ Stage 1 results equal the old expression form row for row.
 
 **Adding the column REWRITES `memory_items`.** PostgreSQL computes the new column for every row of every
 bank and kind, writes a new copy of the table and rebuilds every index on it (the HNSW indexes
-included), all under an `ACCESS EXCLUSIVE` lock: **reads and writes of `memory_items` wait until it
-commits.** Every process that calls `run_migrations` with this release (`prospecta migrate`,
-`prospecta init`, `python -m prospecta.service` at start-up) runs it, so a gateway must not start on this
-release before the migration has been run by hand.
+included), all under an **`ACCESS EXCLUSIVE` lock held for the whole rewrite (172 s on the synthetic
+73,000-chunk bank with its HNSW indexes, table below): reads and writes of `memory_items` wait until it
+commits.** Nothing can query the table while it runs, so on augur-v2 and forge-v2 the migration runs
+**with the gateways STOPPED, inside the restart window**, never against a serving gateway: a recall
+that arrives during the rewrite hangs until its request timeout. Every process that calls
+`run_migrations` with this release (`prospecta migrate`, `prospecta init`, `python -m prospecta.service`
+at start-up) runs it, so a gateway must not start on this release before the migration has been run by
+hand, and the live window length is a **measurement on a copy** (pre-flight below), not an estimate.
 
 Measured on a synthetic 73,000-chunk bank (1536-dim vectors, 120-word chunks, two HNSW indexes of
 about 600 MB each, container Postgres 16.15 with pgvector 0.8.7 on a 22-core host):
@@ -51,22 +55,67 @@ and its time per row are smaller; the HNSW rebuild, which grows with the vector 
 The live figures are an estimate, not a measurement: the slice 5 report lists about 2.2 GB of HNSW
 indexes for forge-v2 and 0.5 GB for augur-v2 (against 1.2 GB in the synthetic bank), plus the old
 banks' indexes, so expect **roughly 6 to 10 minutes** for the rewrite on x-class hardware and more on
-slower hardware. Rehearse it on a restored copy first. The rewrite also writes the whole table and its
+slower hardware: the pre-flight below measures it on a copy. The rewrite also writes the whole table and its
 indexes to WAL and needs free disk of about the current size of `memory_items` plus the new column.
 
 ## Operator runbook (augur-v2 and forge-v2: at go-live, with the captain's word only)
 
 One database holds both banks in one `memory_items` table, so this is one migration, not one per bank.
 
+### Pre-flight (REQUIRED, before the window): measure the migration on a COPY of the live database
+
+The time and size figures above are for a synthetic bank. The live table's rewrite time and size delta
+depend on its row count, its chunk text and above all its HNSW indexes, so **no go-live is scheduled
+until the two numbers below have been measured on a copy of the live data and written into the go-live
+notes.** The copy is a scratch database on host x or chef; **the live database is never migrated for a
+rehearsal and never connected to by anything but the dump.**
+
+1. **Copy.** The rewrite scales with the whole table and its indexes, not with one bank, so copy the
+   whole database (it holds every bank's `memory_items`, documents and the HNSW indexes): the step 1
+   backup is that copy (`pg_dump -Fc`, read-only: it takes no lock that blocks a reader or writer). On
+   x or chef start a throwaway Postgres of the **same major version and pgvector version as live**
+   (`SELECT version();` and `SELECT extversion FROM pg_extension WHERE extname = 'vector';` on live;
+   settings that matter for the timing: `shared_buffers`, `maintenance_work_mem`, `max_wal_size`; use the
+   live values), then restore the dump into it (`docs/embedding-migration.md` section 1 has the
+   commands; `prospecta backup` / `restore` wrap them):
+   ```
+   pg_restore --no-owner -d "$SCRATCH_DATABASE_URL" prospecta-YYYY-MM-DD.dump
+   ```
+   Compare `documents` and `memory_items` counts per bank between live and the scratch.
+2. **Measure before.** On the scratch:
+   ```sql
+   SELECT pg_size_pretty(pg_total_relation_size('memory_items')) AS table_toast_and_indexes,
+          pg_size_pretty(pg_relation_size('memory_items'))       AS heap,
+          pg_size_pretty(pg_indexes_size('memory_items'))        AS indexes,
+          pg_size_pretty(pg_database_size(current_database()))   AS database;
+   ```
+   and note the free disk on the scratch volume (`df -h`).
+3. **Migrate the scratch and time it.** With the new release's CLI against the **scratch** URL only:
+   `time prospecta --database-url "$SCRATCH_DATABASE_URL" migrate` (it prints `Applied: [20]`). Record the
+   wall-clock **seconds** (the `ACCESS EXCLUSIVE` rewrite, then the concurrent index build), the peak
+   free-disk dip and the WAL written (`SELECT pg_current_wal_lsn()` before and after; `pg_wal_lsn_diff`).
+4. **Measure after**: the same size query; record the **size delta** (table, indexes, database).
+5. **Write the numbers into the go-live notes**: rewrite seconds, index-build seconds, size delta, WAL, and
+   the free disk the live volume needs (at least the current `pg_total_relation_size('memory_items')`
+   again, plus the delta). The restart window is those seconds with a margin (at least twice) plus the
+   restart; if that window is not acceptable, the alternative (a plain nullable column kept by a trigger
+   and backfilled in batches, which avoids the rewrite and its lock but is not the stored generated
+   column `docs/postgres-hybrid.md` specifies) is reconsidered before go-live, not during it.
+
+The scratch can be repeated as often as needed (drop the scratch database and restore again); only the
+numbers are carried to the go-live. Remove the scratch and the dump when done (they hold real data).
+
+### The go-live window
+
 1. **Back up first.** `docs/backup-restore.md` (a `pg_dump` of the database; the generated column is
-   recomputed on restore, it is not dumped). Check free disk against
-   `SELECT pg_size_pretty(pg_total_relation_size('memory_items'))`.
-2. **No gateway or service starts on this release yet.** Stop writers; keep the old release's processes
-   stopped or idle for the window (the lock makes them wait or time out).
+   recomputed on restore, it is not dumped). Check free disk against the pre-flight's figure.
+2. **Stop the gateways** (augur and forge, and anything else that reads or writes `memory_items`: the
+   rewrite's `ACCESS EXCLUSIVE` lock makes every query wait) for the whole window. **No gateway or
+   service starts on this release before step 3 has finished.**
 3. **Migrate by hand**, with the new release's CLI and the database URL in the environment:
-   `prospecta migrate`. It prints `Applied: [20]`. Expect the times above: the rewrite first (the lock),
-   then the index build (no lock). Optionally `ANALYZE memory_items;` afterwards (autovacuum does it
-   in due course; the Stage 1 plan does not depend on it).
+   `prospecta migrate`. It prints `Applied: [20]`. Expect the pre-flight's seconds: the rewrite first (the
+   lock), then the index build (no lock). Optionally `ANALYZE memory_items;` afterwards (autovacuum does
+   it in due course; the Stage 1 plan does not depend on it).
 4. **Verify.**
    ```sql
    SELECT attgenerated FROM pg_attribute
@@ -76,7 +125,7 @@ One database holds both banks in one `memory_items` table, so this is one migrat
    SELECT count(*) FROM memory_items WHERE exact_tsv IS NULL AND original_chunk IS NOT NULL;   -- 0
    ```
    and one `the` question through Stage 1 (about 0.1 to 0.7 s, not seconds).
-5. **Start the gateways** on the new release.
+5. **Start the gateways** on the new release (the end of the window).
 6. **Interrupted index build** (the migration was killed after the rewrite): run `prospecta migrate`
    again. It sees the invalid or missing index, drops the leftover and rebuilds it concurrently.
    The rewrite is never repeated: the migration is recorded as applied, and the column add is
