@@ -12,7 +12,7 @@ def llm_text(out) -> str:
 
 
 def llm_call_record(out, *, purpose: str, model: str | None = None) -> dict:
-    """A call record (the shape stages.call_llm appends) for a return value."""
+    """A call record (the shape the stages and the query writer append) for a return value."""
     return {
         "purpose": purpose,
         "model": getattr(out, "model", None) or model,

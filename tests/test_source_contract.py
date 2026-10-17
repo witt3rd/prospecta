@@ -38,16 +38,12 @@ def _q(url, sql, *params):
 
 @pytest.fixture
 def env(bare_db, monkeypatch):  # noqa: F811
-    # the bm25 channel's in-process index is an explicit opt-in, as in a bank that wants it
-    monkeypatch.setattr(Bm25Chunks, "backend", AutoBm25(fallback=InProcessBm25()))
     with psycopg.connect(bare_db, autocommit=True) as c:
         c.execute(HOST_DDL)
     run_migrations(bare_db, schema="prospecta_shared")
-    mem = Memory(database_url=bare_db, bank_id="b", embed=stub_embed,
-                 llm=lambda messages, **k: "What is the first thing?\nWhy does the second thing matter?",
-                 schema="prospecta_shared")
+    mem = Memory(database_url=bare_db, bank_id="b", embed=stub_embed, schema="prospecta_shared")
     mem.create_bank("b", embedding_dim=EMBED_DIM)
-    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)), generate_questions=True)
+    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)))
     yield bare_db, mem, ix
     mem.close()
 
@@ -79,10 +75,10 @@ def test_index_is_idempotent_and_keeps_no_text(env):
     url, mem, ix = env
     _note(url, 1)
     r = ix.index_record("note", "1")
-    assert (r.status, r.revision) == ("indexed", "1") and r.items >= 3
+    assert (r.status, r.revision) == ("indexed", "1") and r.items >= 1
     assert ix.index_record("note", "1").status == "unchanged"
     kinds = [k for k, _ in _items(url, "1")]
-    assert kinds.count("question") == 2 and kinds.count("chunk") >= 1
+    assert kinds and set(kinds) == {"chunk"}
     # no second store of record: the anchor document holds no text
     assert _q(url, "SELECT original_text FROM prospecta_shared.documents") == [("",)]
     assert _q(url, "SELECT count(*) FROM prospecta_shared.documents")[0][0] == 1
@@ -91,21 +87,13 @@ def test_index_is_idempotent_and_keeps_no_text(env):
                    "WHERE n.nspname='host_app'")[0][0] == 3   # notes, its pkey index, records view
 
 
-def test_index_makes_no_model_call_unless_questions_are_asked_for(env):
-    url, mem, asking = env
+def test_index_makes_no_model_call(env):
+    url, mem, ix = env
     calls = []
     mem._llm = lambda messages, **k: calls.append(messages) or "What is the first thing?"
-    plain = SourceIndexer(mem, SourceConfig("host_app", ("records",)))
     _note(url, 1)
-    assert plain.index_record("note", "1").items >= 1
+    assert ix.index_record("note", "1").items >= 1
     assert calls == [] and {k for k, _ in _items(url, "1")} == {"chunk"}
-    _note(url, 2)
-    asking.index_record("note", "2")
-    kinds = [k for k, _ in _items(url, "2")]
-    assert len(calls) == 1 and kinds.count("question") == 1 and kinds.count("chunk") >= 1
-    mem._llm = None
-    with pytest.raises(ValueError, match="llm"):
-        SourceIndexer(mem, SourceConfig("host_app", ("records",)), generate_questions=True)
 
 
 def test_revision_change_retires_old_items(env):
@@ -231,11 +219,9 @@ def test_http_round_trip_and_auth(env):
 # ---- allowed-audience filter -------------------------------------------------
 
 from prospecta.channels.base import Filters, QueryPlan, RecallState  # noqa: E402
-from prospecta.channels.bm25 import AutoBm25, Bm25Chunks, InProcessBm25  # noqa: E402
-from prospecta.channels.graph import GraphExpand  # noqa: E402
 from prospecta.channels.hybrid import HybridChunks  # noqa: E402
 from prospecta.channels.meta import MetadataScope  # noqa: E402
-from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks  # noqa: E402
+from prospecta.channels.semantic import DenseChunks  # noqa: E402
 
 GARDEN = "Gardens need water and sun to grow."
 
@@ -251,23 +237,11 @@ def _channel_docs(mem, text, allow):
     plan = QueryPlan(text=text, filters=Filters(people=["ann"]))
     out = {}
     with mem._pool.connection() as conn:
-        for ch in (DenseChunks(), AnticipatedQuestions(), Bm25Chunks(), HybridChunks(), MetadataScope()):
+        for ch in (DenseChunks(), HybridChunks(), MetadataScope()):
             st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
             out[ch.name] = {c.document_id for c in ch.retrieve(plan, st)}
-        st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
-        seed = DenseChunks().retrieve(plan, RecallState(conn=conn, bank_id="b", embed=stub_embed,
-                                                        metadata_filter=flt))
-        st.pool = seed
-        out["graph"] = {c.document_id for c in GraphExpand().retrieve(plan, st)}
         conn.rollback()
     return out
-
-
-def _link_all(url):
-    _q(url, "INSERT INTO prospecta_shared.memory_links (bank_id, src, dst, link_type, subtype) "
-            "SELECT 'b', a.id, c.id, 'SEMANTIC', 'RELATED_TO' "
-            "FROM prospecta_shared.memory_items a, prospecta_shared.memory_items c "
-            "WHERE a.document_id <> c.document_id AND a.kind = 'chunk' AND c.kind = 'chunk'")
 
 
 def test_allowed_audience_excludes_record_from_every_channel(env):
@@ -276,11 +250,10 @@ def test_allowed_audience_excludes_record_from_every_channel(env):
     _note(url, 2, body=GARDEN + " Gardens also like tea.", aud="team-b")
     _note(url, 3, body=GARDEN + " Gardens and rain.", aud="")
     ix.reindex_kind("note")
-    _link_all(url)
     d1, d2, d3 = _ids(url, "1"), _ids(url, "2"), _ids(url, "3")
     # Sanity: with no filter the other audiences are candidates, in every channel.
     base = _channel_docs(mem, GARDEN, None)
-    for name in ("dense_chunk", "question", "bm25", "hybrid_chunk", "meta", "graph"):
+    for name in ("dense_chunk", "hybrid_chunk", "meta"):
         assert base[name], name
     assert (d2 | d3) & set().union(*base.values())
     # Restricted to team-a: nothing else, in any channel.
@@ -445,15 +418,14 @@ def test_reconcile_document_scope_replaces_pieces(env):
 import time  # noqa: E402
 
 N_FAKE = 300
-LLM_DELAY = 0.02   # stands in for the anticipated-question model call
+EMBED_DELAY = 0.02   # stands in for the embedding provider's latency
 
 
-def _slow_llm(messages, **k):
-    text = json.dumps(messages)
-    if "EXPLODE" in text:
+def _slow_embed(texts):
+    if any("EXPLODE" in t for t in texts):
         raise RuntimeError("model failed")
-    time.sleep(LLM_DELAY)
-    return "What is the first thing?\nWhy does the second thing matter?"
+    time.sleep(EMBED_DELAY)
+    return stub_embed(texts)
 
 
 def _fake_records(url, n=N_FAKE, bad=()):
@@ -466,12 +438,10 @@ def _fake_records(url, n=N_FAKE, bad=()):
                       (i, body, "2026-02-01" if i % 50 == 49 else None))
 
 
-def _indexer(url, bank, llm=_slow_llm, concurrency=1):
-    mem = Memory(database_url=url, bank_id=bank, embed=stub_embed, llm=llm,
-                 schema="prospecta_shared")
+def _indexer(url, bank, embed=_slow_embed, concurrency=1):
+    mem = Memory(database_url=url, bank_id=bank, embed=embed, schema="prospecta_shared")
     mem.create_bank(bank, embedding_dim=EMBED_DIM)
-    return mem, SourceIndexer(mem, SourceConfig("host_app", ("records",)), concurrency,
-                              generate_questions=True)
+    return mem, SourceIndexer(mem, SourceConfig("host_app", ("records",)), concurrency)
 
 
 def _snapshot(url, bank):
@@ -578,7 +548,8 @@ def test_concurrent_reindex_matches_sequential(env):
 def _channel_env(env):
     from prospecta.channels.registry import DEFAULT_CHANNEL_CONFIG
     url, mem, ix = env
-    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] in ("dense_chunk", "question")]
+    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] == "dense_chunk"]
+    cfg.append({"name": "hybrid_chunk", "enabled": True, "weight": 1, "params": {}})
     mem.set_channel_config(cfg)
     _note(url, 1, body="Gardens need water and sun.")
     ix.reindex_kind("note")
@@ -600,29 +571,29 @@ def test_explain_absent_response_is_byte_identical(env):
 def test_explain_hit_found_by_two_channels_shows_both(env):
     svc = _channel_env(env)
     out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
-    assert sorted(out["channels_run"]) == ["dense_chunk", "question"]
+    assert sorted(out["channels_run"]) == ["dense_chunk", "hybrid_chunk"]
     assert out["channels_failed"] == []
     hit = out["results"][0]
-    assert {c["channel"] for c in hit["channels"]} == {"dense_chunk", "question"}
+    assert {c["channel"] for c in hit["channels"]} == {"dense_chunk", "hybrid_chunk"}
     w = {c["channel"]: c["weight"] for c in hit["channels"]}
-    assert w == {"dense_chunk": 4.0, "question": 1.0}
+    assert w == {"dense_chunk": 4.0, "hybrid_chunk": 1.0}
     assert all(c["rank"] == 1 and isinstance(c["score"], float) for c in hit["channels"])
 
 
 def test_explain_failed_and_skipped_channels_listed(env, monkeypatch):
     from prospecta.channels import semantic
-    from prospecta.channels.registry import DEFAULT_CHANNEL_CONFIG
     svc = _channel_env(env)
-    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] in ("dense_chunk", "question")]
-    cfg.append({"name": "bm25", "enabled": False, "weight": 1})
+    cfg = [{"name": "dense_chunk", "enabled": True, "weight": 4},
+           {"name": "hybrid_chunk", "enabled": True, "weight": 1},
+           {"name": "meta", "enabled": False, "weight": 1}]
     env[1].set_channel_config(cfg)
-    monkeypatch.setattr(semantic.AnticipatedQuestions, "_sql", "SELECT broken FROM nowhere")
+    monkeypatch.setattr(semantic.DenseChunks, "_sql", "SELECT broken FROM nowhere")
     out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
-    assert out["channels_run"] == ["dense_chunk"]
+    assert out["channels_run"] == ["hybrid_chunk"]
     failed = {f["channel"]: f["reason"] for f in out["channels_failed"]}
-    assert failed["question"].startswith("failed:")
-    assert failed["bm25"].startswith("skipped:") and "disabled" in failed["bm25"]
-    assert [c["channel"] for c in out["results"][0]["channels"]] == ["dense_chunk"]
+    assert failed["dense_chunk"].startswith("failed:")
+    assert failed["meta"].startswith("skipped:") and "disabled" in failed["meta"]
+    assert [c["channel"] for c in out["results"][0]["channels"]] == ["hybrid_chunk"]
 
 
 def test_explain_must_be_boolean(env):

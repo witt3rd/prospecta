@@ -6,20 +6,17 @@ Replace-on-source-match (docs/schema.md, "Re-retain"):
   - Same content_hash + DIFFERENT source → raise DocumentSourceConflictError.
   - New content_hash → INSERT new documents row.
 
-By default a note is indexed as its own chunks: kind='chunk' items whose
-content and original_chunk are the chunk text, with no model call. Question
-items exist only when the caller supplies `index_text` or asks for generated
-ones (`generate_questions=True`).
+A note is indexed as its own chunks: kind='chunk' items whose content and
+original_chunk are the chunk text, with no model call. Question items exist only
+when the caller supplies `index_text` (the model-written questions of the old
+`generate_questions` option were removed: docs/legacy.md).
 
 P-principles enforced here:
-  P1 — question items (opt-in) hold question-shaped index_text strings; the
-       full body lives in documents.original_text.
-  P3 — zero provider imports; uses memory.llm and memory.embed callables.
-  P4 — caller-supplied index_text bypasses LLM; prompt_override bypasses
-       default prompt.
-  P5 — original content preserved verbatim in documents.original_text
-       (and memory_items.original_chunk = full body for LLM-generated
-       paths, matching the T10 frontmatter override pattern).
+  P1 — question items (the caller's own) hold question-shaped index_text strings;
+       the full body lives in documents.original_text.
+  P3 — zero provider imports; uses the memory.embed callable.
+  P4 — caller-supplied index_text is written as given.
+  P5 — original content preserved verbatim in documents.original_text.
 """
 from __future__ import annotations
 
@@ -32,7 +29,6 @@ from typing import TYPE_CHECKING
 
 from prospecta._chunker import chunk_paragraphs
 from prospecta._filters import filter_fields, today
-from prospecta._index_text import generate_index_text
 from prospecta._types import DocumentSourceConflictError
 from prospecta.db.queries import (
     delete_memory_items_for_document,
@@ -54,8 +50,6 @@ def retain(
     content: str,
     *,
     index_text: str | list[str] | None = None,
-    generate_questions: bool = False,
-    index_text_prompt_override: str | None = None,
     source: str | None = None,
     path: Path | str | None = None,
     tags: list[str] | None = None,
@@ -63,7 +57,7 @@ def retain(
     update_mode: str = "append",
     child_chunks: bool = False,
 ) -> str:
-    """Write-side bilateral spine. Returns document_id (str UUID).
+    """Write a note. Returns document_id (str UUID).
 
     Default: the note is written as kind='chunk' items of at most 1,000 chars
     at paragraph boundaries (small overlap), each carrying the parent
@@ -71,10 +65,6 @@ def retain(
 
     index_text: caller-supplied question strings, written as the note's
     question items instead of the chunks (add child_chunks=True for both).
-    generate_questions (default False): ask the model for anticipated
-    questions and write those as question items instead of the chunks. It
-    needs `llm`, and `index_text_prompt_override` (the prompt template) only
-    applies with it; index_text and generate_questions exclude each other.
     child_chunks: also write the chunk items next to the question items.
 
     documents.created_on is always stamped: the note's own date (frontmatter
@@ -90,11 +80,6 @@ def retain(
 
     if not isinstance(content, str):
         raise TypeError(f"content must be str, got {type(content).__name__}")
-    if index_text is not None and generate_questions:
-        raise ValueError("index_text and generate_questions are mutually exclusive")
-    if index_text_prompt_override is not None and not generate_questions:
-        raise ValueError("index_text_prompt_override applies only with generate_questions=True")
-
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------
@@ -129,9 +114,6 @@ def retain(
     # ------------------------------------------------------------------
     caller_supplied = index_text is not None
     index_text_list: list[str] = []
-    raw_llm_response: str | None = None
-    rendered_prompt: str | None = None
-    index_text_generated: list[str] | None = None
     if index_text is not None:
         if isinstance(index_text, str):
             index_text_list = [index_text]
@@ -141,43 +123,10 @@ def retain(
             raise TypeError(
                 f"index_text must be str | list[str] | None, got {type(index_text).__name__}"
             )
-        # Strip/dedupe to match LLM-path discipline.
+        # Strip/dedupe.
         index_text_list = _dedupe_strip(index_text_list)
         if not index_text_list:
             raise ValueError("index_text resolved to empty list after stripping")
-    elif generate_questions:
-        if memory._llm is None:
-            raise RuntimeError(
-                "Memory.retain(generate_questions=True) requires an `llm` callable; "
-                "construct Memory(llm=...)"
-            )
-        prompt_context: dict = {
-            "tags": tags_list,
-            "source": resolved_source,
-            **extra_metadata,
-        }
-        index_text_list, rendered_prompt, raw_llm_response = generate_index_text(
-            content,
-            memory._llm,
-            prompt_override=index_text_prompt_override,
-            context=prompt_context,
-        )
-        index_text_generated = list(index_text_list)
-        # T16 + 0003: tracer event for the LLM call carries verbatim
-        # prompt + response so PostgresSink can durably persist them
-        # (opt-in via PostgresSink(persist_llm_text=...)).
-        try:
-            memory._tracer("llm_call", {
-                "bank_id": bank_id,
-                "purpose": "index_text",
-                "json_mode": False,
-                "duration_ms": int((time.monotonic() - t_start) * 1000),
-                "messages_count": 1,
-                "prompt_text": rendered_prompt,
-                "response_text": raw_llm_response,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on llm_call (index_text); ignoring")
 
     # ------------------------------------------------------------------
     # Re-retain check (docs/schema.md, "Re-retain").
@@ -255,7 +204,7 @@ def retain(
                 },
                 "tags": tags_list,
                 "update_mode": update_mode,
-                "llm_generated": not caller_supplied,
+                "llm_generated": False,
             })
         if child_chunks or not index_text_list:
             chunk_vectors = memory._embed([c.content for c in chunks]) if chunks else []
@@ -297,15 +246,14 @@ def retain(
             "items_count": len(items),
             "index_text_caller_supplied": caller_supplied,
             "duration_ms": duration_ms,
-            "raw_llm_response": raw_llm_response,
+            "raw_llm_response": None,
             "error": None,
             "source": resolved_source,
-            "index_text_generated": index_text_generated,
+            "index_text_generated": None,
         })
     except Exception:  # pragma: no cover — tracer must not break retain
         logger.exception("tracer raised; ignoring")
 
-    memory._enqueue_link(document_id)
     return document_id
 
 

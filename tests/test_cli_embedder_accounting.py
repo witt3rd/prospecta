@@ -1,13 +1,11 @@
-"""F4/F6/F10/F14: embedder dimensions, health mismatch, accounted LLM contract, BM25 dir."""
+"""F4/F6/F10/F14: embedder dimensions, health mismatch, accounted LLM contract."""
 from __future__ import annotations
 
 import argparse
 from datetime import datetime
 
 from prospecta._formulate import formulate_queries
-from prospecta._index_text import generate_index_text
 from prospecta._rag import synthesize
-from prospecta.channels import bm25
 from prospecta.channels.extract import extract_filters
 from prospecta.cli import _common, health
 from prospecta.stages import LLMResult
@@ -59,18 +57,13 @@ def test_health_dim_mismatch_is_down(monkeypatch, capsys):
 
 def test_stage_kwargs_need_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("PROSPECTA_LINKER", raising=False)
     monkeypatch.delenv("PROSPECTA_JEV", raising=False)
     assert _common._stage_kwargs() == {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-not-real")
     kw = _common._stage_kwargs()
-    assert {"rerank_llm", "synth_llm", "rerank_transport", "jev"} <= set(kw)
-    assert "linker" not in kw             # no bank to read: the linker is not built by default
-    monkeypatch.setenv("PROSPECTA_LINKER", "on")
-    assert "linker" in _common._stage_kwargs()
+    assert set(kw) == {"synth_llm", "rerank_transport", "jev"}      # never a linker: it was removed
     monkeypatch.setenv("PROSPECTA_JEV", "off")
-    monkeypatch.setenv("PROSPECTA_LINKER", "off")
-    assert "jev" not in _common._stage_kwargs() and "linker" not in _common._stage_kwargs()
+    assert "jev" not in _common._stage_kwargs()
 
 
 def _accounted(text):
@@ -78,8 +71,6 @@ def _accounted(text):
 
 
 def test_every_llm_user_accepts_llmresult():
-    lines, _, raw = generate_index_text("body", _accounted("What is it?\nWho?"))
-    assert lines == ["What is it?", "Who?"] and isinstance(raw, str)
     qs, out = formulate_queries("hello", llm=_accounted('{"queries":[{"text":"a"}]}'))
     assert [q.text for q in qs] == ["a"] and not out.parse_fallback
     assert synthesize("q", [], _accounted("answer"))[0] == "answer"
@@ -88,16 +79,3 @@ def test_every_llm_user_accepts_llmresult():
                         people_vocab=["Greg"], now=datetime(2026, 1, 1), calls=calls)
     assert f.people == ["Greg"] and f.hard
     assert calls[0]["purpose"] == "extract_filters" and calls[0]["cost_usd"] == 0.5
-
-
-def test_bm25_dir_never_home_cache(monkeypatch, tmp_path):
-    monkeypatch.delenv("PROSPECTA_BM25_DIR", raising=False)
-    monkeypatch.delenv("PROSPECTA_DATA_DIR", raising=False)
-    assert bm25.index_dir() is None
-    monkeypatch.setenv("PROSPECTA_DATA_DIR", str(tmp_path))
-    assert bm25.index_dir() == tmp_path / "bm25"
-    monkeypatch.setenv("PROSPECTA_BM25_DIR", str(tmp_path / "x"))
-    assert bm25.index_dir() == tmp_path / "x"
-    monkeypatch.delenv("PROSPECTA_BM25_DIR")
-    monkeypatch.delenv("PROSPECTA_DATA_DIR")
-    assert bm25.InProcessBm25()._path("b") is None

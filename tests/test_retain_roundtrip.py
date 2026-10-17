@@ -2,8 +2,6 @@
 
 Acceptance criteria:
   - caller-supplied index_text bypasses LLM (P4)
-  - LLM-generated index_text becomes memory_items rows (P1)
-  - prompt_override is rendered with content interpolated (P4)
   - retain_events row appended with correct columns
   - replace-on-source-match (docs/schema.md, "Re-retain")
   - DocumentSourceConflictError on hash collision with different source
@@ -90,60 +88,6 @@ def test_retain_caller_supplied_index_text(memory_with_bank_and_mock_llm, mock_l
     doc = _document_row(mem.database_url, doc_id)
     assert doc["original_text"] == body
     assert doc["source"] == "kelly-bio"
-
-
-# ---------------------------------------------------------------------------
-# 2. LLM-generated index_text (generate_questions=True) becomes memory_items rows
-# ---------------------------------------------------------------------------
-
-def test_retain_llm_generated_index_text(memory_with_bank_and_mock_llm, mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    body = "The forge bench was warm. Sparks flew."
-    doc_id = mem.retain(body, source="bench-note", generate_questions=True)
-
-    assert len(mock_llm.calls) == 1
-    rows = _rows_for_document(mem.database_url, doc_id)
-    # Default mock_llm returns three lines.
-    assert len(rows) == 3
-    expected = sorted([
-        "What does this say?",
-        "Why does it matter?",
-        "When was this stored?",
-    ])
-    assert sorted(r["content"] for r in rows) == expected
-    for r in rows:
-        assert r["metadata"].get("index_text_caller_supplied") is False
-        assert r["llm_generated"] is True
-        # P5: body preserved in original_chunk
-        assert r["original_chunk"] == body
-
-
-# ---------------------------------------------------------------------------
-# 3. prompt_override rendered with content interpolated
-# ---------------------------------------------------------------------------
-
-def test_retain_prompt_override(memory_with_bank_and_mock_llm, mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    body = "The metal rang true."
-    override = (
-        "Custom prompt with content={{ content }} and source={{ source }}\n"
-        "Produce questions."
-    )
-    mock_llm.canned = "Q1?\nQ2?"
-    doc_id = mem.retain(
-        body,
-        generate_questions=True,
-        index_text_prompt_override=override,
-        source="custom-source",
-    )
-    assert len(mock_llm.calls) == 1
-    sent_prompt = mock_llm.calls[0]["messages"][-1]["content"]
-    assert "content=The metal rang true." in sent_prompt
-    assert "source=custom-source" in sent_prompt
-    assert "Custom prompt" in sent_prompt
-
-    rows = _rows_for_document(mem.database_url, doc_id)
-    assert sorted(r["content"] for r in rows) == ["Q1?", "Q2?"]
 
 
 # ---------------------------------------------------------------------------
@@ -246,15 +190,3 @@ def test_retain_writes_path_when_supplied(memory_with_bank_and_mock_llm, tmp_pat
     )
     assert target.exists()
     assert target.read_text() == "file content from retain()"
-
-
-# ---------------------------------------------------------------------------
-# 10. IndexTextGenerationError when LLM returns empty
-# ---------------------------------------------------------------------------
-
-def test_retain_raises_when_llm_returns_empty(memory_with_bank_and_mock_llm, mock_llm):
-    from prospecta._types import IndexTextGenerationError
-    mem = memory_with_bank_and_mock_llm
-    mock_llm.canned = "   \n   \n"  # only whitespace
-    with pytest.raises(IndexTextGenerationError):
-        mem.retain("body", source="src", generate_questions=True)

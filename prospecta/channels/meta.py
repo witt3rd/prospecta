@@ -10,16 +10,76 @@ how far members rise, so a large filter set stays sensible. A member whose
 cosine is 0 gets no boost: the boost multiplies a real score."""
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import replace
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
-from prospecta._entities import resolve_entities
 from prospecta.db.queries import _meta_param, _vec_literal
 
 DEFAULT_PROMOTE = False       # scope-promotion re-sort is opt-in (meta param `promote`)
 DEFAULT_PROMOTE_WEIGHT = 1.0   # tuning weight (meta param `promote_weight`), not a cap
 NAME = "meta"
+
+# --- person-name matching: a name in a question reaches the documents.person that is that person ---
+# Honorifics and articles are dropped, case / whitespace / diacritics fold, "Last, First" order is
+# irrelevant, and a name matches when every core token of the shorter name equals (or, for 3+
+# letters, prefixes) a token of the other: "Nelson" reaches "Mr. Nelson". Every plausible match is
+# returned (ambiguity widens the set; nothing is dropped).
+HONORIFICS = frozenset({
+    "mr", "mrs", "ms", "miss", "mx", "dr", "prof", "professor", "sir", "dame", "lady", "lord",
+    "master", "madam", "madame", "mme", "mlle", "monsieur", "sr", "sra", "srta", "don", "dona",
+    "rev", "reverend", "fr", "father", "sister", "br", "brother", "capt", "captain", "sgt",
+    "lt", "col", "gen", "hon", "judge", "rabbi", "imam", "jr", "sr.", "ii", "iii", "the",
+    "a", "an",
+})
+_FROM = "àáâãäåāăąçćčďèéêëēěęğìíîïīıłñńňòóôõöøōőřśşšťùúûüūůűýÿźżž"
+_TO = "aaaaaaaaacccdeeeeeeegiiiiiilnnnooooooooorsssstuuuuuuuyyzzz"
+_SQL_FOLD = "translate(lower({col}), '%s', '%s')" % (_FROM, _TO)
+_PEOPLE_SQL = f"""
+SELECT DISTINCT d.person FROM documents d
+WHERE d.bank_id = %(bank)s AND d.person IS NOT NULL
+  AND {_SQL_FOLD.format(col='d.person')} LIKE ANY(%(pats)s)
+"""
+
+
+def _fold(name: str) -> str:
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(c for c in s if not unicodedata.combining(c)).casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
+
+
+def _tokens(name: str) -> list[str]:
+    """Core tokens: folded, honorifics/articles removed, initials kept only if nothing longer remains."""
+    toks = [t for t in _fold(name).split() if t not in HONORIFICS]
+    long = [t for t in toks if len(t) > 1]
+    return long or toks
+
+
+def _tok_match(a: str, b: str) -> bool:
+    return a == b or (min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a)))
+
+
+def name_matches(query: str, candidate: str) -> bool:
+    q, c = _tokens(query), _tokens(candidate)
+    if not q or not c:
+        return False
+    short, longer = (q, c) if len(q) <= len(c) else (c, q)
+    return all(any(_tok_match(s, t) for t in longer) for s in short)
+
+
+def resolve_people(conn, bank_id: str, names: list[str]) -> list[str]:
+    """The documents.person values of the bank that the given names match (see above)."""
+    given = list(dict.fromkeys(n.strip() for n in names if n.strip()))
+    if not given:
+        return []
+    toks = sorted({t for n in given for t in _tokens(n) if len(t) >= 2})
+    pats = [f"%{t.replace('%', '').replace('_', '')}%" for t in toks] or ["%"]
+    with conn.cursor() as cur:
+        cur.execute(_PEOPLE_SQL, {"bank": bank_id, "pats": pats})
+        people = [r[0] for r in cur.fetchall() if any(name_matches(g, r[0]) for g in given)]
+    return sorted(set(people))
 
 _SQL = """
 SELECT DISTINCT ON (d.id) d.id AS document_id, d.source, m.id AS item_id,
@@ -52,7 +112,7 @@ class MetadataScope:
         qe = state.embed_query(plan.text)
         people = list(f.people)
         if people:   # name matching, not exact equality: Nelson reaches "Mr. Nelson"
-            people = list(dict.fromkeys(people + resolve_entities(state.conn, state.bank_id, people).people))
+            people = list(dict.fromkeys(people + resolve_people(state.conn, state.bank_id, people)))
         with state.conn.cursor() as cur:
             cur.execute(_SQL, {
                 "bank_id": state.bank_id, "qe": _vec_literal(qe),

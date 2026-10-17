@@ -5,7 +5,7 @@ import time
 
 from prospecta.channels.base import Candidate, QueryPlan, RecallState
 from prospecta.channels.fusion import FLOOR, FusedDoc, fuse
-from prospecta.channels.registry import build_channels
+from prospecta.channels.registry import build_channels, retired_channels
 
 RRF_K = 60
 
@@ -34,7 +34,6 @@ def run_channels(
         t0 = time.monotonic()
         error = None
         cands: list[Candidate] = []
-        state.pool = [c for lst in lists.values() for c in lst]
         try:
             cands = cc.channel.retrieve(plan, state)
         except Exception as exc:  # one channel never sinks the recall
@@ -56,7 +55,9 @@ def run_channels(
         "plan": plan.to_json(),
         "channels": traces,
         "skipped": [{"name": e["name"], "reason": "disabled in the bank's channel config"}
-                    for e in config if not e.get("enabled", True)],
+                    for e in config if not e.get("enabled", True)]
+                   + [{"name": n, "reason": "retired channel, skipped (docs/legacy.md)"}
+                      for n in retired_channels(config)],
         "fusion": {
             "method": "weighted_rrf" if method == "rrf" else method, "k": k,
             "weights": weights, **({"floor": floor} if method == "floor_union" else {}),

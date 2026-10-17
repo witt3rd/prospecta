@@ -37,14 +37,14 @@ The project's `questions.md` format is also read directly: `### Qnnn` blocks wit
 `gold2` give hit@1, hit@10, MRR and cover@10 each; `answer` is for `--judge` (answer-correct by a
 Sonnet judge, with `--synth`).
 
-`--ablate` reruns with each live channel off, each enabled stage (rerank, gate, reader) off, and
+`--ablate` reruns with each live channel off, the rerank stage off if it is enabled, and
 each registered channel the bank lacks on at weight 1; a channel **earns** its weight when
 removing it costs hit@10, hit@1 or MRR >= 0.03 on either gold, or cover@10 >= 0.03 on the
 multi-note questions (a channel not yet run **gains** by the same margin). The channels it tries
-on include the retired ones (`docs/legacy.md`). The report gives latency and cost per stage (each
+on are the ones that remain (`dense_chunk`, `hybrid_chunk`, `meta`). The report gives latency and cost per stage (each
 channel, each model stage, total), and a channel or stage error is shown in it (`ERROR xN`).
 Nothing is written to the bank (no config change, no `recall_events` rows from the retrieval
 runs); `--synth` runs real `recall_synth(grounded=True)` and so does log those events. Eval never
-changes channel weights: it tells the owner which to set. `--rerank-blend/--no-rerank-blend` and
-`--scope-promote/--no-scope-promote` force the two legacy switches per run;
+changes channel weights: it tells the owner which to set. `--scope-promote/--no-scope-promote`
+forces the legacy scope-promotion switch per run;
 `--depth` sets the rerank pool cut for the run (`docs/recall-stages.md`).

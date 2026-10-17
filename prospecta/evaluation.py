@@ -37,7 +37,7 @@ from pathlib import Path
 
 from prospecta._template import render_prompt
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
-from prospecta.channels.registry import REGISTRY
+from prospecta.channels.registry import REGISTRY, RETIRED
 from prospecta._scorecut import CHANNEL_MIN_REL
 from prospecta.stages import parse_json_object, read_recall_config
 
@@ -211,6 +211,8 @@ def ablation_variants(channel_config: list[dict], recall_cfg: dict) -> list[dict
     enabled stage off, and every registered channel the bank lacks switched on."""
     variants: list[dict] = []
     for e in channel_config:
+        if e["name"] in RETIRED:      # skipped by every recall: nothing to ablate
+            continue
         if e.get("enabled", True) and float(e.get("weight", 1)) > 0:
             cfg = [dict(x) for x in channel_config]
             for x in cfg:
@@ -227,14 +229,11 @@ def ablation_variants(channel_config: list[dict], recall_cfg: dict) -> list[dict
         cfg.append({"name": name, "enabled": True, "weight": 1})
         variants.append({"name": f"+{name}", "kind": "channel_on", "target": name,
                          "channels": cfg, "stages": recall_cfg})
-    for stage in ("rerank", "gate", "reader"):
-        if (recall_cfg.get(stage) or {}).get("enabled"):
-            st = copy.deepcopy(recall_cfg)
-            st[stage]["enabled"] = False
-            if stage == "rerank":
-                st.get("gate", {})["enabled"] = False   # the gate hands over to rerank
-            variants.append({"name": f"-{stage}", "kind": "stage_off", "target": stage,
-                             "channels": channel_config, "stages": st})
+    if (recall_cfg.get("rerank") or {}).get("enabled"):
+        st = copy.deepcopy(recall_cfg)
+        st["rerank"]["enabled"] = False
+        variants.append({"name": "-rerank", "kind": "stage_off", "target": "rerank",
+                         "channels": channel_config, "stages": st})
     return variants
 
 
@@ -281,7 +280,7 @@ def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
     stages: dict[str, dict] = {}
     t0 = time.monotonic()
     trace: list = []
-    # the production path: filter extraction, channels, stages, hop, scope promotion
+    # the production path: filter extraction, channels, the rerank stage, scope promotion
     recalled = _search_channels(
         memory, query, memory.default_bank_id, channel_config, limit=len_all if pool is None else pool,
         metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {},
@@ -364,7 +363,7 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
                "cited_gold": bool({_norm(c["note"]) for c in res.citations}
                                   & {_norm(g) for g in q.gold})}
         if judge and q.answer:
-            ok, call = judge_answer(memory._rerank_llm or memory._llm, q.text, q.answer,
+            ok, call = judge_answer(memory._synth_llm or memory._llm, q.text, q.answer,
                                     res.synthesis)
             row["correct"] = ok
             judged += 1
@@ -391,11 +390,10 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
 
 def run_eval(memory, questions: list[Question], *, ablate: bool = False,
              synth: bool = False, judge: bool = False, pool: int | None = None,
-             rerank_blend: bool | None = None, scope_promote: bool | None = None,
-             depth: str | None = None) -> dict:
+             scope_promote: bool | None = None, depth: str | None = None) -> dict:
     """Score the bank as configured; optionally ablate and synthesise.
-    `rerank_blend` / `scope_promote` (None = keep config) force the rerank blend
-    and the scope-promotion re-sort on or off for this run. `depth` ('standard' |
+    `scope_promote` (None = keep config) forces the scope-promotion re-sort on or
+    off for this run. `depth` ('standard' |
     'deep'; None = the bank's recall_config.depth, else standard) sets the rerank
     pool cut; the report records the depth used."""
     from prospecta._scorecut import check_depth, pool_min_rel, resolve_depth
@@ -409,9 +407,6 @@ def run_eval(memory, questions: list[Question], *, ablate: bool = False,
         legacy = True   # the bank has no channel registry; score the measured default
     else:
         legacy = False
-    if rerank_blend is not None:
-        recall_cfg = copy.deepcopy(recall_cfg)
-        recall_cfg.setdefault("rerank", {}).setdefault("blend", {})["enabled"] = rerank_blend
     if scope_promote is not None:
         channel_config = copy.deepcopy(channel_config)
         for e in channel_config:
@@ -459,7 +454,7 @@ def format_report(r: dict) -> str:
         if name.startswith("channel:") and s.get("errors"):
             L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
     chans = {e["name"]: (e.get("params") or {}).get("min_rel", CHANNEL_MIN_REL)
-             for e in r.get("channel_config") or [] if e["name"] in ("dense_chunk", "question", "bm25")}
+             for e in r.get("channel_config") or [] if e["name"] == "dense_chunk"}
     L.append("cuts: channels " + (", ".join(f"{n} {v}" for n, v in chans.items()) or "none")
              + f" (0 = no cut); rerank pool >= "
              f"{r.get('rerank_min_rel')} x best fused score "

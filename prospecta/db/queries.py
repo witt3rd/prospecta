@@ -204,9 +204,8 @@ def upsert_document(
 
 def delete_memory_items_for_document(conn, *, document_id: str) -> int:
     with conn.cursor() as cur:
-        # the items' links and entity rows cascade; the Linker must run again
-        cur.execute("DELETE FROM memory_link_state WHERE document_id = %(doc)s",
-                    {"doc": document_id})
+        # the items' link and entity rows (tables of the removed linker, still in a bank that
+        # ran it) cascade away with them
         cur.execute(
             "DELETE FROM memory_items WHERE document_id = %(doc)s",
             {"doc": document_id},

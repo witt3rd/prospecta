@@ -19,11 +19,9 @@ CHARS_PER_TOKEN = 4
 # best fused (the scout's knee); configurable down to 0.05 (recall_config.rerank.min_rel_score).
 POOL_MIN_REL = 0.15
 # Recall depths: the named rerank-pool cut. `standard` is the default (automatic per-turn
-# recall); `deep` is for explicit recall, set/discovery questions and map-reduce.
+# recall); `deep` is for explicit recall and for set / discovery questions.
 DEPTHS = {"standard": POOL_MIN_REL, "deep": 0.05}
 DEFAULT_DEPTH = "standard"
-HOP_MIN_REL = 0.4              # new notes of a hop follow-up run: >= 0.4 x the best of that run
-READER_MIN_REL = 0.6           # rerank grade (0..3) or fused score >= 0.6 x best
 # Retrieval channels do NOT cut: every candidate goes into fusion, bounded only by the
 # index fetch completing (semantic._scan_everything). `min_rel` stays an explicit per-bank override.
 CHANNEL_MIN_REL = 0.0

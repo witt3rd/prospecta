@@ -10,12 +10,10 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from prospecta._test_helpers import no_cut
 from prospecta.channels import (
     DEFAULT_CHANNEL_CONFIG, QueryPlan, RecallState, build_channels, run_channels,
     validate_channel_config,
 )
-from prospecta.channels.bm25 import Bm25Chunks
 from prospecta.db.queries import _stage1_statement, stage1_search
 from prospecta.memory import Memory
 from tests._stub_embedder import EMBED_DIM, stub_embed
@@ -280,7 +278,7 @@ def test_the_plan_uses_the_hnsw_and_both_gin_indexes(fresh_db):
     assert "Index Scan using memory_items_embedding_plan" in plan   # on embedding::vector(N), the indexed expression
     assert "Bitmap Index Scan on memory_items_body_tsv_gin" in plan
     assert "Bitmap Index Scan on memory_items_exact_tsv_gin" in plan   # the stored exact vector (0020)
-    assert "memory_items_keyword_gin" not in plan                      # the 0018 index serves `keyword` only
+    assert "memory_items_keyword_gin" not in plan                      # the 0018 index: no code reads it any more
 
 
 # --------------------------------------------------------------------------
@@ -351,59 +349,3 @@ def test_search_through_the_bank_config_finds_the_phrase_first(memory_with_bank)
     hits = mem.search('"electric dreams"', limit=2)
     assert {h.source for h in hits} == {"adjacent.md", "upper.md"}
     assert hits[0].original_chunk in {PHRASE_NOTES["adjacent.md"], PHRASE_NOTES["upper.md"]}
-
-
-def test_a_reader_hop_runs_the_hybrid_channel(memory_with_bank):
-    from tests.test_stages import StubLLM
-    mem = memory_with_bank
-    retain_all(mem, {"alpha.md": "alpha cat sat on the warm mat", "delta.md": "delta dog barked at the moon",
-                     "echo.md": "echo revenue grew twelve percent"})
-    mem.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
-    mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["dog barked moon"]})
-    mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
-                           "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
-    res = mem.recall(["cat sat"], limit=10)
-    with psycopg.connect(mem.database_url) as conn:
-        hops = conn.execute("SELECT hops FROM recall_events WHERE bank_id='test' "
-                            "ORDER BY id DESC LIMIT 1").fetchone()[0]
-    assert hops["per_query"][0]["new_candidates"] and "delta.md" in {r.source for r in res}
-
-
-# --------------------------------------------------------------------------
-# the in-process BM25 is no longer part of default channel execution
-# --------------------------------------------------------------------------
-
-@pytest.fixture
-def no_inprocess_bm25(monkeypatch):
-    def boom(*a, **k):
-        raise AssertionError("an in-process BM25 index was built")
-    monkeypatch.setattr("prospecta.channels.bm25.Bm25Index.build", boom)
-
-
-@pytest.mark.parametrize("config", [no_cut(DEFAULT_CHANNEL_CONFIG), [{"name": "hybrid_chunk", "weight": 1}]],
-                         ids=["default", "hybrid_chunk"])
-def test_default_channel_execution_never_builds_an_in_process_bm25(memory_with_bank, no_inprocess_bm25, config):
-    retain_all(memory_with_bank, PHRASE_NOTES)
-    memory_with_bank.set_channel_config(config)
-    assert memory_with_bank.search("electric dreams", limit=3)
-
-
-def test_bm25_channel_without_pg_search_fails_loudly_instead_of_building_the_index(
-        memory_with_bank, no_inprocess_bm25):
-    retain_all(memory_with_bank, PHRASE_NOTES)
-    memory_with_bank.set_channel_config(
-        [{"name": "hybrid_chunk", "weight": 1}, {"name": "bm25", "weight": 1}])
-    traces: list = []
-    hits = memory_with_bank.recall(["electric dreams"], limit=3, _trace=traces)
-    errors = {c["name"]: c["error"] for c in traces[0]["channels"]}
-    assert errors["hybrid_chunk"] is None
-    assert "hybrid_chunk" in errors["bm25"] and "InProcessBm25" in errors["bm25"]
-    assert hits      # the other channel still answers
-
-
-def test_in_process_bm25_remains_available_as_an_explicit_backend(memory_with_bank, monkeypatch):
-    from prospecta.channels import AutoBm25, InProcessBm25
-    retain_all(memory_with_bank, PHRASE_NOTES)
-    monkeypatch.setattr(Bm25Chunks, "backend", AutoBm25(fallback=InProcessBm25()))
-    memory_with_bank.set_channel_config([{"name": "bm25", "weight": 1}])
-    assert memory_with_bank.search("electric dreams", limit=3)

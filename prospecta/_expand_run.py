@@ -36,7 +36,7 @@ from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_
 from prospecta.cited import HEADING, TASK_HEADING, document_citations, format_cited_rag_block
 from prospecta.stages import (
     CrossEncoderReranker, RERANK_MIN_SCORE, RERANK_TIMEOUT_S, _with_decision_model, _with_scores,
-    build_items, read_recall_config, resolve_reranker_model, run_reranker, totals,
+    build_items, read_recall_config, resolve_reranker_model, run_reranker, totals, warn_retired_recall_config,
 )
 
 logger = logging.getLogger("prospecta.expand")
@@ -199,6 +199,7 @@ class _Run:
             channel_config = read_channel_config(conn, bank_id)
             conn.rollback()
         self.timings["config"] = _ms(t)
+        warn_retired_recall_config(cfg)
         xcfg, g0, rr = cfg.get("expansion") or {}, cfg.get("stage0_gate") or {}, cfg.get("rerank") or {}
         models = cfg.get("models") or {}
         deadline = float(_pick(deadline, xcfg.get("deadline_s"), ex.DEFAULT_DEADLINE_S))
@@ -550,7 +551,7 @@ def _search(memory, spec: SearchSpec, p: _Plan, cancelled: threading.Event, db) 
             kind=cited.get(r.document_id, (None, None))[1],
             relevance_score=r.score if r.relevance_score is None else r.relevance_score)
             for r in recalled]
-        tr.update(rerank=rec, hops=None, calls=calls, accounting=totals(calls),
+        tr.update(rerank=rec, calls=calls, accounting=totals(calls),
                   depth=resolve_depth(p.depth, p.cfg))
         out.trace, out.calls = tr, calls
     except Exception as exc:

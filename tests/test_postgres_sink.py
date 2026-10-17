@@ -66,8 +66,8 @@ def test_postgres_sink_writes_sweep_pass(memory_with_bank_and_mock_llm, tmp_corp
 
 def test_postgres_sink_writes_llm_call(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = "q1"  # type: ignore[attr-defined]
-    mem.retain("content", source="test", generate_questions=True)
+    mem._llm.canned = '{"queries":[{"text":"q"}]}'  # type: ignore[attr-defined]
+    mem.formulate_queries("a message")
     with psycopg.connect(mem.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -75,7 +75,7 @@ def test_postgres_sink_writes_llm_call(memory_with_bank_and_mock_llm):
                 ("test",),
             )
             rows = cur.fetchall()
-            assert any(r[0] == "index_text" for r in rows)
+            assert any(r[0] == "formulate_queries" for r in rows)
 
 
 def test_composite_tracer_combines_postgres_sink_and_recording(fresh_db, mock_llm):

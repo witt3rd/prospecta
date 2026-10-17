@@ -7,7 +7,7 @@ import pytest
 
 from prospecta import _scorecut, evaluation as ev, stages
 from prospecta.stages import validate_recall_config
-from tests.test_stages import QUERY, StubLLM, last_event, mem  # noqa: F401  (fixture)
+from tests.test_stages import QUERY, cross_encoder_transport, last_event, mem  # noqa: F401  (fixture)
 
 
 def test_pool_cut_precedence():
@@ -38,13 +38,13 @@ def cuts(monkeypatch):
 
 
 def test_recall_depth_per_call_bank_default_and_trace(mem, cuts):
-    mem._rerank_llm = StubLLM()
-    mem.set_recall_config({"rerank": {"enabled": True}})
+    mem._rerank_transport = cross_encoder_transport({"alpha": 0.9})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     mem.recall([QUERY], limit=5)
     assert cuts[-1] == 0.15 and last_event(mem, "depth")[0] == "standard"
     mem.recall([QUERY], limit=5, depth="deep")
     assert cuts[-1] == 0.05 and last_event(mem, "depth")[0] == "deep"
-    mem.set_recall_config({"depth": "deep", "rerank": {"enabled": True}})
+    mem.set_recall_config({"depth": "deep", "rerank": {"enabled": True, "stage": "cross_encoder"}})
     mem.recall([QUERY], limit=5)
     assert cuts[-1] == 0.05 and last_event(mem, "depth")[0] == "deep"
     mem.recall([QUERY], limit=5, depth="standard")
@@ -54,15 +54,15 @@ def test_recall_depth_per_call_bank_default_and_trace(mem, cuts):
 
 
 def test_search_accepts_depth(mem, cuts):
-    mem._rerank_llm = StubLLM()
-    mem.set_recall_config({"rerank": {"enabled": True}})
+    mem._rerank_transport = cross_encoder_transport({"alpha": 0.9})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     mem.search(QUERY, limit=5, depth="deep")
     assert cuts[-1] == 0.05
 
 
 def test_grounded_set_question_defaults_to_deep(mem, cuts):
-    mem._rerank_llm = StubLLM()
-    mem.set_recall_config({"rerank": {"enabled": True}})
+    mem._rerank_transport = cross_encoder_transport({"alpha": 0.9})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     mem._llm = lambda *a, **k: json.dumps({"answer": "x", "citations": []})
     try:
         mem.recall_synth(QUERY, grounded=True, scope=["alpha.md", "bravo.md"])
@@ -77,8 +77,8 @@ def test_grounded_set_question_defaults_to_deep(mem, cuts):
 
 
 def test_eval_reports_and_uses_depth(mem, cuts):
-    mem._rerank_llm = StubLLM()
-    mem.set_recall_config({"rerank": {"enabled": True}})
+    mem._rerank_transport = cross_encoder_transport({"alpha": 0.9})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     qs = ev.parse_questions("## Q1\nquestion: cat sat\ngold: alpha.md\n")
     rep = ev.run_eval(mem, qs)
     assert rep["depth"] == "standard" and "depth: standard" in ev.format_report(rep)

@@ -6,8 +6,8 @@ Prospecta records every load-bearing event in Postgres event tables. The record 
 
 | Table | Fires on | Carries |
 |---|---|---|
-| `retain_events` | every `retain()` call | `document_id`, `items_count` (the chunks written), `index_text_caller_supplied`, `duration_ms`, `error`. `index_text_generated` and `raw_llm_response` are filled only on the opt-in path where a model writes questions (`generate_questions=True`) |
-| `recall_events` | every `recall()` (so every `ask()`), every `expand_and_recall` / `recall_for_task` that records (a task by default, a chat message not), `recall_synth` | `queries` (the question, or the searches the writer wrote), `mode`, `n_results`, `results` (JSONB array of per-hit `{source, document_id, rank, scores, content_preview}`), `duration_ms`, `depth`, and the pipeline trace: `plan`, `channels`, `fusion`, `rerank`, `hops`, plus `cost_usd`, `tokens_in`, `tokens_out`, `n_llm_calls`; `synthesis` and `citations` for the legacy synthesis |
+| `retain_events` | every `retain()` call | `document_id`, `items_count` (the chunks written), `index_text_caller_supplied`, `duration_ms`, `error`. `index_text_generated` and `raw_llm_response` are filled only in rows written before the model-written questions were removed (`docs/legacy.md`) |
+| `recall_events` | every `recall()` (so every `ask()`), every `expand_and_recall` / `recall_for_task` that records (a task by default, a chat message not), `recall_synth` | `queries` (the question, or the searches the writer wrote), `mode`, `n_results`, `results` (JSONB array of per-hit `{source, document_id, rank, scores, content_preview}`), `duration_ms`, `depth`, and the pipeline trace: `plan`, `channels`, `fusion`, `rerank` (`hops` is empty in a recall that ran after the reader was removed), plus `cost_usd`, `tokens_in`, `tokens_out`, `n_llm_calls`; `synthesis` and `citations` for the legacy synthesis |
 | `recall_event_candidates` | one row per candidate per channel of a recall | `recall_event_id`, `query_index`, `document_id`, `item_id`, `channel` (`hybrid_chunk`), `rank`, `score` |
 | `llm_calls` | every model call: the query writer, the Stage 0 gate, every Stage 2 rerank request, Stage 3, the `ask` answer | `prompt_name` (the **purpose**, below), `model`, `tokens_in`, `tokens_out`, `cost_usd`, `messages_count`, `json_mode`, `duration_ms`, `error`, **`prompt_text`** and **`response_text`** (verbatim; opt-out) |
 | `formulate_events` | every `formulate_queries()` call (the legacy question-space path) | `message`, `n_queries_out`, `json_mode_used`, `parse_fallback`, `error_kind` (`malformed_json` / `schema_mismatch` / NULL), `raw_response`, `duration_ms` |
@@ -25,8 +25,8 @@ Prospecta records every load-bearing event in Postgres event tables. The record 
 | `cross_encoder_rerank` | one Stage 2 rerank request (`model` as the provider reports it, `tokens_in` = `usage.total_tokens`, `cost_usd` = `usage.cost`) | yes |
 | `stage3_sufficiency` | the Stage 3 `evidence_sufficient` question | yes |
 | `ask_cited` | the `ask` answer | yes |
-| `index_text` | model-written questions at write time (opt-in) | opt-in |
-| `formulate_queries`, `synthesize_grounded`, `rerank_listwise`, `jev_score`, `reader_sufficiency`, `extract_filters`, `extract_entities`, `jev_relations`, `mapreduce_map`, `mapreduce_reduce` | the retired question-space, Sonnet / Jev, reader, entity, linker and map-reduce calls | `docs/legacy.md` |
+| `index_text` | model-written questions at write time (removed; rows written before it stay) | `docs/legacy.md` |
+| `formulate_queries`, `synthesize_grounded`, `rerank_listwise`, `jev_score`, `reader_sufficiency`, `extract_filters`, `extract_entities`, `jev_relations`, `mapreduce_map`, `mapreduce_reduce` | the retired question-space, Sonnet / Jev, reader, entity, linker and map-reduce calls: no code writes them any more, rows already written stay | `docs/legacy.md` |
 
 ## Reading a recall event end to end
 

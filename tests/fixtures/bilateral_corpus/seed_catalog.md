@@ -1,1 +1,0 @@
-A seed catalog arrived in the mail. Pages and pages of flower varieties — tulips in unusual colors, climbing roses with thornless stems, ground-cover plants suitable for partial-shade beds. The soil amendment guide at the back recommends compost worked in two seasons before planting.

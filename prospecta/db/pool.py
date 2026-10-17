@@ -205,7 +205,8 @@ class ConnectionPool:
     def dedicated(self) -> Iterator[Connection]:
         """Borrow a connection that is never the one the calling thread already
         holds, for work that must not share a transaction with the caller (the
-        Linker worker). It still counts against the pool. Caller commits."""
+        former linker worker used it; the plugin's pool stand-in implements it too).
+        It still counts against the pool. Caller commits."""
         with self._borrow(False) as conn:
             try:
                 yield conn

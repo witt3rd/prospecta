@@ -327,7 +327,7 @@ def _write_parsed_docs(
                         "update_mode": "append",
                         "llm_generated": False,
                     })
-                # The body must not be invisible to dense_chunk / bm25: also
+                # The body must not be invisible to dense_chunk / hybrid_chunk: also
                 # write it as child chunks (kind='chunk', frontmatter-free).
                 if parsed.original_text.strip():
                     body_chunks = list(chunk_paragraphs(
@@ -423,9 +423,6 @@ def _write_parsed_docs(
         agg = "unchanged"
     else:
         agg = "skipped"
-    if agg in ("new", "replaced"):
-        for d in document_ids:   # idempotent; a no-op without Memory(linker=...)
-            memory._enqueue_link(str(d))
     return SingleFileIndexResult(
         status=agg,
         document_ids=tuple(document_ids),
@@ -693,15 +690,14 @@ def _search_channels(
         )
         if recall_cfg:
             fused, st = run_stages(
-                state, text, fused, config, recall_cfg,
-                StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
-                          model=memory._rerank_model,
+                state, text, fused, recall_cfg,
+                StageDeps(jev=memory._jev,
                           rerank_transport=memory._rerank_transport,
                           reranker_model=reranker_model or memory._reranker_model,
                           decision_model=decision_model or memory._decision_model),
-                k=rrf_k, depth=depth,
+                depth=depth,
             )
-            tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
+            tr.update(rerank=st["rerank"], calls=st["calls"],
                       fallback_reason=st.get("fallback_reason"),
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
@@ -730,7 +726,7 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
     """The fused documents as RecalledMemory, in order. `channel_lists` is what the channels
     returned (the hybrid_chunk chunk carries the snippet that belongs with its own text);
     `channel_names` are the channels that ran; `recall_cfg` says whether stages ran (scores
-    gain rerank / jev) and whether the cross-encoder graded (relevance_score)."""
+    gain rerank) and whether the cross-encoder graded (relevance_score)."""
     hybrid = {c.document_id: c for c in channel_lists.get("hybrid_chunk", [])}
     rerank_cfg = (recall_cfg or {}).get("rerank") or {}
     cross_encoder = rerank_cfg.get("enabled") and rerank_cfg.get("stage") == "cross_encoder"
@@ -743,12 +739,9 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
         scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
         scores.update({n: 0.0 for n in channel_names})
         if recall_cfg:
-            scores.update(rerank=0.0, jev=0.0)
+            scores.update(rerank=0.0)
         scores.update({n: float(v) for n, v in f.scores.items()})
-        scores["semantic"] = max(
-            (float(v) for n, v in f.scores.items() if n in ("dense_chunk", "question")),
-            default=0.0,
-        )
+        scores["semantic"] = float(f.scores.get("dense_chunk", 0.0))
         scores["rrf"] = float(f.score)
         out.append(RecalledMemory(
             content=b.detail.get("content") or b.evidence or "",
@@ -760,9 +753,9 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
             bank_id=bank_id,
             document_id=f.document_id,
             match_kind=match_kind(
-                exact=d.get("exact_rank") is not None or "keyword" in ranked,
-                lexical=d.get("stem_rank") is not None or "bm25" in ranked,
-                semantic=d.get("sem_rank") is not None or bool(ranked & {"dense_chunk", "question"}),
+                exact=d.get("exact_rank") is not None,
+                lexical=d.get("stem_rank") is not None,
+                semantic=d.get("sem_rank") is not None or "dense_chunk" in ranked,
                 date=d.get("date_rank") is not None),
             relevance_score=float(f.scores["rerank"]) if cross_encoder and "rerank" in f.scores
             else float(f.score),

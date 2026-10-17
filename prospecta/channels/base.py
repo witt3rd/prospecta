@@ -11,7 +11,7 @@ class Candidate:
     document_id: str            # the parent note
     item_id: str | None         # the child chunk or question item that matched
     source: str                 # documents.source (the file name)
-    channel: str                # "dense_chunk" | "question" | "bm25" | ...
+    channel: str                # "dense_chunk" | "hybrid_chunk" | "meta"
     rank: int                   # 1-based within the channel (document level)
     score: float                # the channel's own score
     evidence: str | None        # the matched item's original text
@@ -59,8 +59,7 @@ class QueryPlan:
 
 @dataclass
 class RecallState:
-    """What a channel may use: a connection, the bank, the pool so far
-    (so an `expand` channel sees its seeds), and a memoised query embedder."""
+    """What a channel may use: a connection, the bank, and a memoised query embedder."""
 
     conn: Any
     bank_id: str
@@ -71,7 +70,6 @@ class RecallState:
     date_from: date | str | None = None
     date_to: date | str | None = None
     excluded_sources: list[str] | None = None
-    pool: list[Candidate] = field(default_factory=list)
     channel_lists: dict[str, list[Candidate]] = field(default_factory=dict)  # set by run_channels
     _embeddings: dict[str, list[float]] = field(default_factory=dict)
 
@@ -85,7 +83,7 @@ class RecallState:
 
 class Channel(Protocol):
     name: str
-    kind: Literal["recall", "filter", "expand"]
-    # recall: finds; filter: constrains / promotes; expand: grows the pool from seeds
+    kind: Literal["recall", "filter"]
+    # recall: finds; filter: constrains / promotes
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int) -> list[Candidate]: ...

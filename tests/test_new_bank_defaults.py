@@ -2,8 +2,9 @@
 
 New banks (Memory.create_bank, hence `prospecta create-bank`, `prospecta init`, the service and
 `migrate-bank`) store channel_config = [hybrid_chunk] (Stage 1), recall_config = a cross_encoder
-rerank (Stage 2) and link_config = {links: false, entities: false}: no manual configuration and no
-PROSPECTA_LINKER=off. Existing banks keep exactly what they stored: the defaults live in the INSERT
+rerank (Stage 2) and link_config = {links: false, entities: false}: no manual configuration. (The
+linker itself was removed; the column is still written so an older library never links or extracts
+entities on a new bank.) Existing banks keep exactly what they stored: the defaults live in the INSERT
 of create_bank, never in a migration and never in a column DEFAULT. Invented text, stub models."""
 from __future__ import annotations
 
@@ -16,14 +17,12 @@ import psycopg
 import pytest
 
 from prospecta import bank_defaults
-from prospecta._linker import Linker, effective_link_config, validate_link_config
 from prospecta.channels import validate_channel_config
 from prospecta.cli import _common
 from prospecta.db.migrate import run_migrations
 from prospecta.memory import Memory
 from prospecta.stages import (
-    RERANKER_MODEL, CrossEncoderReranker, LLMResult, build_reranker, resolve_reranker_model,
-    validate_recall_config,
+    RERANKER_MODEL, CrossEncoderReranker, build_reranker, resolve_reranker_model, validate_recall_config,
 )
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
@@ -88,7 +87,7 @@ class FakeRerank:
 def test_the_default_configs_are_valid():
     validate_channel_config(bank_defaults.NEW_BANK_CHANNEL_CONFIG)
     validate_recall_config(bank_defaults.NEW_BANK_RECALL_CONFIG)
-    validate_link_config(bank_defaults.NEW_BANK_LINK_CONFIG)
+    assert bank_defaults.NEW_BANK_LINK_CONFIG == {"links": False, "entities": False}
 
 
 def test_a_fresh_bank_stores_hybrid_chunk_cross_encoder_and_no_linking(mem, fresh_db):
@@ -97,14 +96,13 @@ def test_a_fresh_bank_stores_hybrid_chunk_cross_encoder_and_no_linking(mem, fres
     assert channel == HYBRID
     assert recall == CROSS_ENCODER
     assert link == {"links": False, "entities": False}
-    assert mem.get_link_config("fresh") == {"links": False, "entities": False}
 
 
 def test_the_stage_2_model_of_a_fresh_bank_is_the_default_cross_encoder(mem, fresh_db, monkeypatch):
     monkeypatch.delenv("PROSPECTA_RERANKER_MODEL", raising=False)
     mem.create_bank("fresh", embedding_dim=EMBED_DIM)
     recall = config_of(fresh_db, "fresh")[1]
-    stage = build_reranker(recall, llm=None, jev=None, rerank_transport=FakeRerank())
+    stage = build_reranker(recall, rerank_transport=FakeRerank())
     assert isinstance(stage, CrossEncoderReranker)
     assert stage.model == RERANKER_MODEL == "qwen/qwen3-reranker-8b"
 
@@ -114,7 +112,7 @@ def test_the_environment_still_chooses_the_reranker_of_a_fresh_bank(mem, fresh_d
     monkeypatch.setenv("PROSPECTA_RERANKER_MODEL", "acme/other-reranker")
     mem.create_bank("fresh", embedding_dim=EMBED_DIM)
     recall = config_of(fresh_db, "fresh")[1]
-    stage = build_reranker(recall, llm=None, jev=None, rerank_transport=FakeRerank())
+    stage = build_reranker(recall, rerank_transport=FakeRerank())
     assert stage.model == "acme/other-reranker"
     assert resolve_reranker_model(None, recall["rerank"].get("model")) == "acme/other-reranker"
 
@@ -334,83 +332,28 @@ def test_the_hand_set_banks_still_run_hybrid_chunk_and_cross_encoder(live):
         assert m._rerank_transport.requests
 
 
-def test_the_live_banks_keep_their_link_switches(live):
-    for bank in LIVE_BANKS:
-        assert live[bank].get_link_config(bank) == {"links": False, "entities": True}
-
-
-class EntityLLM:
+class RecordingLLM:
     def __init__(self):
         self.calls = 0
 
     def __call__(self, messages, *, json_mode=False):
         self.calls += 1
-        return LLMResult(json.dumps({"entities": [{"name": "Kelly", "type": "person"}]}),
-                         model="stub", tokens_in=1, tokens_out=1, cost_usd=0.0)
+        return "{}"
 
 
-def test_retain_runs_entity_extraction_on_the_live_banks_and_not_on_a_fresh_one(live, mem):
+def test_retain_extracts_no_entities_and_calls_no_model_on_any_bank(live, mem, fresh_db):
+    """A bank that stored `{}` ran entity extraction on every write under the old library; the
+    linker is gone, so no bank does, the four live ones included."""
     mem.create_bank("fresh", embedding_dim=EMBED_DIM)
-    llm = EntityLLM()
+    llm = RecordingLLM()
     for m in (*live.values(), mem):
-        m._linker = Linker(llm=llm, asynchronous=False)
-    before = llm.calls
+        m._llm = llm
     mem.retain("Kelly met Ann on monday", source="fresh.md")
-    assert llm.calls == before                                   # a fresh bank: no extraction call
     for bank in LIVE_BANKS:
-        n = llm.calls
         live[bank].retain("Kelly wrote again on tuesday", source="again.md")
-        assert llm.calls > n, bank                               # a stored bank: extraction as before
-
-
-# ---------------------------------------------------------------- the CLI and the linker
-
-@pytest.fixture
-def keyed(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-not-real")
-    monkeypatch.delenv("PROSPECTA_LINKER", raising=False)
-    monkeypatch.delenv("PROSPECTA_JEV", raising=False)
-
-
-def test_the_cli_does_not_build_the_linker_for_a_fresh_bank(keyed, mem, fresh_db):
-    mem.create_bank("fresh", embedding_dim=EMBED_DIM)
-    kw = _common._stage_kwargs(fresh_db, "fresh")
-    assert "linker" not in kw and {"rerank_llm", "synth_llm", "rerank_transport", "jev"} <= set(kw)
-    args = argparse.Namespace(database_url=fresh_db, bank="fresh")
-    assert _common.make_memory(args)._linker is None
-
-
-def test_the_cli_still_builds_the_linker_for_banks_that_enable_it(keyed, fresh_db):
-    for bank in LIVE_BANKS:                                        # stored {}: entities on by default
-        insert_stored_bank(fresh_db, bank, *LIVE_BANKS[bank])
-        assert "linker" in _common._stage_kwargs(fresh_db, bank), bank
-    insert_stored_bank(fresh_db, "links", HYBRID, {}, {"links": True, "entities": False})
-    insert_stored_bank(fresh_db, "ents", HYBRID, {}, {"links": False, "entities": True})
-    insert_stored_bank(fresh_db, "none", HYBRID, {}, {"links": False, "entities": False})
-    assert "linker" in _common._stage_kwargs(fresh_db, "links")
-    assert "linker" in _common._stage_kwargs(fresh_db, "ents")
-    assert "linker" not in _common._stage_kwargs(fresh_db, "none")
-
-
-def test_the_linker_env_switch(keyed, fresh_db, monkeypatch):
-    insert_stored_bank(fresh_db, "none", HYBRID, {}, {"links": False, "entities": False})
-    insert_stored_bank(fresh_db, "legacy", [], {}, {})
-    monkeypatch.setenv("PROSPECTA_LINKER", "off")                    # off stays off ...
-    assert "linker" not in _common._stage_kwargs(fresh_db, "legacy")
-    assert "linker" not in _common._stage_kwargs(None, None)
-    monkeypatch.setenv("PROSPECTA_LINKER", "on")                     # ... on asks for it explicitly
-    assert "linker" in _common._stage_kwargs(fresh_db, "none")
-    assert "linker" in _common._stage_kwargs(None, None)
-    monkeypatch.setenv("PROSPECTA_LINKER", "")                       # unset: the bank decides
-    assert "linker" not in _common._stage_kwargs(fresh_db, "none")
-    assert "linker" in _common._stage_kwargs(fresh_db, "legacy")
-
-
-def test_an_unreadable_bank_gets_no_linker(keyed):
-    assert "linker" not in _common._stage_kwargs(None, None)
-    assert "linker" not in _common._stage_kwargs("postgresql://nobody@127.0.0.1:1/none", "x")
-
-
-def test_effective_link_config_of_stored_banks_is_unchanged():
-    assert effective_link_config({}) == {"links": False, "entities": True}
-    assert effective_link_config({"links": False, "entities": False}) == {"links": False, "entities": False}
+    assert llm.calls == 0
+    with psycopg.connect(fresh_db) as c:
+        assert c.execute("SELECT count(*) FROM memory_entities").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM memory_links").fetchone()[0] == 0
+    for bank, stored in LIVE_BANKS.items():
+        assert config_of(fresh_db, bank) == stored               # and no bank was rewritten

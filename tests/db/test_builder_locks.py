@@ -1,11 +1,14 @@
-"""The post-commit index builders (finish_0004 +1, finish_0005 +2, the keyword index +3, the
+"""The post-commit index builders (finish_0004 +1, finish_0005 +2, the retired keyword index +3, the
 exact_tsv index +4: advisory keys MIGRATE_LOCK_KEY + n) serialize on those keys so that no two
 CREATE INDEX CONCURRENTLY run on the table at once (they can deadlock each other).
 
+The keyword index (+3) is no longer built by this library; its key stays so that a process of the
+previous library, which still builds it, keeps taking turns with the builders that remain. The
+tests stand a process of that library in with `previous_library_keyword_index` below.
+
 The first version of that rule had each builder take its OWN key and then poll the OTHER
-builders' keys. Two builders running at once in different processes (`prospecta keyword-index
---rebuild` during a migration) then each held their own key and polled the other's forever: a
-livelock. The rule now: every builder takes ALL the builder keys, its own included, in ONE fixed
+builders' keys. Two builders running at once in different processes (a migration and a
+rebuild) then each held their own key and polled the other's forever: a livelock. The rule now: every builder takes ALL the builder keys, its own included, in ONE fixed
 ascending order (polling, never blocking), and releases them all."""
 from __future__ import annotations
 
@@ -16,16 +19,25 @@ import time
 import psycopg
 import pytest
 
+from prospecta.db.builder_locks import hold_builder_locks
 from prospecta.db.exact_tsv import ensure_exact_tsv_index
-from prospecta.db.keyword_index import ensure_keyword_index
 from prospecta.db.migrate import MIGRATE_LOCK_KEY, finish_0004, finish_0005, run_migrations
 
 BUILDER_KEYS = [MIGRATE_LOCK_KEY + n for n in (1, 2, 3, 4)]
 
+
+
+def previous_library_keyword_index(url: str) -> None:
+    """What the previous library's `ensure_keyword_index(rebuild=True)` did around its index build: held
+    every builder key, in order, for a moment."""
+    with psycopg.connect(url, autocommit=True) as conn, hold_builder_locks(conn):
+        time.sleep(0.05)
+
+
 BUILDERS = {
     1: lambda url: finish_0004(url),
     2: lambda url: finish_0005(url),
-    3: lambda url: ensure_keyword_index(url, rebuild=True),
+    3: previous_library_keyword_index,
     4: lambda url: ensure_exact_tsv_index(url, rebuild=True),
 }
 

@@ -6,10 +6,15 @@ every chunk holding a query word, so a question made only of very common words (
 about 0.15 ms per matching chunk. It is now a STORED generated column, filled by the database
 on every write, with its own GIN index; the query reads the column and nothing is tokenized.
 
-One definition: the column is generated from `keyword_index.indexed_expression()`, the same
-word rule migration 0018 indexes for the `keyword` channel. Migration 0020's SQL carries a
-placeholder that `migrate.run_migrations` fills from that function, so the migration, the
-column and the `keyword` index cannot drift, and the query names only the column.
+One definition: the column is generated from `indexed_expression()` below: Postgres's 'simple'
+text-search parser (stemming off; versions, paths and ids stay whole words) plus the pieces of a
+path split at slashes. Migration 0020's SQL carries a placeholder that `migrate.run_migrations`
+fills from `column_expression()`, so the migration and the column cannot drift, and the query
+names only the column.
+
+Migration 0018 once built a GIN index (`memory_items_keyword_gin`) over the same expression for
+the `keyword` channel. That channel was removed (docs/legacy.md): no code reads or builds the index
+any more. A database that has it keeps it (it is not dropped); a new database does not get it.
 
 Adding the column REWRITES `memory_items` (every row, every index of the table), once, inside
 the migration. The GIN index is then built without blocking writes (CREATE INDEX
@@ -23,13 +28,33 @@ from __future__ import annotations
 import psycopg
 
 from prospecta.db.builder_locks import hold_builder_locks
-from prospecta.db.keyword_index import has_index, indexed_expression
 
 COLUMN = "exact_tsv"
 INDEX_NAME = "memory_items_exact_tsv_gin"
 # This build's own advisory key (MIGRATE_LOCK_KEY + 4); it takes every builder's key, this one
 # included, in ascending order (prospecta/db/builder_locks.py).
 LOCK_KEY = 0x70726F73706563 + 4
+
+
+def word_vector(cfg: str, expr: str) -> str:
+    """The one word rule. `cfg` is a SQL expression for the regconfig."""
+    return (f"(to_tsvector({cfg}::regconfig, {expr}) || "
+            f"to_tsvector({cfg}::regconfig, translate({expr}, '/\\', '  ')))")
+
+
+def indexed_expression() -> str:
+    return word_vector("'simple'", "original_chunk")
+
+
+def has_index(conn: psycopg.Connection, name: str) -> bool:
+    """True when a valid index of that name exists on memory_items in the connection's schema."""
+    row = conn.execute(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE i.indrelid = to_regclass('memory_items') AND c.relname = %s "
+        "AND i.indisvalid AND i.indisready AND c.relnamespace = "
+        "(SELECT relnamespace FROM pg_class WHERE oid = to_regclass('memory_items'))",
+        (name,)).fetchone()
+    return row is not None
 
 
 def column_expression() -> str:

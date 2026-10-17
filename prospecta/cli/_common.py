@@ -42,8 +42,7 @@ def make_memory(args) -> "Memory":
 
     # Resolve embed and llm independently so an offline embedder
     # (PROSPECTA_EMBEDDER=sentence-transformers) works even when LiteLLM is
-    # not installed. Combined with `retain --index-text "..."` (which skips
-    # LLM index_text generation), this gives a fully offline retain path.
+    # not installed: retain makes no model call, so this is a fully offline write path.
     embed = None
     try:
         embed = _resolve_embedder(bank_embedding_dim(args.database_url, args.bank))
@@ -61,7 +60,7 @@ def make_memory(args) -> "Memory":
         llm = defaults.make_default_llm()  # type: ignore[attr-defined]
     except (ImportError, AttributeError):
         # LiteLLM not installed / T23 defaults absent. Read-only paths
-        # (stats, config) and offline retain (--index-text) work without llm.
+        # (stats, config) and offline retain work without llm.
         pass
 
     return Memory(
@@ -69,7 +68,7 @@ def make_memory(args) -> "Memory":
         bank_id=args.bank,
         llm=llm,
         embed=embed,
-        **_stage_kwargs(args.database_url, args.bank),
+        **_stage_kwargs(),
     )
 
 
@@ -77,50 +76,12 @@ def _truthy_off(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("0", "off", "false", "no")
 
 
-def _truthy_on(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "on", "true", "yes")
-
-
-def bank_link_switches(database_url: str | None, bank_id: str | None) -> tuple[bool, bool] | None:
-    """(links, entities) the bank's link_config enables (defaults filled in: a stored `{}` is
-    links off, entities on; a bank created fresh stores both off), or None if the bank or
-    the database cannot be read."""
-    if not database_url or not bank_id:
-        return None
-    try:
-        import psycopg
-        from prospecta._linker import effective_link_config
-        from prospecta.db.schema import resolve_schema, scoped_url
-        with psycopg.connect(scoped_url(database_url, resolve_schema()), connect_timeout=10) as conn:
-            row = conn.execute(
-                "SELECT link_config FROM banks WHERE bank_id = %s", (bank_id,)).fetchone()
-        if row is None:
-            return None
-        cfg = effective_link_config(row[0])
-        return bool(cfg["links"]), bool(cfg["entities"])
-    except Exception:
-        return None
-
-
-def _want_linker(database_url: str | None, bank_id: str | None) -> bool:
-    """Whether the CLI builds the Linker: never with PROSPECTA_LINKER=off; always with
-    PROSPECTA_LINKER=on (the bank's link_config still decides what it does); otherwise
-    only when the bank's link_config enables links or entities (a bank created fresh
-    has both off; a bank that stored `{}` keeps its default of entities on)."""
-    if _truthy_off("PROSPECTA_LINKER"):
-        return False
-    if _truthy_on("PROSPECTA_LINKER"):
-        return True
-    return any(bank_link_switches(database_url, bank_id) or ())
-
-
-def _stage_kwargs(database_url: str | None = None, bank_id: str | None = None) -> dict:
-    """rerank_llm, synth_llm, rerank_transport, jev and linker for Memory, built
-    when configured: an OPENROUTER_API_KEY configures them (Sonnet 5.5 through
-    the accounted LLM; the cross-encoder through OpenRouter's rerank endpoint;
-    Jev through OpenRouter's System One door). PROSPECTA_JEV=off opts out of Jev. The
-    linker is built only when `_want_linker` says so (the bank's link_config, or
-    PROSPECTA_LINKER=on; PROSPECTA_LINKER=off never). Without a key none is built."""
+def _stage_kwargs() -> dict:
+    """synth_llm, rerank_transport and jev for Memory, built when configured: an OPENROUTER_API_KEY
+    configures them (the cited answer's model through the accounted LLM; the cross-encoder through
+    OpenRouter's rerank endpoint; the decision model, Jev, through OpenRouter's System One door).
+    PROSPECTA_JEV=off opts out of Jev. Without a key none is built. (No linker is ever built: the
+    linker was removed, docs/legacy.md.)"""
     if not os.environ.get("OPENROUTER_API_KEY"):
         return {}
     try:
@@ -129,18 +90,9 @@ def _stage_kwargs(database_url: str | None = None, bank_id: str | None = None) -
     except (ImportError, AttributeError):
         return {}
     from prospecta.stages import JevScore, openrouter_jev_transport, openrouter_rerank_transport
-    transport = openrouter_jev_transport()
-    kw: dict = {"rerank_llm": accounted, "synth_llm": accounted,
-                "rerank_transport": openrouter_rerank_transport()}
+    kw: dict = {"synth_llm": accounted, "rerank_transport": openrouter_rerank_transport()}
     if not _truthy_off("PROSPECTA_JEV"):
-        kw["jev"] = JevScore(transport)
-    if _want_linker(database_url, bank_id):
-        from prospecta._linker import JUDGE_FLOOR_FRAC, JevRelationJudge, Linker
-        judge = None if _truthy_off("PROSPECTA_JEV") else JevRelationJudge(transport)
-        # PROSPECTA_LINK_COMPLETENESS=all-pairs|connected overrides the bank's recall_config for this run
-        kw["linker"] = Linker(llm=accounted, judge=judge,
-                              link_completeness=os.environ.get("PROSPECTA_LINK_COMPLETENESS") or None,
-                              judge_floor_frac=float(os.environ.get("PROSPECTA_JUDGE_FLOOR_FRAC", JUDGE_FLOOR_FRAC)))
+        kw["jev"] = JevScore(openrouter_jev_transport())
     return kw
 
 

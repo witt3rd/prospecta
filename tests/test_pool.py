@@ -67,15 +67,14 @@ def served(bare_db, monkeypatch):  # noqa: F811
     run_migrations(bare_db, schema="prospecta_shared")
     state = {"boom": False}
 
-    def llm(messages, **k):
+    def embed(texts):
         if state["boom"]:
-            raise RuntimeError("model failed")
-        return "What is the first thing?\nWhy does the second thing matter?"
+            raise RuntimeError("embedder failed")
+        return stub_embed(texts)
 
-    mem = Memory(database_url=bare_db, bank_id="b", embed=stub_embed, llm=llm,
-                 schema="prospecta_shared")
+    mem = Memory(database_url=bare_db, bank_id="b", embed=embed, schema="prospecta_shared")
     mem.create_bank("b", embedding_dim=EMBED_DIM)
-    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)), generate_questions=True)
+    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)))
     srv = Server(("127.0.0.1", 0), make_handler(Service(mem, ix), None))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"

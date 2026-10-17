@@ -3,7 +3,7 @@
 Prospecta knows nothing about the host: it only reads a view contract (see
 docs/source-contract.md) from a configured schema. It never copies record text
 into a store of record. What it keeps are derived items (chunks, anticipated
-questions, embeddings, entities, links) plus one reference row per record
+embeddings) plus one reference row per record
 (source_refs: kind, record id, revision, filter columns; no text).
 
 All operations are idempotent and keyed by (kind, record_id, revision).
@@ -121,16 +121,11 @@ class Coverage:
 class SourceIndexer:
     """Index/remove/coverage over the host views, writing into a Memory's bank."""
 
-    def __init__(self, memory, config: SourceConfig, concurrency: int | None = None,
-                 generate_questions: bool = False):
-        """By default a record is indexed as chunk items only, with no model call;
-        `generate_questions=True` (needs the Memory's `llm`) adds anticipated questions."""
-        if generate_questions and memory._llm is None:
-            raise ValueError("generate_questions=True requires Memory(llm=...)")
+    def __init__(self, memory, config: SourceConfig, concurrency: int | None = None):
+        """A record is indexed as chunk items only, with no model call."""
         self._m = memory
         self.config = config
         self.concurrency = default_concurrency() if concurrency is None else concurrency
-        self.generate_questions = generate_questions
 
     def _workers(self, concurrency: int | None) -> int:
         n = self.concurrency if concurrency is None else concurrency
@@ -243,9 +238,8 @@ class SourceIndexer:
             if ref is not None:
                 self._retire(conn, ref[1])
             items = self._build_items(rec)
-            doc_id = self._write(conn, bank, rec, items)
+            self._write(conn, bank, rec, items)
             conn.commit()
-        m._enqueue_link(doc_id)
         return IndexResult(kind, record_id, "indexed", revision, len(items))
 
     # -- document scope / reconcile ----------------------------------------
@@ -310,21 +304,12 @@ class SourceIndexer:
         body = f"{title}\n\n{text}".strip() if title else text.strip()
         meta = ref_metadata(rec)
         items: list[dict] = []
-        questions: list[str] = []
-        if body and self.generate_questions:
-            from prospecta._index_text import generate_index_text
-            questions, _p, _r = generate_index_text(
-                body, m._llm, context={"source": f"{rec['kind']}:{rec['record_id']}",
-                                       **({"person": rec["person"]} if rec["person"] else {})})
         chunks = chunk_paragraphs(body, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS) if body else []
-        texts = list(questions) + [c.content for c in chunks]
+        texts = [c.content for c in chunks]
         vecs = m._embed(texts) if texts else []
         if len(vecs) != len(texts):
             raise RuntimeError(f"embed() returned {len(vecs)} vectors for {len(texts)} inputs")
-        for q, vec in zip(questions, vecs):
-            items.append({"content": q, "original_chunk": chunks[0].content if chunks else body[:CHUNK_MAX_CHARS],
-                          "embedding": vec, "metadata": meta, "llm_generated": True, "kind": "question"})
-        for c, vec in zip(chunks, vecs[len(questions):]):
+        for c, vec in zip(chunks, vecs):
             items.append({"content": c.content, "original_chunk": c.content, "embedding": vec,
                           "metadata": meta, "llm_generated": False, "kind": "chunk",
                           "ordinal": c.ordinal, "char_start": c.char_start, "char_end": c.char_end})

@@ -27,7 +27,6 @@ def cmd_eval(args) -> int:
         report = evaluation.run_eval(
             memory, questions, ablate=args.ablate, synth=args.synth or args.judge,
             judge=args.judge,
-            rerank_blend=getattr(args, "rerank_blend", None),
             scope_promote=getattr(args, "scope_promote", None),
             depth=getattr(args, "depth", None))
     except Exception as e:

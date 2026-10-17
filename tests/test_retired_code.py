@@ -226,7 +226,7 @@ def test_a_bank_that_still_names_retired_channels_searches_with_the_rest(chunk_b
         chunk_bank.search(q, limit=8)      # a second recall in the same process
     assert expected and sources(got) == sources(expected)
     assert [c["name"] for c in trace[0]["channels"]] == ["dense_chunk", "meta"]
-    assert {s["name"] for s in trace[0]["fusion"].get("skipped", [])} <= set()  # not channels that ran
+    assert {s["name"] for s in trace[0]["skipped"]} == set(RETIRED_CHANNELS)    # recorded, not run
     for name in RETIRED_CHANNELS:                       # one warning each, in the whole process
         assert len(retired_warnings(caplog, name)) == 1, name
 

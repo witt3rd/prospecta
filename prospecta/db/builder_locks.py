@@ -3,12 +3,13 @@
 Two CREATE INDEX CONCURRENTLY on one table can deadlock: the statement waiting for the
 table's lock already holds a snapshot that the building one waits to end in its last phase
 (seen between finish_0004's `CREATE INDEX CONCURRENTLY IF NOT EXISTS` and the keyword index
-build when four processes migrate at once). So the builders run one at a time, each holding
-a session advisory key while it builds:
+build, since retired, when four processes migrate at once). So the builders run one at a time,
+each holding a session advisory key while it builds:
 
     MIGRATE_LOCK_KEY + 1   finish_0004   (migrate.py)
     MIGRATE_LOCK_KEY + 2   finish_0005   (migrate.py)
-    MIGRATE_LOCK_KEY + 3   the keyword index (keyword_index.py)
+    MIGRATE_LOCK_KEY + 3   the keyword index (retired; the key stays so that a process still running the
+                           previous library, which builds that index, keeps taking turns with this one)
     MIGRATE_LOCK_KEY + 4   the exact_tsv index (exact_tsv.py)
 
 The rule that makes that safe: every builder takes ALL the keys, its own included, in ONE

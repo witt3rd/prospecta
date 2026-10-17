@@ -12,7 +12,7 @@ Every table, index, function and the `prospecta_schema_version` table live in
 that one schema; every connection runs with `search_path = "<schema>", public`.
 Nothing is created elsewhere. The `vector` extension must already be installed by
 the database owner; in this mode Prospecta never creates an extension (migration
-0012's optional `pg_search` index, a legacy channel's, is skipped unless that
+0012's optional `pg_search` index, which no code reads any more, is skipped unless that
 extension is installed).
 
 - `run_migrations` creates the schema when missing (an existing one is left alone).
@@ -181,9 +181,7 @@ Environment: `DATABASE_URL`, `PROSPECTA_SCHEMA`, `PROSPECTA_SOURCE_SCHEMA`,
 `PROSPECTA_EMBEDDING_DIM`, `PROSPECTA_SERVICE_HOST` (default 127.0.0.1),
 `PROSPECTA_SERVICE_PORT` (8080), `PROSPECTA_SERVICE_TOKEN` (bearer token;
 required to listen on a non-loopback address), and the usual embedder/LLM
-variables. Only chunk items are written (no model call at index time); anticipated
-questions too only when a library caller builds `SourceIndexer(..., generate_questions=True)`
-(needs an LLM). The host decides when to call `/index` (for example after a
+variables. Only chunk items are written (no model call at index time). The host decides when to call `/index` (for example after a
 change) and can use `/coverage` to find what to re-send.
 
 ```

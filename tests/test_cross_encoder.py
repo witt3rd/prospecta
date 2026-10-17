@@ -211,22 +211,22 @@ def rr_cfg(**kw):
 def test_build_reranker_resolves_model_and_settings(monkeypatch):
     monkeypatch.setenv("PROSPECTA_RERANKER_MODEL", "env/model")
     t = fake_rerank(by_marker)
-    rr = build_reranker(rr_cfg(), llm=None, jev=None, rerank_transport=t)
+    rr = build_reranker(rr_cfg(), rerank_transport=t)
     assert (type(rr), rr.model, rr.top_n, rr.min_score, rr.timeout, rr.deduplicate) == (
         CrossEncoderReranker, "env/model", 10, 0.15, 2.5, True)
     rr = build_reranker(rr_cfg(model="bank/model", top_n=4, min_score=0.3, timeout_s=1.0,
                                deduplicate_near_copies=False),
-                        llm=None, jev=None, rerank_transport=t)
+                        rerank_transport=t)
     assert (rr.model, rr.top_n, rr.min_score, rr.timeout, rr.deduplicate) == (
         "bank/model", 4, 0.3, 1.0, False)
-    rr = build_reranker(rr_cfg(model="bank/model"), llm=None, jev=None, rerank_transport=t,
+    rr = build_reranker(rr_cfg(model="bank/model"), rerank_transport=t,
                         reranker_model="call/model")
     assert rr.model == "call/model"
 
 
 def test_cross_encoder_needs_a_transport():
     with pytest.raises(RuntimeError, match="rerank transport"):
-        build_reranker(rr_cfg(), llm=None, jev=None)
+        build_reranker(rr_cfg())
 
 
 def test_validate_cross_encoder_config():

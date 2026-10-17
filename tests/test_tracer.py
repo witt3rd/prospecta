@@ -78,14 +78,13 @@ def test_caller_supplied_tracer_overrides_default(memory_with_recording_tracer, 
 
 def test_tracer_fires_on_retain(memory_with_recording_tracer):
     mem = memory_with_recording_tracer
-    mem._mock_llm.canned = "q1\nq2"
-    mem.retain("the body content", source="t1", generate_questions=True)
+    mem.retain("the body content", source="t1")
     events = mem._tracer.by_name("retain")
     assert len(events) == 1
-    assert events[0]["items_count"] == 2
+    assert events[0]["items_count"] == 1                    # one chunk
     assert events[0]["index_text_caller_supplied"] is False
-    # llm_call also fired for index_text generation
-    assert mem._tracer.by_name("llm_call")
+    # no model is called to write a note
+    assert mem._tracer.by_name("llm_call") == []
 
 
 def test_tracer_fires_on_retain_caller_supplied(memory_with_recording_tracer):
@@ -142,9 +141,8 @@ def test_six_events_fire_end_to_end(memory_with_recording_tracer, tmp_corpus):
     from prospecta._sweeper import SweeperConfig, run_one_pass
 
     mem = memory_with_recording_tracer
-    mem._mock_llm.canned = "q1\nq2"
-    # retain → fires 'retain' + 'llm_call' (for generate_index_text)
-    mem.retain("body content", source="t1", generate_questions=True)
+    # retain → fires 'retain' (no model call)
+    mem.retain("body content", source="t1")
     # recall_synth → fires 'formulate_queries' + 'recall' + 'llm_call'
     mem._mock_llm.set_response(
         lambda messages, *, json_mode: (

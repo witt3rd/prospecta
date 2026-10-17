@@ -180,7 +180,7 @@ def _seeded(fresh_db, **kw):
 
 def test_synth_llm_used_when_given_and_label_from_result(fresh_db):
     general, synth = SynthLLM("general [alpha.md]"), SynthLLM("synth [alpha.md]")
-    m = _seeded(fresh_db, llm=general, synth_llm=synth, rerank_model="rerank-x")
+    m = _seeded(fresh_db, llm=general, synth_llm=synth)
     res = m.recall_synth("cat sat", grounded=True)
     assert res.synthesis == "synth [alpha.md]"
     assert synth.prompts and not general.prompts
@@ -189,7 +189,7 @@ def test_synth_llm_used_when_given_and_label_from_result(fresh_db):
 
 
 def test_synth_falls_back_to_general_llm_label_none_when_unreported(fresh_db):
-    m = _seeded(fresh_db, llm=_bare(), rerank_model="rerank-x")
+    m = _seeded(fresh_db, llm=_bare())
     res = m.recall_synth("cat sat", grounded=True)
     assert res.synthesis == "Cats [alpha.md]"
     assert res.synth_call["model"] is None
