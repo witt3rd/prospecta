@@ -721,12 +721,21 @@ def _search_channels(
             tr["fusion"]["scope_promoted"] = [m.document_id for m in members]
     if trace is not None:
         trace.append(tr)
-    channel_names = [c["name"] for c in tr["channels"]]
-    hybrid = {c.document_id: c for c in state.channel_lists.get("hybrid_chunk", [])}
+    return recalled_from_fused(
+        fused[:limit], bank_id, state.channel_lists, [c["name"] for c in tr["channels"]], recall_cfg)
+
+
+def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names: list[str],
+                        recall_cfg: dict | None) -> list[RecalledMemory]:
+    """The fused documents as RecalledMemory, in order. `channel_lists` is what the channels
+    returned (the hybrid_chunk chunk carries the snippet that belongs with its own text);
+    `channel_names` are the channels that ran; `recall_cfg` says whether stages ran (scores
+    gain rerank / jev) and whether the cross-encoder graded (relevance_score)."""
+    hybrid = {c.document_id: c for c in channel_lists.get("hybrid_chunk", [])}
     rerank_cfg = (recall_cfg or {}).get("rerank") or {}
     cross_encoder = rerank_cfg.get("enabled") and rerank_cfg.get("stage") == "cross_encoder"
     out = []
-    for f in fused[:limit]:
+    for f in fused:
         h = hybrid.get(f.document_id)   # the Stage 1 chunk: its snippet belongs with its own text
         b = h or f.best
         d = h.detail if h else {}
@@ -760,6 +769,8 @@ def _search_channels(
             exact_snippet=d.get("exact_snippet"),
         ))
     return out
+
+
 
 
 def _row_to_recalled(row: dict, bank_id: str, *, mode: str) -> RecalledMemory:

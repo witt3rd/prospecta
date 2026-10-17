@@ -78,16 +78,85 @@ class RecalledMemory:
     match_kind: str | None = None         # exact+semantic | exact | lexical | semantic | date
     relevance_score: float | None = None  # cross-encoder score (0..1) when stage 2 graded it, else `score`
     exact_snippet: str | None = None      # ts_headline of the matched words, <<marked>>
+    found_by: tuple[int, ...] | None = None   # query expansion: the numbers of the searches that found it
 
 
 @dataclass(frozen=True)
-class TaskRecall:
-    """Result of Memory.recall_for_task: the facet queries that ran, the cited
-    notes (own project first, other projects labeled) and the context block."""
+class TaskBrief:
+    """A non-interactive task: what Memory.expand_and_recall(kind='task') expands."""
 
-    queries: list[str]
-    items: list[RecalledMemory]
-    block: str        # format_cited_rag_block(items): the "## Recalled Project Context" block
+    title: str
+    ask: str
+    done: str | None = None       # the done criteria
+    project: str | None = None    # the task's own project: its notes come first, others are labeled
+
+
+@dataclass(frozen=True)
+class SearchSpec:
+    """One structured search of a query expansion (docs/postgres-hybrid.md, Mode 1, point 3)."""
+
+    query: str                    # what to find: for the semantic and stemmed retrievers and the reranker
+    terms: tuple[str, ...] = ()   # names, identifiers, "quoted phrases", verbatim from the prompt: the exact retriever
+    date_from: str | None = None  # YYYY-MM-DD: the period the prompt states or implies
+    date_to: str | None = None
+
+
+@dataclass
+class SearchRun:
+    """What became of one search: `index` is its 1-based number in the writer's order (the
+    block's numbering and RecalledMemory.found_by)."""
+
+    index: int
+    spec: SearchSpec
+    status: str = "pending"       # ok | late (past the deadline, dropped) | error | skipped
+    n_candidates: int = 0         # Stage 1 candidates (notes)
+    n_kept: int = 0               # what the search contributed after stage 2 and its floor
+    reranked: bool = False        # stage 2 graded them (False: Stage 1 order stood)
+    fallback_reason: str | None = None
+    error: str | None = None
+    ms: dict = field(default_factory=dict)   # embed, stage1, rerank, total
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """The stage 0 gate's verdict for a chat message. `needs_memory` is the decision model's
+    noul in 0..1 (the plugin's contract: at or above the threshold, 0.5, the message goes on).
+    `skip` forces a skip whatever the number (e.g. the message is a greeting)."""
+
+    needs_memory: float
+    skip: bool = False
+    reason: str | None = None
+    model: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class ExpandedRecall:
+    """Result of Memory.expand_and_recall. Never raised into the caller: a failure is in
+    `error`, `fallbacks` and an empty or partial `block`."""
+
+    kind: str                         # chat | task
+    block: str                        # the cited block ("" when gated, empty or failed)
+    items: list[RecalledMemory]       # the merged records, in block order; relevance_score is the best score
+    searches: list[SearchSpec]        # the searches written (after the verbatim guard and the maximum)
+    runs: list[SearchRun]             # one per search: status, counts, per-search ms
+    skipped: bool = False             # the gate skipped the whole expansion
+    skipped_reason: str | None = None
+    gate: dict | None = None          # {needs_memory, threshold, model, ...} or {error}
+    fallbacks: list[str] = field(default_factory=list)   # every degraded step, in words
+    timings_ms: dict = field(default_factory=dict)       # gate, writer, stage1, rerank, merge, total
+    accounting: dict = field(default_factory=dict)       # n_llm_calls, tokens_in, tokens_out, cost_usd
+    calls: list[dict] = field(default_factory=list)      # every model call record
+    deadline_hit: bool = False
+    dropped_for_tokens: int = 0       # records left out by the max_tokens valve (0 = valve off or not hit)
+    error: str | None = None
+
+    @property
+    def queries(self) -> list[str]:
+        """The searches' queries (what the old TaskRecall.queries held)."""
+        return [s.query for s in self.searches]
 
 
 @dataclass(frozen=True)

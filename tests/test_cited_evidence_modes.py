@@ -4,8 +4,9 @@ modes that use it, end to end with fakes for the models.
 - Mode 2A: Memory.search / POST /lookup hits carry source, created_on, kind, match_kind,
   relevance_score, exact_snippet and original_chunk; Stage 1 filters and the model
   overrides are per-call.
-- Mode 1B: Memory.recall_for_task / POST /lookup {"task": ...}: a brief becomes 2-4
-  facet queries, each runs Stage 1 + Stage 2, the notes merge into one cited block.
+- Mode 1, task: Memory.recall_for_task / POST /lookup {"task": ...}: a thin wrapper of
+  expand_and_recall (the brief becomes N searches, each runs Stage 1 + Stage 2, the notes merge
+  into one cited block); the entry point's own tests are tests/test_expand.py.
 - Mode 2B: Memory.ask: a grounded answer with [n] citations and verbatim snippets, and
   the optional Stage 3 sufficiency gate.
 Invented text; a stub embedder, a fake rerank transport, a fake Jev, a fake LLM."""
@@ -17,7 +18,6 @@ import re
 import psycopg
 import pytest
 
-from prospecta._task import DEFAULT_QUERY_WRITER_MODEL, decompose_brief
 from prospecta._tracer import RecordingTracer
 from prospecta._types import RecalledMemory
 from prospecta.cited import (
@@ -71,16 +71,16 @@ class FakeJev:
 
 
 class FakeLLM:
-    """The query writer (json_mode) and the synthesis model, in one callable that accepts
-    the optional `model` hint."""
+    """The query writer (json_mode: the scripted `searches`) and the synthesis model (`answer`), in one
+    callable that accepts the optional `model` hint."""
 
-    def __init__(self, facets=None, answer="not in memory"):
-        self.facets, self.answer, self.calls = facets, answer, []
+    def __init__(self, searches=None, answer="not in memory"):
+        self.searches, self.answer, self.calls = searches, answer, []
 
     def __call__(self, messages, *, json_mode=False, model=None):
         self.calls.append({"json_mode": json_mode, "model": model, "prompt": messages[-1]["content"]})
         if json_mode:
-            return json.dumps({"queries": self.facets})
+            return json.dumps({"searches": self.searches})
         return self.answer
 
 
@@ -265,7 +265,8 @@ def test_lookup_passes_filters_and_models_and_refuses_bad_ones(svc, mem):
 
 
 # --------------------------------------------------------------------------
-# Mode 1B: recall for a task
+# Mode 1, task: recall_for_task is a thin wrapper of expand_and_recall (tests/test_expand.py has
+# the entry point's own tests); here the old behaviours that must still hold, through the wrapper.
 # --------------------------------------------------------------------------
 
 BRIEF = dict(title="Show the library tree view", project="atlas",
@@ -273,73 +274,25 @@ BRIEF = dict(title="Show the library tree view", project="atlas",
              done="Large folders page in")
 
 
-def test_recall_for_task_splits_the_brief_into_facets_and_returns_a_cited_block(fresh_db):
-    llm = FakeLLM(facets=['"electric dreams"', "library tree view decisions",
-                          "append-only archive conventions"])
+def test_recall_for_task_returns_a_cited_block_with_its_own_project_first(fresh_db):
+    llm = FakeLLM(searches=[{"query": "library tree view decisions", "terms": ['"electric dreams"']},
+                            {"query": "append-only archive conventions"}])
     rerank = FakeRerank()
     m = build(fresh_db, llm=llm, rerank=rerank)
     try:
         m.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder", "min_score": 0}})
         got = m.recall_for_task(**BRIEF)
-        assert got.queries == llm.facets
-        [event] = m._tracer.by_name("recall")
-        assert event["queries"] == llm.facets                        # one batched Stage 1 + 2 pass
+        assert got.queries == ["library tree view decisions", "append-only archive conventions"]
         sources = [i.source for i in got.items]
         assert len(sources) == len(set(sources))                     # each note once
         assert sources.index("tree.md") > max(sources.index(s) for s in ("phrase.md", "decision.md"))
-        assert got.block.startswith("## Recalled Project Context\n\n[1] source=")
+        assert got.block.startswith("## Recalled Project Context\n\n")
         assert "source=phrase.md | date=2024-04-01 | kind=note | match=exact" in got.block
         assert 'Exact match snippet: "' in got.block and "<<electric>> <<dreams>>" in got.block
         assert "source=tree.md | date=2023-09-09 | kind=note" in got.block
         assert "| project=borealis (another project)" in got.block
         assert "project=atlas" not in got.block          # the task's own project is not labeled
-        assert len(rerank.requests) == 3                             # a Stage 2 request per facet
-    finally:
-        m.close()
-
-
-def test_recall_for_task_keeps_quoted_strings_and_tops_up_the_facets(fresh_db):
-    llm = FakeLLM(facets=["tree view"])           # one facet, and the quoted phrase is gone
-    m = build(fresh_db, llm=llm)
-    try:
-        got = m.recall_for_task(**BRIEF)
-        assert '"electric dreams"' in got.queries[0] and got.queries[0].startswith("tree view")
-        assert 2 <= len(got.queries) <= 4 and "Show the library tree view" in got.queries
-    finally:
-        m.close()
-
-
-def test_task_facets_are_cleaned_cut_and_fall_back_to_the_brief():
-    brief = ("T", "the ask", "done when", None)
-    messy = FakeLLM(facets=["a", "A", "a", "b", "c", "d", "e", 7, "  "])
-    queries, calls = decompose_brief(*brief, llm=messy, model="m", max_facets=3)
-    assert queries == ["a", "A", "b"] and calls[0]["purpose"] == "task_facets" and calls[0]["error"] is None
-    queries, calls = decompose_brief(*brief, llm=lambda messages, **k: "no json here", model="m")
-    assert queries == ["T", "the ask", "done when"] and calls[0]["error"]
-    assert decompose_brief(*brief, llm=None, model="m") == (["T", "the ask", "done when"], [])
-    assert decompose_brief("T", "T", None, None, llm=None, model="m")[0] == ["T"]
-
-
-def test_the_query_writer_model_is_per_call_then_bank_then_environment_then_default(fresh_db, monkeypatch):
-    llm = FakeLLM(facets=["tree view", "archive"])
-    m = build(fresh_db, llm=llm)
-    try:
-        models = []
-        m.recall_for_task(**BRIEF, query_writer_model="call/qw")
-        models.append(llm.calls[-1]["model"])
-        m.set_recall_config({"models": {"query_writer_model": "bank/qw"}})
-        m.recall_for_task(**BRIEF)
-        models.append(llm.calls[-1]["model"])
-        m.set_recall_config({})
-        monkeypatch.setenv("PROSPECTA_QUERY_WRITER_MODEL", "env/qw")
-        m.recall_for_task(**BRIEF)
-        models.append(llm.calls[-1]["model"])
-        monkeypatch.delenv("PROSPECTA_QUERY_WRITER_MODEL")
-        m.recall_for_task(**BRIEF)
-        models.append(llm.calls[-1]["model"])
-        assert models == ["call/qw", "bank/qw", "env/qw", DEFAULT_QUERY_WRITER_MODEL]
-        assert all(c["json_mode"] for c in llm.calls)
-        assert m._tracer.by_name("llm_call")[0]["purpose"] == "task_facets"
+        assert len(rerank.requests) == 2                             # a Stage 2 request per search
     finally:
         m.close()
 
@@ -348,7 +301,8 @@ def test_recall_for_task_without_a_query_writer_searches_the_brief_itself(fresh_
     m = build(fresh_db)
     try:
         got = m.recall_for_task(**BRIEF)
-        assert got.queries == [BRIEF["title"], BRIEF["ask"], BRIEF["done"]] and got.items
+        assert got.queries == [" ".join([BRIEF["title"], BRIEF["ask"], BRIEF["done"]])] and got.items
+        assert got.searches[0].terms == ('"electric dreams"',)       # the verbatim terms of the brief
         for bad in ({"title": " "}, {"ask": ""}):
             with pytest.raises(ValueError):
                 m.recall_for_task(**{**BRIEF, **bad})
@@ -357,17 +311,26 @@ def test_recall_for_task_without_a_query_writer_searches_the_brief_itself(fresh_
 
 
 def test_lookup_task_form_returns_the_context_block_and_cited_results(fresh_db):
-    llm = FakeLLM(facets=['tree view "electric dreams"', "append-only archive"])
-    m = build(fresh_db, llm=llm)
+    searches = [{"query": 'tree view "electric dreams"', "terms": ['"electric dreams"']},
+                {"query": "append-only archive"}]
+    m = build(fresh_db, llm=FakeLLM(searches=searches))
     try:
-        out = Service(m, None).lookup({"task": BRIEF, "limit": 3})["task"]
-        assert out["queries"] == llm.facets and out["context"].startswith("## Recalled Project Context")
+        out = Service(m, None).lookup({"task": BRIEF, "max_tokens": 0})["task"]
+        assert out["queries"] == [s["query"] for s in searches]
+        assert out["searches"][0] == {"query": 'tree view "electric dreams"', "terms": ['"electric dreams"'],
+                                      "date_from": None, "date_to": None}
+        assert out["context"].startswith("## Recalled Project Context") and out["error"] is None
         first = out["results"][0]
-        assert {"source", "created_on", "kind", "project", "match_kind", "relevance_score"} <= set(first)
+        assert {"source", "created_on", "kind", "project", "match_kind", "relevance_score", "found_by"} <= set(first)
         for bad in ({"title": 3}, {"ask": ""}, {"done": 1}):
             with pytest.raises(ApiError) as e:
                 Service(m, None).lookup({"task": {**BRIEF, **bad}})
             assert e.value.status == 400
+        with pytest.raises(ApiError, match="sized by relevance") as e:      # no count cap on a task
+            Service(m, None).lookup({"task": BRIEF, "limit": 3})
+        assert e.value.status == 400
+        with pytest.raises(ApiError):
+            Service(m, None).lookup({"task": BRIEF, "max_tokens": -1})
     finally:
         m.close()
 

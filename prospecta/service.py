@@ -136,17 +136,24 @@ class Service:
         for k in ("done", "project"):
             if task.get(k) is not None and not isinstance(task[k], str):
                 raise ApiError(400, f"task.{k} must be a string")
-        limit = body.get("limit", 10)
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
-            raise ApiError(400, f"limit must be an integer 1..{MAX_LIMIT}")
+        if "limit" in body:
+            raise ApiError(400, "limit does not apply to a task: its block is sized by relevance "
+                                "(max_tokens is the safety valve)")
+        max_tokens = body.get("max_tokens", 0)
+        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0:
+            raise ApiError(400, "max_tokens must be an integer >= 0 (0: no valve)")
         try:
             got = self.memory.recall_for_task(
                 title=task["title"], ask=task["ask"], done=task.get("done"),
-                project=task.get("project"), limit=limit, **self._recall_options(body))
+                project=task.get("project"), max_tokens=max_tokens, **self._recall_options(body))
         except ValueError as e:
             raise ApiError(400, str(e)) from None
         return {"task": {"queries": got.queries, "context": got.block,
-                         "results": [_cited_hit(h) for h in got.items]}}
+                         "searches": [{"query": s.query, "terms": list(s.terms),
+                                       "date_from": s.date_from, "date_to": s.date_to}
+                                      for s in got.searches],
+                         "results": [_cited_hit(h) for h in got.items],
+                         "fallbacks": got.fallbacks, "error": got.error}}
 
     def lookup(self, body: dict) -> dict:
         if body.get("task") is not None:
@@ -246,7 +253,8 @@ def _cited_hit(h) -> dict:
     return {"source": h.source, "created_on": h.created_on, "kind": md.get("kind") or h.kind,
             "record_id": md.get("record_id"), "revision": md.get("revision"),
             "project": md.get("project"), "match_kind": h.match_kind,
-            "exact_snippet": h.exact_snippet, "relevance_score": h.relevance_score}
+            "exact_snippet": h.exact_snippet, "relevance_score": h.relevance_score,
+            "found_by": list(h.found_by) if h.found_by else None}
 
 
 def _str(body: dict, key: str) -> str:
