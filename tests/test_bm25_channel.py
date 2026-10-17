@@ -5,7 +5,7 @@ import psycopg
 import pytest
 
 from prospecta.channels import (
-    Bm25Chunks, Bm25Index, DEFAULT_CHANNEL_CONFIG, InProcessBm25, QueryPlan, RecallState,
+    AutoBm25, Bm25Chunks, Bm25Index, DEFAULT_CHANNEL_CONFIG, InProcessBm25, QueryPlan, RecallState,
     build_channels, validate_channel_config,
 )
 from prospecta.channels.bm25 import tokenize
@@ -65,6 +65,8 @@ def _chunk(conn, bank, source, text, metadata="{}"):
 @pytest.fixture
 def mem(fresh_db, tmp_path, monkeypatch):
     monkeypatch.setenv("PROSPECTA_BM25_DIR", str(tmp_path / "bm25"))
+    # the in-process index is an explicit opt-in (not the default backend)
+    monkeypatch.setattr(Bm25Chunks, "backend", AutoBm25(fallback=InProcessBm25()))
     m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
     m.create_bank("b", embedding_dim=EMBED_DIM)
     for src, text in (("cat.md", "The cat sat on the warm mat by the window."),
@@ -171,11 +173,12 @@ class _Stub:
 
 
 def test_auto_backend_selection_with_stub():
-    from prospecta.channels import AutoBm25
     pg, fb = _Stub("pg"), _Stub("fb")
     assert AutoBm25(pg, fb).search(None, "b", "q", 5) == [("pg", 1.0)]
     pg.avail = False
     assert AutoBm25(pg, fb).search(None, "b", "q", 5) == [("fb", 1.0)]
+    with pytest.raises(RuntimeError, match="no in-process fallback"):
+        AutoBm25(pg).search(None, "b", "q", 5)       # no fallback unless asked for
 
     class Boom(_Stub):
         def available(self, conn):
@@ -196,4 +199,4 @@ def test_migration_0012_is_noop_without_extension(mem):
         assert PgSearchBm25().available(conn) is False
         out = Bm25Chunks().retrieve(QueryPlan(text="revenue europe"),
                                     RecallState(conn=conn, bank_id="b"), 5)
-    assert out and out[0].source == "rev.md"  # default AutoBm25 fell back to bm25s
+    assert out and out[0].source == "rev.md"  # the explicit AutoBm25 fallback served it

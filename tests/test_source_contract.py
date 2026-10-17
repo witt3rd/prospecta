@@ -37,7 +37,9 @@ def _q(url, sql, *params):
 
 
 @pytest.fixture
-def env(bare_db):  # noqa: F811
+def env(bare_db, monkeypatch):  # noqa: F811
+    # the bm25 channel's in-process index is an explicit opt-in, as in a bank that wants it
+    monkeypatch.setattr(Bm25Chunks, "backend", AutoBm25(fallback=InProcessBm25()))
     with psycopg.connect(bare_db, autocommit=True) as c:
         c.execute(HOST_DDL)
     run_migrations(bare_db, schema="prospecta_shared")
@@ -228,8 +230,9 @@ def test_http_round_trip_and_auth(env):
 # ---- allowed-audience filter -------------------------------------------------
 
 from prospecta.channels.base import Filters, QueryPlan, RecallState  # noqa: E402
-from prospecta.channels.bm25 import Bm25Chunks  # noqa: E402
+from prospecta.channels.bm25 import AutoBm25, Bm25Chunks, InProcessBm25  # noqa: E402
 from prospecta.channels.graph import GraphExpand  # noqa: E402
+from prospecta.channels.hybrid import HybridChunks  # noqa: E402
 from prospecta.channels.meta import MetadataScope  # noqa: E402
 from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks  # noqa: E402
 
@@ -247,7 +250,7 @@ def _channel_docs(mem, text, allow):
     plan = QueryPlan(text=text, filters=Filters(people=["ann"]))
     out = {}
     with mem._pool.connection() as conn:
-        for ch in (DenseChunks(), AnticipatedQuestions(), Bm25Chunks(), MetadataScope()):
+        for ch in (DenseChunks(), AnticipatedQuestions(), Bm25Chunks(), HybridChunks(), MetadataScope()):
             st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
             out[ch.name] = {c.document_id for c in ch.retrieve(plan, st)}
         st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
@@ -276,7 +279,7 @@ def test_allowed_audience_excludes_record_from_every_channel(env):
     d1, d2, d3 = _ids(url, "1"), _ids(url, "2"), _ids(url, "3")
     # Sanity: with no filter the other audiences are candidates, in every channel.
     base = _channel_docs(mem, GARDEN, None)
-    for name in ("dense_chunk", "question", "bm25", "meta", "graph"):
+    for name in ("dense_chunk", "question", "bm25", "hybrid_chunk", "meta", "graph"):
         assert base[name], name
     assert (d2 | d3) & set().union(*base.values())
     # Restricted to team-a: nothing else, in any channel.

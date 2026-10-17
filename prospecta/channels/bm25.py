@@ -17,7 +17,10 @@ Backend seam: `Bm25Backend` is the interface (`search(conn, bank_id, query, n)`
 `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text`
 ordered by `pdb.score(id)`) is `PgSearchBm25`; migration 0012 creates its index
 only where the extension is installable. `AutoBm25` (the default) uses it when
-that index exists and otherwise stays on `InProcessBm25`.
+that index exists and otherwise fails the channel: the in-process index is never
+built implicitly (on a 73,000-chunk bank a rebuild costs seconds after every write).
+Use the native `hybrid_chunk` channel instead, or opt in to the in-process index with
+`Bm25Chunks.backend = AutoBm25(fallback=InProcessBm25())`.
 """
 from __future__ import annotations
 
@@ -237,19 +240,25 @@ class PgSearchBm25:
 
 
 class AutoBm25:
-    """pg_search when its index exists, else the in-process bm25s backend."""
+    """pg_search when its index exists, else `fallback` (None: no fallback, an error)."""
 
-    def __init__(self, pg=None, fallback=None) -> None:
+    def __init__(self, pg=None, fallback: Bm25Backend | None = None) -> None:
         self.pg = pg or PgSearchBm25()
-        self.fallback = fallback or InProcessBm25()
+        self.fallback = fallback
 
     def choose(self, conn) -> Bm25Backend:
         try:
-            return self.pg if self.pg.available(conn) else self.fallback
+            if self.pg.available(conn):
+                return self.pg
         except Exception:
             if hasattr(conn, "rollback"):
                 conn.rollback()
-            return self.fallback
+        if self.fallback is None:
+            raise RuntimeError(
+                f"bm25: no pg_search index ({PG_SEARCH_INDEX}) and no in-process fallback; use "
+                "the hybrid_chunk channel, or set Bm25Chunks.backend = "
+                "AutoBm25(fallback=InProcessBm25())")
+        return self.fallback
 
     def search(self, conn, bank_id: str, query: str, n: int) -> list[tuple[str, float]]:
         return self.choose(conn).search(conn, bank_id, query, n)

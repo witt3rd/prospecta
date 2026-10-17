@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from prospecta.channels.bm25 import Bm25Chunks
 from prospecta.channels.graph import GraphExpand
+from prospecta.channels.hybrid import HybridChunks
 from prospecta.channels.keyword import KeywordChunks
 from prospecta.channels.meta import MetadataScope
 from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks
@@ -14,12 +15,15 @@ REGISTRY: dict[str, type] = {
     AnticipatedQuestions.name: AnticipatedQuestions,
     Bm25Chunks.name: Bm25Chunks,
     KeywordChunks.name: KeywordChunks,
+    HybridChunks.name: HybridChunks,
     GraphExpand.name: GraphExpand,
     MetadataScope.name: MetadataScope,
 }
 
 # The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
-# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
+# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config; so is
+# `hybrid_chunk`, the native Postgres Stage 1 (docs/postgres-hybrid.md) that replaces
+# dense_chunk + bm25 + keyword with one reserved-slot query.
 # `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
 # optional and off by default (docs/graph-links.md), and a bank with no link rows
 # returns nothing from it. Set its weight per bank when the bank builds links.

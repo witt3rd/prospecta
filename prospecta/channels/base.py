@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Literal, Protocol
 
 
@@ -62,6 +62,11 @@ class RecallState:
     bank_id: str
     embed: Callable[[list[str]], list[list[float]]] | None = None
     metadata_filter: dict | None = None
+    # per-call filters of the hybrid_chunk channel (applied inside every retriever):
+    # the note's date window (inclusive) and the anti-echo list of documents.source
+    date_from: date | str | None = None
+    date_to: date | str | None = None
+    excluded_sources: list[str] | None = None
     pool: list[Candidate] = field(default_factory=list)
     channel_lists: dict[str, list[Candidate]] = field(default_factory=dict)  # set by run_channels
     _embeddings: dict[str, list[float]] = field(default_factory=dict)
