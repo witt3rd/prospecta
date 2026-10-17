@@ -59,7 +59,7 @@ def test_success_orders_by_relevance_and_sends_the_documented_request():
     assert ids(items, out) == ["d1", "d2", "d0"]
     assert out.grades == {"d1": 0.9, "d2": 0.5, "d0": 0.2}
     (req, timeout), = reqs
-    assert req["model"] == "qwen/qwen3-reranker-8b" and timeout == 2.5
+    assert req["model"] == "qwen/qwen3-reranker-8b" and timeout == 4.0
     assert req["query"].startswith("Instruct: ") and req["query"].endswith("\nQuery: " + QUERY)
     assert req["documents"] == ["s0\na note=0.2", "s1\nb note=0.9", "s2\nc note=0.5"]
     assert req["top_n"] == 3
@@ -213,7 +213,7 @@ def test_build_reranker_resolves_model_and_settings(monkeypatch):
     t = fake_rerank(by_marker)
     rr = build_reranker(rr_cfg(), rerank_transport=t)
     assert (type(rr), rr.model, rr.top_n, rr.min_score, rr.timeout, rr.deduplicate) == (
-        CrossEncoderReranker, "env/model", 10, 0.15, 2.5, True)
+        CrossEncoderReranker, "env/model", 10, 0.15, 4.0, True)
     rr = build_reranker(rr_cfg(model="bank/model", top_n=4, min_score=0.3, timeout_s=1.0,
                                deduplicate_near_copies=False),
                         rerank_transport=t)

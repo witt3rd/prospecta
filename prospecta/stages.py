@@ -48,7 +48,7 @@ RERANK_INSTRUCTION = ("Instruct: Retrieve memory records that directly answer or
                       "Query: ")
 RERANK_TOP_N = 10
 RERANK_MIN_SCORE = 0.15        # absolute floor on the calibrated relevance score (0..1)
-RERANK_TIMEOUT_S = 2.5
+RERANK_TIMEOUT_S = 4.0
 NEAR_COPY_JACCARD = 0.88       # token Jaccard above which two notes are near-copies
 NEAR_COPY_COSINE = 0.90        # chunk-embedding cosine at or above which two notes say the same thing (query expansion's merge; measured, docs/postgres-hybrid.md)
 # qwen3-reranker-8b reads 41K tokens per request. A request carries at most 32K

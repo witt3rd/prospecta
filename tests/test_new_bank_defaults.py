@@ -362,3 +362,18 @@ def test_retain_extracts_no_entities_and_calls_no_model_on_any_bank(live, mem, f
         assert c.execute("SELECT count(*) FROM memory_links").fetchone()[0] == 0
     for bank, stored in LIVE_BANKS.items():
         assert config_of(fresh_db, bank) == stored               # and no bank was rewritten
+
+
+def test_rerank_timeout_default_is_4s_and_a_stored_value_wins():
+    from prospecta import stages
+    assert stages.RERANK_TIMEOUT_S == 4.0
+    # a fresh bank stores no timeout: it follows the code default
+    assert "timeout_s" not in bank_defaults.NEW_BANK_RECALL_CONFIG["rerank"]
+    t = lambda *a, **k: None
+    assert build_reranker(CROSS_ENCODER, rerank_transport=t).timeout == 4.0
+    assert build_reranker({"rerank": {"enabled": True, "stage": "cross_encoder", "timeout_s": 2.5}},
+                          rerank_transport=t).timeout == 2.5
+    import inspect
+    from prospecta import _expand_run
+    src = inspect.getsource(_expand_run)
+    assert 'rr.get("timeout_s", RERANK_TIMEOUT_S)' in src

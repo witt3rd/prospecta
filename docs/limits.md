@@ -40,7 +40,7 @@ removed graph, linker, reader / hop and BM25 code are in git history.
 | Cross-encoder request size | `stages.py` `RERANK_BATCH_TOKENS` | 32,000 tokens (est. 4 chars / token) | `qwen/qwen3-reranker-8b` reads 41K tokens; the rest is margin for tokenizer variance, the instruction and the query. A larger pool goes out as several requests (scores are calibrated, so they merge); a lone note is never cut | design |
 | Score floor | `rerank.min_score` | 0.15 | an absolute cut on the calibrated 0..1 score; the only thing that empties a result | tuning |
 | `top_n` | `rerank.top_n` | 10 | the notes kept after the floor and the near-copy collapse (Mode 1 keeps every note above the floor) | ours-config |
-| Timeout | `rerank.timeout_s` | 2.5 s | latency bound on an optional stage; failure keeps the Stage 1 order | ours-config |
+| Timeout | `rerank.timeout_s` | 4 s | latency bound on an optional stage; failure keeps the Stage 1 order | ours-config |
 | Near-copy collapse inside Stage 2 | `NEAR_COPY_JACCARD` | token Jaccard 0.88 | two notes this alike are one answer (`deduplicate_near_copies`) | tuning |
 | Evidence clip for the reranker | `stages.py` | **none** | the best chunk goes in full; a chunk is already bounded by chunking | removed |
 
