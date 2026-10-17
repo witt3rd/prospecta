@@ -31,6 +31,7 @@ from prospecta._test_helpers import (
     restore_module_patches,
 )
 from prospecta._types import RAGResult
+from tests._legacy_bank import create_legacy_bank
 
 CORPUS_DIR = Path(__file__).parent.parent / "fixtures" / "bilateral_corpus"
 TARGET_DOC = "kelly_birthday_arc.md"
@@ -109,7 +110,7 @@ def _run_cell(
         llm=llm,
         tracer=tracer,
     )
-    mem.create_bank(bank, embedding_dim=embed.dim)
+    create_legacy_bank(mem, bank, embedding_dim=embed.dim)
     # Index via retain(generate_questions=True) per file so the write-side
     # spine fires through _retain.generate_index_text (not _index.py's chunk
     # path, which is classical RAG regardless). _retain is the bilateral

@@ -68,9 +68,7 @@ If you plan to use OpenAI `text-embedding-3-small`, pass `--embedding-dim 1536`.
 
 ```bash
 # Retain a memory
-prospecta retain "Kelly was born March 4th 1990" \
-  --source kelly.md \
-  --index-text "When was Kelly born?"
+prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 # Recall it
 prospecta search "Kelly birthday"

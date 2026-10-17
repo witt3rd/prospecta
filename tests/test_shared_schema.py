@@ -13,6 +13,7 @@ from prospecta.db.schema import (
     SchemaError, check_schema_writable, scoped_url, validate_schema_name,
 )
 from prospecta.memory import Memory
+from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 from tests.conftest import _normalize_url
 
@@ -85,9 +86,9 @@ def test_two_schemas_side_by_side(bare_db):
     run_migrations(bare_db, schema="p_two")
     a = Memory(database_url=bare_db, bank_id="b", embed=stub_embed, schema="p_one")
     b = Memory(database_url=bare_db, bank_id="b", embed=stub_embed, schema="p_two")
-    a.create_bank("b", embedding_dim=EMBED_DIM)
+    create_legacy_bank(a, "b", embedding_dim=EMBED_DIM)
     a.retain("alpha only in one", index_text="what is alpha", source="s1")
-    b.create_bank("b", embedding_dim=EMBED_DIM)
+    create_legacy_bank(b, "b", embedding_dim=EMBED_DIM)
     assert a.bank_stats().documents == 1 and b.bank_stats().documents == 0
     assert [r.content for r in a.recall(["what is alpha"])] == ["what is alpha"]
     assert b.recall(["what is alpha"]) == []

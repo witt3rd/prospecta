@@ -13,9 +13,14 @@ from prospecta.db.exact_tsv import COLUMN as EXACT_TSV_COLUMN
 # Bank lifecycle
 # ---------------------------------------------------------------------------
 
+# The one place a bank's config is written at creation (prospecta/bank_defaults.py): a new
+# bank runs hybrid_chunk + cross_encoder with linking off. ON CONFLICT DO NOTHING: a bank
+# that exists is never touched. The columns' own DEFAULTs ('[]', '{}', '{}') stay legacy.
 INSERT_BANK = """
-    INSERT INTO banks (bank_id, embedding_dim, embedding_model_id, mission, retain_mission)
-    VALUES (%(bank_id)s, %(embedding_dim)s, %(embedding_model_id)s, %(mission)s, %(retain_mission)s)
+    INSERT INTO banks (bank_id, embedding_dim, embedding_model_id, mission, retain_mission,
+                       channel_config, recall_config, link_config)
+    VALUES (%(bank_id)s, %(embedding_dim)s, %(embedding_model_id)s, %(mission)s, %(retain_mission)s,
+            %(channel_config)s::jsonb, %(recall_config)s::jsonb, %(link_config)s::jsonb)
     ON CONFLICT (bank_id) DO NOTHING
     RETURNING bank_id, embedding_dim
 """

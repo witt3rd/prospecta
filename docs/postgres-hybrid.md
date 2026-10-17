@@ -9,6 +9,8 @@ Prospecta's hybrid search and RAG engine serves two primary operating modes on t
    - **Direct lookup & navigation:** Keyword, boolean (`OR`, `-exclude`), and `"exact phrase"` search with highlighted exact-match snippets (`ts_headline`).
    - **Interactive RAG / Question-Answering:** Natural-language questions answered with grounded synthesis, inline citations (`[source_id, date]`), and verbatim supporting quotes.
 
+**A bank gets this pipeline by being created fresh.** `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` (Stage 1), `recall_config = {"rerank": {"enabled": true, "stage": "cross_encoder"}}` (Stage 2) and `link_config = {"links": false, "entities": false}`; nothing else needs configuring. A bank created before that change keeps the config it stored: one that stored `channel_config = []` runs the legacy three-channel recall, not this design (Mode 1 and the Stage 1 filters return an error there).
+
 Across **all** modes, every retrieved or synthesized answer is **RAG with citations**, accompanied by **exact-match snippets** whenever lexical or phrase tokens match. We index **chunks and notes directly** (embeddings + stemmed/exact lexical vectors + metadata) and do not generate or carry model-written question tables at write time.
 
 ---

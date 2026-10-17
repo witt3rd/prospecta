@@ -40,7 +40,10 @@ This creates `<bank>-v2` (`embedding_dim=1536`,
 indexes) and, per source document, in one transaction: copies the document
 (recording `migrated_from_document_id` in `document_metadata`), inserts its
 `kind='chunk'` items (≤1,000 chars at paragraph boundaries, small overlap) and
-re-embeds each existing `kind='question'` item's text (no LLM call).
+re-embeds each existing `kind='question'` item's text (no LLM call). The target is a new bank,
+so it gets the new-bank defaults (`channel_config = [hybrid_chunk]`, a `cross_encoder` rerank,
+linking off): the questions it carries are stored but `hybrid_chunk` reads chunks only. The source
+bank is not modified, config included.
 
 **Resumable by document id.** A source document is done when the target holds a
 document carrying its id; re-running the same command skips those. Embedder

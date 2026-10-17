@@ -59,10 +59,15 @@ def test_health_dim_mismatch_is_down(monkeypatch, capsys):
 
 def test_stage_kwargs_need_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("PROSPECTA_LINKER", raising=False)
+    monkeypatch.delenv("PROSPECTA_JEV", raising=False)
     assert _common._stage_kwargs() == {}
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-not-real")
     kw = _common._stage_kwargs()
-    assert {"rerank_llm", "synth_llm", "rerank_transport", "jev", "linker"} <= set(kw)
+    assert {"rerank_llm", "synth_llm", "rerank_transport", "jev"} <= set(kw)
+    assert "linker" not in kw             # no bank to read: the linker is not built by default
+    monkeypatch.setenv("PROSPECTA_LINKER", "on")
+    assert "linker" in _common._stage_kwargs()
     monkeypatch.setenv("PROSPECTA_JEV", "off")
     monkeypatch.setenv("PROSPECTA_LINKER", "off")
     assert "jev" not in _common._stage_kwargs() and "linker" not in _common._stage_kwargs()

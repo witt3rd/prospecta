@@ -149,3 +149,19 @@ def test_cli(fresh_db, hs_url, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out[0]["tables"]["memory_units"]["imported"] == synth.BANKS["alpha"][0]
     assert main(["import", "hindsight", hs_url, "--all-banks"]) == 0
+
+
+def test_imported_units_are_chunk_items_the_hybrid_channel_finds(fresh_db, hs_url):
+    """`import hindsight` creates a missing bank with the new-bank defaults (hybrid_chunk), which
+    reads kind='chunk' items only: each imported fact is one whole chunk, not a question item."""
+    m = Memory(database_url=fresh_db, bank_id="alpha", embed=embed384, llm=None)
+    r = ih.import_bank(m, hs_url, "alpha", batch=100)
+    assert r.ok, r.failures
+    with m._pool.cursor() as cur:
+        cur.execute("SELECT kind, ordinal, char_start, char_end = length(content), content = original_chunk "
+                    "FROM memory_items WHERE bank_id = 'alpha'")
+        rows = cur.fetchall()
+    assert rows and {x[0] for x in rows} == {"chunk"}
+    assert {(x[1], x[2], x[3], x[4]) for x in rows} == {(0, 0, True, True)}
+    got = m.search("Generic fact about topic 0", limit=5)       # Stage 1: hybrid_chunk, no setup
+    assert got and all(h.source.startswith("hindsight:") and h.match_kind for h in got)

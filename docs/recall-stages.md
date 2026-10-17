@@ -2,7 +2,9 @@
 
 After the channels fuse (`banks.channel_config`), a bank can run more stages,
 all configured by `banks.recall_config` (migration 0009; `{}` = none, recall is
-unchanged). Set it with `Memory.set_recall_config(...)`.
+unchanged). Set it with `Memory.set_recall_config(...)`. A bank created fresh stores
+`{"rerank": {"enabled": true, "stage": "cross_encoder"}}` (Stage 2 with the defaults below);
+a bank that stored `{}` keeps running no stage.
 
 ```python
 mem.set_recall_config({

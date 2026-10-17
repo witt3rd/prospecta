@@ -15,8 +15,9 @@ the chunks inside the window, newest note first, as `date` candidates for Stage 
 not embedded.
 
 The slot counts and the HNSW ef_search are the channel's params (the plan's
-`stage1_postgres` section). Opt-in, like bm25 and keyword: add
-{"name": "hybrid_chunk", "weight": 1} to a bank's config.
+`stage1_postgres` section). It is the channel of every bank created fresh
+(prospecta.bank_defaults); a bank that stored another config opts in with
+{"name": "hybrid_chunk", "weight": 1}.
 """
 from __future__ import annotations
 
