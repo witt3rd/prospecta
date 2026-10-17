@@ -183,7 +183,7 @@ Not part of Stage 1, and **no longer used by any code**. Migration 0018 owed a G
 index, `memory_items_keyword_gin`, over the word rule of the `keyword` channel (the `simple`
 text-search configuration, stemming off, plus path pieces split at slashes): the same rule
 `exact_tsv` is generated from (`indexed_expression()` in `prospecta/db/exact_tsv.py`). The
-`keyword` channel and `prospecta keyword-index` were removed (`docs/legacy.md`), and
+`keyword` channel and `prospecta keyword-index` were removed, and
 `prospecta migrate` no longer builds the index.
 
 - **A database that has it keeps it.** It is not dropped by any code. It costs disk and write time

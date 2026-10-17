@@ -20,7 +20,7 @@ The design is `docs/postgres-hybrid.md`; it is the one normative description.
 
 ## Status
 
-**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]`, a `cross_encoder` rerank and no linker (`prospecta/bank_defaults.py`). Banks created earlier keep the config they stored; what was removed from the library and the legacy path that still serves them are in `docs/legacy.md`; neither is how new banks run. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
+**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` and a `cross_encoder` rerank (`prospecta/bank_defaults.py`). There is one design and one code path: a bank whose `channel_config` is empty runs `hybrid_chunk` with its defaults, and anything a stored config names that the library no longer has is ignored. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
 
 Substrate: Postgres with the `pgvector` extension, **0.8 or newer** (Stage 1 uses iterative index scans). Models: an embedder and an `llm` are injected callables; the Stage 2 reranker and the decision model are reached over HTTP with an `OPENROUTER_API_KEY`. Without that key retrieval still works: the Stage 1 order stands instead of a rerank and a chat message is not gated (the result says so).
 
@@ -74,7 +74,7 @@ prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 **One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality: a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
-With `OPENROUTER_API_KEY` set the CLI also builds the Stage 2 rerank transport, the decision model (Jev, System One) and the accounted LLM that writes the `ask` answer. `PROSPECTA_JEV=off` opts out of Jev. No linker is ever built: it was removed (`docs/legacy.md`).
+With `OPENROUTER_API_KEY` set the CLI also builds the Stage 2 rerank transport, the decision model (Jev, System One) and the accounted LLM that writes the `ask` answer. `PROSPECTA_JEV=off` opts out of Jev.
 
 **Note dates:** every retained note gets `documents.created_on`: its own date (frontmatter `created` / `created_on` / `date`, or the `metadata=` kwarg), else today's date in the zone named by `PROSPECTA_TIMEZONE` (an IANA name such as `America/Los_Angeles`; UTC when unset).
 
@@ -130,7 +130,7 @@ got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting    # what
 4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed (by wording, then by meaning: chunk-embedding cosine of 0.90 or more; the kept record lists what collapsed into it), best first, a task's own project first; sized by relevance, never by a count.
 5. **Never raises on a provider failure and stays inside the deadline** (7 s): a step that fails or runs late degrades and is named in `fallbacks`.
 
-For the library to run Mode 1 on a bank it needs the bank's `channel_config` to hold `hybrid_chunk` (every new bank does). A bank that stored `[]` is a legacy bank: `expand_and_recall` returns an `error` and the Stage 1 filters raise `ValueError` (`docs/legacy.md`).
+Mode 1 runs on every bank: it needs Stage 1's `hybrid_chunk`, which a bank with an empty `channel_config` runs with its defaults. (Only a config that disables it, `{"name": "hybrid_chunk", "enabled": false}`, makes `expand_and_recall` return an `error`.)
 
 Other entry points: `Memory.index_directory` (walks a corpus; frontmatter `created`, `person`, `source_kind` become the note's date, person and kind), `Memory.start_sweeper` (drift safety net), `Memory.set_channel_config` / `set_recall_config` (`docs/recall-stages.md`), `Memory.bank_stats`. The `SourceIndexer` indexes a host's records in place from database views (`docs/source-contract.md`).
 
@@ -140,7 +140,7 @@ Other entry points: `Memory.index_directory` (walks a corpus; frontmatter `creat
 prospecta init                           # docker compose up + migrate + create the default bank
 prospecta migrate                        # apply pending migrations
 prospecta create-bank --id alice --embedding-dim 1536
-prospecta migrate-bank --source-bank alice   # backfill alice-v2 at a new dimension (docs/embedding-migration.md)
+prospecta migrate-bank --source-bank alice   # re-embed alice into alice-v2: another embedder or dimension (docs/embedding-migration.md)
 prospecta retain "content..." --source X --tags a,b      # or "@path/to/file"
 prospecta index ./corpus                 # walk a directory; chunk + embed
 prospecta search "query" [--limit N] [--depth standard|deep] [--json]
@@ -153,7 +153,7 @@ prospecta config                         # show loaded config (passwords redacte
 prospecta backup FILE / restore FILE     # docs/backup-restore.md
 ```
 
-Legacy-bank commands (`retain --index-text`, `search --mode semantic|lexical`) are in `docs/legacy.md`, which also says what was removed (`link-pass`, `drop-links`, `keyword-index`). The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else `PROSPECTA_BANK`, default `prospecta`).
+The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else `PROSPECTA_BANK`, default `prospecta`).
 
 ## The HTTP service
 
@@ -186,7 +186,6 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/deployment.md`](docs/deployment.md) | Docker, local Postgres, Neon, Azure; pgvector 0.8 |
 | [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |
 | [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
-| [`docs/legacy.md`](docs/legacy.md) | what was removed (and how to get it back), and the legacy read path that existing banks still use |
 | [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 
@@ -196,9 +195,9 @@ Honest about what is not there:
 
 - **Sync only.** All `retain` / `search` / `ask` calls block; Mode 1 runs its searches on threads inside one call. An async surface is post-v0.1.
 - **English-only stemming.** The stemmed retriever uses `to_tsvector('english', ...)`; the exact retriever (unstemmed `simple`) and the semantic retriever are language-neutral.
-- **pgvector 0.8 or newer for `hybrid_chunk`.** A bank on an older pgvector can only run the legacy path.
+- **pgvector 0.8 or newer.** Stage 1 uses iterative index scans; there is no fallback for an older pgvector.
 - **Embedding-dim change requires a new bank** (`prospecta migrate-bank`).
-- **HNSW build cost on large banks.** Each bank has three partial HNSW indexes; the first bulk index can be slow.
+- **HNSW build cost on large banks.** Each bank has one partial HNSW index (over its chunks); the first bulk index can be slow.
 - **A very long plain question over common words is slow** in the stemmed retriever (seconds at 20 common words on a 73,000-chunk bank): measured in `docs/exact-tsv.md`; Mode 1's per-search `query` is short.
 - **Stage 2 and the gates need a key.** With no rerank transport the Stage 1 order stands; with no decision transport there is no gate. Both are recorded in the result.
 - **Migration 0020 rewrites `memory_items`** under an `ACCESS EXCLUSIVE` lock: read `docs/exact-tsv.md` before upgrading a database that holds a bank.

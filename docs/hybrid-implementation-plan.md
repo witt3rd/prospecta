@@ -18,7 +18,9 @@ We already have ~80% of the pieces in place. The goal is to **simplify, unify, a
 | 4c | Mode 1 recall fixes: `terms` are only names and identifiers; near-copies collapse by meaning too | **done, merged** | #87 |
 | 5 | Offline verification on `augur-v2` / `forge-v2` | **verified read-only**; no gateway was switched by this repository's changes. The live migration `0020` and any gateway restart happen only with the captain's word (the `docs/exact-tsv.md` runbook) | none (no repository change) |
 | 6 | `rung-memory-prospecta` and Spire follow the contract | **pending** (other repositories) | |
-| 7 | Documentation overhaul in this repository | **in progress** | #88 |
+| 7 | Documentation overhaul in this repository | **done, merged** | #88 |
+| 8 | Removal of the retired recall code (linker, graph, bm25 / keyword / question channels, Sonnet / Jev rerank, gate, reader) | **done, merged** | #89 |
+| 9 | Removal of all remaining legacy: the three-channel read path (an empty `channel_config` is the `hybrid_chunk` default), `recall_synth`, `formulate_queries`, question items and `index_text` / `child_chunks`, the `dense_chunk` and `meta` channels, the `mode` of a search, the `link_config` stamp; the legacy page deleted (git history has it) | **this change** | |
 
 This file stays until slices 5 and 6 finish; then it is deleted or reduced to a short record of what was done.
 
@@ -30,10 +32,10 @@ This file stays until slices 5 and 6 finish; then it is deleted or reduced to a 
 
 | Area | State |
 | --- | --- |
-| **Write path** | `retain()` writes `kind='chunk'` items (`content = original_chunk = the chunk`, at most 1000 characters, 100 of overlap) with **no model call**, and always stamps `documents.created_on`. Question items exist only when the caller passes `index_text=` (instead of the chunks) or `generate_questions=True`. |
-| **Schema and indexes** | `body_tsv` (stemmed) and the stored `exact_tsv` (migration 0020, unstemmed, rewrote `memory_items`) with GIN indexes, per-bank partial HNSW indexes, `hnsw.iterative_scan = relaxed_order` in Stage 1. `docs/schema.md`. |
-| **Stage 1** | The `hybrid_chunk` channel: semantic top 25, stemmed top 20, exact / phrase top 20, fused into 50 in one query with `exact_snippet`; filters (`date_from` / `date_to`, `excluded_sources`, metadata / audience) pushed into every retriever; plain questions read as an OR of their stemmed words; date-only questions list the window. **A bank created fresh has it** (#86); older banks keep the config they stored, and the legacy three-channel recall (`channel_config = []`, `docs/legacy.md`) still serves them. |
-| **Stage 2** | `cross_encoder` (`qwen/qwen3-reranker-8b`, floor 0.15, `top_n` 10, 2.5 s, near-copy collapse, fallback to the Stage 1 order), configurable by call, bank and environment. A bank created fresh has it. The Sonnet and Jev rerank stages were removed from `stages.py` (`docs/legacy.md`). |
+| **Write path** | `retain()` writes `kind='chunk'` items (`content = original_chunk = the chunk`, at most 1000 characters, 100 of overlap) with **no model call**, and always stamps `documents.created_on`. It writes nothing else: there are no question items. |
+| **Schema and indexes** | `body_tsv` (stemmed) and the stored `exact_tsv` (migration 0020, unstemmed, rewrote `memory_items`) with GIN indexes, one partial HNSW index per bank over its chunks, `hnsw.iterative_scan = relaxed_order` in Stage 1. `docs/schema.md`. |
+| **Stage 1** | The `hybrid_chunk` channel: semantic top 25, stemmed top 20, exact / phrase top 20, fused into 50 in one query with `exact_snippet`; filters (`date_from` / `date_to`, `excluded_sources`, metadata / audience) pushed into every retriever; plain questions read as an OR of their stemmed words; date-only questions list the window. **Every bank runs it**: a bank created fresh stores it (#86), a bank with an empty `channel_config` runs it with its defaults. |
+| **Stage 2** | `cross_encoder` (`qwen/qwen3-reranker-8b`, floor 0.15, `top_n` 10, 2.5 s, near-copy collapse, fallback to the Stage 1 order), configurable by call, bank and environment. A bank created fresh has it. The Sonnet and Jev rerank stages were removed from `stages.py` (#89). |
 | **Stage 0 and Stage 3** | The decision model (`typesafe/jev-1.14`, System One) answers the `needs_memory` noul (Stage 0, chat only) and the `evidence_sufficient` score question (Stage 3, off by default). The gate decides only `needs_memory`; the writer proposes the period (the plan's `time_scope` decision was never built). |
 | **Mode 1** | `Memory.expand_and_recall` / `recall_for_task`: query expansion, N searches in parallel, one cited block, a 7 s deadline. |
 | **Citations** | `RecalledMemory` carries `source`, `created_on`, `kind`, `match_kind`, `relevance_score`, `exact_snippet`; `format_cited_rag_block`; `/lookup` returns them. |

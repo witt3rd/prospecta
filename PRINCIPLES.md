@@ -18,7 +18,7 @@ The library takes an `embed` callable and an `llm` callable from the caller; the
 
 ## P4 — Caller wins on every override
 
-Per-call arguments beat the bank's `recall_config`, which beats the environment, which beats the default: the reranker, decision and query-writer models, `deadline`, `max_searches`, `date_from` / `date_to`, `excluded_sources`, `depth`. `expand_and_recall(decision=...)` replaces the gate with the caller's own; `retain(index_text=...)` supplies the question items instead of the chunks. The library fills in what is absent and never overrides what the caller supplied.
+Per-call arguments beat the bank's `recall_config`, which beats the environment, which beats the default: the reranker, decision and query-writer models, `deadline`, `max_searches`, `date_from` / `date_to`, `excluded_sources`, `depth`. `expand_and_recall(decision=...)` replaces the gate with the caller's own. The library fills in what is absent and never overrides what the caller supplied.
 
 **Prevents:** the library out-thinking callers who have more context (a venue that already decided a message needs no memory; a caller that knows the period it means).
 
@@ -66,7 +66,7 @@ Provider code lives in `prospecta.defaults` (`pip install 'prospecta[defaults]'`
 
 ## P19 — Observability is durable, not ephemeral
 
-Every event a user might want to inspect after the fact is persisted in Postgres, not flushed to stderr: `retain_events`, `recall_events` with `recall_event_candidates`, `llm_calls` (every model call with its purpose, model, tokens, cost, and the verbatim prompt and response), `formulate_events` (the legacy question path), `sweep_passes` and `sweeper_state`. The tables are append-only except `sweeper_state`, and they carry the payload, not summaries: the notes that surfaced with each channel's rank and score, the stage records (the rerank's cuts and fallback reason), the accounting.
+Every event a user might want to inspect after the fact is persisted in Postgres, not flushed to stderr: `retain_events`, `recall_events` with `recall_event_candidates`, `llm_calls` (every model call with its purpose, model, tokens, cost, and the verbatim prompt and response), `sweep_passes` and `sweeper_state`. The tables are append-only except `sweeper_state`, and they carry the payload, not summaries: the notes that surfaced with each channel's rank and score, the stage records (the rerank's cuts and fallback reason), the accounting.
 
 The tracer fan-out (`Tracer` is an injected Protocol, `PostgresSink` the default; callers can supply `NoOpTracer`, `RecordingTracer`, `CompositeTracer` or their own) means persistence is one consumer of the event stream, not the only one, but the *default* must be durable. When a feature produces a load-bearing event, the default action is to **add a column** to the event table (or a new table), not to log a line. Logs are for transient breadcrumbs.
 

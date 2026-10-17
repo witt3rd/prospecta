@@ -58,8 +58,7 @@ Until then lookups use the old key (`/coverage` lists the record as `stale`).
 
 The service refuses to start if a view is missing, lacks a column or is not readable.
 
-What Prospecta keeps: its own derived items only (chunks and their embeddings;
-anticipated questions only when a library caller asks for them), each stamped with
+What Prospecta keeps: its own derived items only (chunks and their embeddings), each stamped with
 `kind`, `record_id`, `revision` (plus `person`, `project`, `audience_key`,
 `created_date` for filters), and one `source_refs` row per record
 (kind, record id, revision, filter columns; **no text**). The `documents` row
@@ -73,7 +72,7 @@ rebuilt from the view and removed with the record.
 strings) are optional. When given, a record whose audience key (project) is not
 in the list is never a candidate: it cannot appear in a result or a rerank
 input. The condition is part of each retriever's query in Stage 1, applied
-before its slots are cut (the legacy channels apply it too). An empty list
+before its slots are cut. An empty list
 allows nothing. A record with an empty or missing audience key
 (project) is visible only if the list contains `""`. When a list is absent
 there is no restriction (unchanged behavior). In the library the same filter is
@@ -137,10 +136,9 @@ block is sized by relevance, not by count, so the task form takes **no `limit`**
 default response is otherwise unchanged. With it, each question's object gains `channels_run` (channels
 that ran and did not fail) and `channels_failed` (`[{"channel","reason"}]`, a reason in
 words, starting `failed:` for an error or `skipped:` for a channel disabled in the bank's
-config), and each hit gains `channels`: `[{"channel","rank","score","weight"}]` for every
-channel that returned it (rank within the channel, the channel's raw score, the fusion
-weight applied). A legacy bank (no channel config) uses the fixed legacy fusion: `channels_run`
-names its three channels and a hit's `rank` and `weight` are null.
+config or that the library no longer has), and each hit gains `channels`:
+`[{"channel","rank","score","weight"}]` for every channel that returned it (rank within the
+channel, the channel's raw score, the fusion weight applied). `hybrid_chunk` is the only channel.
 
 ### Reconcile
 

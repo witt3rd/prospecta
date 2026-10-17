@@ -6,11 +6,10 @@ Prospecta records every load-bearing event in Postgres event tables. The record 
 
 | Table | Fires on | Carries |
 |---|---|---|
-| `retain_events` | every `retain()` call | `document_id`, `items_count` (the chunks written), `index_text_caller_supplied`, `duration_ms`, `error`. `index_text_generated` and `raw_llm_response` are filled only in rows written before the model-written questions were removed (`docs/legacy.md`) |
-| `recall_events` | every `recall()` (so every `ask()`), every `expand_and_recall` / `recall_for_task` that records (a task by default, a chat message not), `recall_synth` | `queries` (the question, or the searches the writer wrote), `mode`, `n_results`, `results` (JSONB array of per-hit `{source, document_id, rank, scores, content_preview}`), `duration_ms`, `depth`, and the pipeline trace: `plan`, `channels`, `fusion`, `rerank` (`hops` is empty in a recall that ran after the reader was removed), plus `cost_usd`, `tokens_in`, `tokens_out`, `n_llm_calls`; `synthesis` and `citations` for the legacy synthesis |
+| `retain_events` | every `retain()` call | `document_id`, `items_count` (the chunks written), `duration_ms`, `error`. `index_text_caller_supplied` is written `false` (a NOT NULL column kept for the rows written when a note could carry question strings); `index_text_generated` and `raw_llm_response` stay NULL: no model is called at write time |
+| `recall_events` | every `recall()` (so every `ask()`), every `expand_and_recall` / `recall_for_task` that records (a task by default, a chat message not) | `queries` (the question, or the searches the writer wrote), `mode` (always `hybrid`: a NOT NULL column kept from the time a search had modes), `n_results`, `results` (JSONB array of per-hit `{source, document_id, rank, scores, content_preview}`; `scores` are `hybrid_chunk`, `rrf` and, when Stage 2 ran, `rerank`), `duration_ms`, `depth`, and the pipeline trace: `plan`, `channels`, `fusion`, `rerank`, plus `cost_usd`, `tokens_in`, `tokens_out`, `n_llm_calls`. The columns `hops`, `synthesis` and `citations` hold rows of calls that were removed and stay NULL |
 | `recall_event_candidates` | one row per candidate per channel of a recall | `recall_event_id`, `query_index`, `document_id`, `item_id`, `channel` (`hybrid_chunk`), `rank`, `score` |
 | `llm_calls` | every model call: the query writer, the Stage 0 gate, every Stage 2 rerank request, Stage 3, the `ask` answer | `prompt_name` (the **purpose**, below), `model`, `tokens_in`, `tokens_out`, `cost_usd`, `messages_count`, `json_mode`, `duration_ms`, `error`, **`prompt_text`** and **`response_text`** (verbatim; opt-out) |
-| `formulate_events` | every `formulate_queries()` call (the legacy question-space path) | `message`, `n_queries_out`, `json_mode_used`, `parse_fallback`, `error_kind` (`malformed_json` / `schema_mismatch` / NULL), `raw_response`, `duration_ms` |
 | `sweep_passes` | every background sweep cycle | `corpus_path`, `started_at` / `ended_at`, `files_seen` / `files_indexed` / `files_pruned` / `errors_count`, `duration_ms`, `pass_metadata` |
 | `sweeper_state` | upserted on each sweep | `(bank_id, corpus_path)` → the last pass's start, end, duration, files indexed, errors |
 
@@ -25,8 +24,7 @@ Prospecta records every load-bearing event in Postgres event tables. The record 
 | `cross_encoder_rerank` | one Stage 2 rerank request (`model` as the provider reports it, `tokens_in` = `usage.total_tokens`, `cost_usd` = `usage.cost`) | yes |
 | `stage3_sufficiency` | the Stage 3 `evidence_sufficient` question | yes |
 | `ask_cited` | the `ask` answer | yes |
-| `index_text` | model-written questions at write time (removed; rows written before it stay) | `docs/legacy.md` |
-| `formulate_queries`, `synthesize_grounded`, `rerank_listwise`, `jev_score`, `reader_sufficiency`, `extract_filters`, `extract_entities`, `jev_relations`, `mapreduce_map`, `mapreduce_reduce` | the retired question-space, Sonnet / Jev, reader, entity, linker and map-reduce calls: no code writes them any more, rows already written stay | `docs/legacy.md` |
+| `index_text`, `formulate_queries`, `synthesize`, `synthesize_grounded`, `rerank_listwise`, `jev_score`, `reader_sufficiency`, `extract_filters`, `extract_entities`, `jev_relations`, `mapreduce_map`, `mapreduce_reduce` | model calls that were removed (write-time questions, the question-space expansion and synthesis, the Sonnet / Jev rerank, the reader, entity extraction, the linker, map-reduce): no code writes them any more, rows already written stay | no |
 
 ## Reading a recall event end to end
 
@@ -36,7 +34,7 @@ An agent calls `m.recall_for_task(title=..., ask=..., done=..., project=...)` (o
 2. **One `recall_events` row**: `queries` is the list of the searches' `query` text, `n_results` the merged items, `duration_ms` the whole call, `results` one entry per item of the block. The trace columns hold, per search (`per_query`), the plan, `channels` (the `hybrid_chunk` count and latency), `fusion`, and `rerank`: `stage`, `model`, `n_candidates`, `n_below_min_score`, `collapsed`, `n_over_top_n`, `latency_ms`, `fallback_reason` (non-NULL when Stage 1's order stood), and the totals.
 3. **`recall_event_candidates`**: every Stage 1 candidate of every search, with its rank and fused score.
 
-On the legacy question-space path a recall also has a preceding `formulate_events` row (the model's expansion of the message into sub-questions, with `parse_fallback` and `error_kind`) and, for `recall_synth`, one more `llm_calls` row for the synthesis (`docs/legacy.md`); the TUI's recall thread joins them (`tui/README.md`).
+(`formulate_events` holds the rows of a call that was removed; nothing writes it. An `ask` adds one more `llm_calls` row, `ask_cited`, for the answer.)
 
 What the caller sees of the same run is in the `ExpandedRecall`: `searches`, `runs` (what each found), `fallbacks` (every degraded step), `timings_ms` and `accounting`.
 
@@ -52,7 +50,6 @@ SELECT
     re.document_id,
     d.source,
     re.items_count,
-    re.index_text_caller_supplied                AS caller_supplied,
     re.duration_ms,
     re.error
 FROM retain_events re
@@ -167,7 +164,7 @@ The CLI: `prospecta stats`. Or in SQL:
 SELECT
     b.bank_id,
     b.embedding_dim,
-    b.channel_config = '[]'::jsonb                              AS legacy_bank,
+    b.channel_config,
     (SELECT COUNT(*) FROM documents     WHERE bank_id = b.bank_id) AS documents,
     (SELECT COUNT(*) FROM memory_items  WHERE bank_id = b.bank_id) AS items,
     (SELECT COUNT(*) FROM retain_events WHERE bank_id = b.bank_id) AS retains,
@@ -180,7 +177,7 @@ ORDER BY b.bank_id;
 
 ### Default behavior
 
-When `Memory(database_url=..., bank_id=..., llm=..., embed=...)` is constructed without an explicit `tracer=` kwarg, the default tracer is `PostgresSink(pool=<memory's pool>, bank_id=<memory's bank>)`. All six event types persist automatically — no opt-in needed.
+When `Memory(database_url=..., bank_id=..., llm=..., embed=...)` is constructed without an explicit `tracer=` kwarg, the default tracer is `PostgresSink(pool=<memory's pool>, bank_id=<memory's bank>)`. All five event types persist automatically — no opt-in needed.
 
 ### Disable verbose LLM payloads
 
@@ -204,7 +201,7 @@ m = Memory(
 )
 ```
 
-When `persist_llm_text=False`, the `prompt_text` and `response_text` columns are written as NULL even though the tracer payload carries them. The other event tables (`retain_events`, `recall_events`, `formulate_events`) are unaffected — the opt-out is scoped specifically to `llm_calls`.
+When `persist_llm_text=False`, the `prompt_text` and `response_text` columns are written as NULL even though the tracer payload carries them. The other event tables (`retain_events`, `recall_events`) are unaffected — the opt-out is scoped specifically to `llm_calls`.
 
 ### Custom tracers
 
@@ -240,7 +237,7 @@ def my_tracer(event: str, payload: dict) -> None:
 m = Memory(..., tracer=my_tracer)
 ```
 
-The six event names are stable: `retain`, `recall`, `formulate_queries`, `sweep_pass`, `index_single_file`, `llm_call`. The payload dicts for each are documented in `prospecta/observability/postgres_sink.py` — the `_handle_*` methods are the canonical reference for which payload keys land in which columns.
+The five event names are stable: `retain`, `recall`, `sweep_pass`, `index_single_file`, `llm_call`. The payload dicts for each are documented in `prospecta/observability/postgres_sink.py` — the `_handle_*` methods are the canonical reference for which payload keys land in which columns.
 
 ## What is NOT persisted
 
@@ -248,7 +245,7 @@ Honest about the boundaries:
 
 - **Cosine distance / HNSW probe details.** Individual vector arithmetic isn't logged; you see the surfaced result and each candidate's rank and fused score, not the scoring inside the HNSW probe. To inspect at that level, query `memory_items` directly.
 - **Chunker decisions.** Markdown chunking happens before retain; the chunked text lands as `memory_items.original_chunk`, but the chunker's reasoning (split here vs. there) isn't recorded.
-- **Items that did NOT surface.** Only the returned notes land in `recall_events.results`. A bank with a non-empty `channel_config` also persists every channel candidate in `recall_event_candidates` (migration 0007); a legacy bank (`channel_config = []`) does not.
+- **Items that did NOT surface.** Only the returned notes land in `recall_events.results`. Every channel candidate of a recall is also persisted, in `recall_event_candidates` (migration 0007).
 - **Plain `Memory.search`.** It records nothing; `recall` and the Mode 1 calls do.
 
 ## Performance impact
