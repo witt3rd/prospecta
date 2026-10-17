@@ -5,7 +5,7 @@ Acceptance criteria:
   - LLM-generated index_text becomes memory_items rows (P1)
   - prompt_override is rendered with content interpolated (P4)
   - retain_events row appended with correct columns
-  - replace-on-source-match per schema.md §6
+  - replace-on-source-match (docs/schema.md, "Re-retain")
   - DocumentSourceConflictError on hash collision with different source
 """
 from __future__ import annotations

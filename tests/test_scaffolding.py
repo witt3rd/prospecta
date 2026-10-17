@@ -1,6 +1,6 @@
 """Scaffolding acceptance tests for prospecta v0.1.
 
-These tests verify the bootstrap layout per plan-v2.md §3.1 + §3.2.
+These tests verify the bootstrap layout: package, modules, packaging metadata.
 """
 
 
@@ -38,13 +38,21 @@ def test_gitignore_contents():
         assert pattern in text
 
 
-def test_readme_mentions_spine():
+def test_readme_describes_the_architecture():
+    """The front door names the design that runs: the write path, the stages and the contract."""
     from pathlib import Path
-    text = Path("README.md").read_text().lower()
-    assert any(
-        phrase in text
-        for phrase in ["bilateral", "both sides", "question-form", "llm-mediated"]
-    )
+    text = Path("README.md").read_text()
+    for phrase in ["hybrid_chunk", "cross-encoder", "cited", "expand_and_recall",
+                   "docs/postgres-hybrid.md", "docs/legacy.md"]:
+        assert phrase in text, f"README.md no longer mentions {phrase!r}"
+
+
+def test_package_metadata_matches_the_readme():
+    import tomllib
+    from pathlib import Path
+    project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+    assert project["readme"] == "README.md" and Path(project["readme"]).is_file()
+    assert "bilateral" not in project["description"].lower()
 
 
 def test_env_example_has_database_url():

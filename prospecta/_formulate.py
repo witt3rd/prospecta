@@ -2,7 +2,7 @@
 
 LLM-mediated multi-query expansion (JSON-mode). Library NEVER raises on
 malformed JSON from the LLM; falls back to a single-query echo of the
-input message. Parse-fallback is canonical observability (schema.md §13).
+input message. Parse-fallback is recorded in formulate_events (docs/observability.md).
 
 P-principles enforced here:
   P1 — read-half of bilateral spine: message → LLM → list[Query].

@@ -82,7 +82,7 @@ def test_retain_then_search_lexical_and_semantic(memory_with_bank_and_mock_llm):
 
 
 def test_retain_replace_on_same_content_and_source_keeps_one_document(memory_with_bank_and_mock_llm):
-    # Replace semantics (schema.md §6) key on content_hash + source.
+    # Replace semantics (docs/schema.md, "Re-retain") key on content_hash + source.
     mem = memory_with_bank_and_mock_llm
     first = mem.retain("body about basalt", index_text="basalt", source="s1")
     second = mem.retain("body about basalt", index_text="basalt", source="s1")

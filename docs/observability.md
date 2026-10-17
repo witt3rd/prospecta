@@ -1,29 +1,50 @@
 # Observability
 
-Prospecta records every load-bearing event of the bilateral spine in Postgres event tables. The persisted record is durable — you query it later with `pgcli` or any Postgres client — not ephemeral stderr that scrolls past. This is the audit trail and the debugging surface in one.
+Prospecta records every load-bearing event in Postgres event tables. The record is durable: you query it later with `psql`, `pgcli` or any Postgres client, not ephemeral stderr that scrolls past. It is the audit trail and the debugging surface in one. `docs/schema.md` has the columns; this page says what each event is and how to read it.
 
 ## What gets recorded
 
-Six event types, one table each (plus the `documents` + `memory_items` tables, which are the canonical content store):
-
 | Table | Fires on | Carries |
 |---|---|---|
-| `retain_events` | every `retain()` call | `document_id`, `items_count`, `index_text_caller_supplied`, **`index_text_generated`** (verbatim LLM-authored questions when not caller-supplied), `duration_ms`, `raw_llm_response`, `error` |
-| `recall_events` | every `recall()` AND `recall_synth()` call | `queries` (formulated list), `mode`, `n_results`, **`results`** (JSONB array of per-chunk `{source, document_id, rank, scores, content_preview}`), **`synthesis`** (TEXT — populated by `recall_synth`, NULL for plain `recall`), `duration_ms`, `trace` |
-| `formulate_events` | every `formulate_queries()` call | `message` (verbatim user input), `n_queries_out`, `json_mode_used`, `parse_fallback`, `raw_response` (verbatim LLM JSON), **`error_kind`** (`'malformed_json'` / `'schema_mismatch'` / NULL), `duration_ms` |
-| `llm_calls` | every LLM call (3 sites: `index_text` generation, formulate, synthesize) | `prompt_name` (`'index_text'` / `'formulate'` / `'synthesize'`), `messages_count`, `json_mode`, `duration_ms`, **`prompt_text`** (verbatim rendered prompt), **`response_text`** (verbatim LLM response), `error` |
+| `retain_events` | every `retain()` call | `document_id`, `items_count` (the chunks written), `index_text_caller_supplied`, `duration_ms`, `error`. `index_text_generated` and `raw_llm_response` are filled only on the opt-in path where a model writes questions (`generate_questions=True`) |
+| `recall_events` | every `recall()` (so every `ask()`), every `expand_and_recall` / `recall_for_task` that records (a task by default, a chat message not), `recall_synth` | `queries` (the question, or the searches the writer wrote), `mode`, `n_results`, `results` (JSONB array of per-hit `{source, document_id, rank, scores, content_preview}`), `duration_ms`, `depth`, and the pipeline trace: `plan`, `channels`, `fusion`, `rerank`, `hops`, plus `cost_usd`, `tokens_in`, `tokens_out`, `n_llm_calls`; `synthesis` and `citations` for the legacy synthesis |
+| `recall_event_candidates` | one row per candidate per channel of a recall | `recall_event_id`, `query_index`, `document_id`, `item_id`, `channel` (`hybrid_chunk`), `rank`, `score` |
+| `llm_calls` | every model call: the query writer, the Stage 0 gate, every Stage 2 rerank request, Stage 3, the `ask` answer | `prompt_name` (the **purpose**, below), `model`, `tokens_in`, `tokens_out`, `cost_usd`, `messages_count`, `json_mode`, `duration_ms`, `error`, **`prompt_text`** and **`response_text`** (verbatim; opt-out) |
+| `formulate_events` | every `formulate_queries()` call (the legacy question-space path) | `message`, `n_queries_out`, `json_mode_used`, `parse_fallback`, `error_kind` (`malformed_json` / `schema_mismatch` / NULL), `raw_response`, `duration_ms` |
 | `sweep_passes` | every background sweep cycle | `corpus_path`, `started_at` / `ended_at`, `files_seen` / `files_indexed` / `files_pruned` / `errors_count`, `duration_ms`, `pass_metadata` |
-| `sweeper_state` | upserted on each sweep | `(bank_id, corpus_path)` → `last_pass_started_at`, `last_pass_ended_at`, `last_pass_duration_ms`, `last_pass_files_indexed`, `last_pass_errors` |
+| `sweeper_state` | upserted on each sweep | `(bank_id, corpus_path)` → the last pass's start, end, duration, files indexed, errors |
 
-(Bolded fields are the columns added by migration 0003 — full durable trace beyond bare timing and counts.)
+`Memory.search` on its own writes no event; `recall`, `ask`, `expand_and_recall` and `recall_for_task` do (`record=`; a chat message is not recorded by default, a task is). With a shadow bank (`docs/embedding-migration.md`) a recall writes the old / new pair instead of the single event.
 
-## The pgcli cheat sheet
+### `llm_calls.prompt_name` (the purposes)
 
-Connect to your prospecta DB and run these. All assume `bank_id='default'` — adjust the `WHERE` if you're using multiple banks.
+| purpose | what | current design |
+|---|---|---|
+| `expand_gate` | the Stage 0 `needs_memory` decision | yes |
+| `expand_searches` | the query writer | yes |
+| `cross_encoder_rerank` | one Stage 2 rerank request (`model` as the provider reports it, `tokens_in` = `usage.total_tokens`, `cost_usd` = `usage.cost`) | yes |
+| `stage3_sufficiency` | the Stage 3 `evidence_sufficient` question | yes |
+| `ask_cited` | the `ask` answer | yes |
+| `index_text` | model-written questions at write time (opt-in) | opt-in |
+| `formulate_queries`, `synthesize_grounded`, `rerank_listwise`, `jev_score`, `reader_sufficiency`, `extract_filters`, `extract_entities`, `jev_relations`, `mapreduce_map`, `mapreduce_reduce` | the retired question-space, Sonnet / Jev, reader, entity, linker and map-reduce calls | `docs/legacy.md` |
+
+## Reading a recall event end to end
+
+An agent calls `m.recall_for_task(title=..., ask=..., done=..., project=...)` (or `expand_and_recall` with `record=True`):
+
+1. **`llm_calls`**: one `expand_searches` row (the writer; its `prompt_text` is the rendered prompt, `response_text` the searches), one `expand_gate` row for a chat message, then one `cross_encoder_rerank` row per rerank request (a search's pool goes out as several parallel requests when it is large). Each has `model`, tokens, cost and any `error`.
+2. **One `recall_events` row**: `queries` is the list of the searches' `query` text, `n_results` the merged items, `duration_ms` the whole call, `results` one entry per item of the block. The trace columns hold, per search (`per_query`), the plan, `channels` (the `hybrid_chunk` count and latency), `fusion`, and `rerank`: `stage`, `model`, `n_candidates`, `n_below_min_score`, `collapsed`, `n_over_top_n`, `latency_ms`, `fallback_reason` (non-NULL when Stage 1's order stood), and the totals.
+3. **`recall_event_candidates`**: every Stage 1 candidate of every search, with its rank and fused score.
+
+On the legacy question-space path a recall also has a preceding `formulate_events` row (the model's expansion of the message into sub-questions, with `parse_fallback` and `error_kind`) and, for `recall_synth`, one more `llm_calls` row for the synthesis (`docs/legacy.md`); the TUI's recall thread joins them (`tui/README.md`).
+
+What the caller sees of the same run is in the `ExpandedRecall`: `searches`, `runs` (what each found), `fallbacks` (every degraded step), `timings_ms` and `accounting`.
+
+## The psql cheat sheet
+
+Connect to your prospecta DB and run these. All assume `bank_id='default'`; adjust the `WHERE` for other banks.
 
 ### Last 5 retains: what did the agent commit to memory?
-
-Per-call summary of write activity: how many items each retain produced, whether the caller supplied `index_text` (P4 caller-wins) or the LLM authored it, the LLM-authored questions verbatim when applicable, and timing.
 
 ```sql
 SELECT
@@ -32,7 +53,6 @@ SELECT
     d.source,
     re.items_count,
     re.index_text_caller_supplied                AS caller_supplied,
-    re.index_text_generated                      AS llm_questions,
     re.duration_ms,
     re.error
 FROM retain_events re
@@ -42,45 +62,30 @@ ORDER BY re.created_at DESC
 LIMIT 5;
 ```
 
-### Last 5 recalls: query → expansion → synthesis end-to-end
-
-Each recall pairs with one preceding `formulate_events` row (the message expansion that produced its `queries`). Join by `bank_id` + proximity in time to walk a single inspection thread end-to-end.
+### Last 10 recalls: cost, latency, and whether the reranker ran
 
 ```sql
-WITH recent_recalls AS (
-    SELECT
-        id, bank_id, created_at, queries, mode, n_results,
-        duration_ms, synthesis
-    FROM recall_events
-    WHERE bank_id = 'default'
-    ORDER BY created_at DESC
-    LIMIT 5
-)
 SELECT
-    r.created_at                                 AS recall_at,
-    f.message                                    AS user_message,
-    f.n_queries_out,
-    f.parse_fallback,
-    f.error_kind,
+    r.created_at,
     r.mode,
     r.n_results,
-    r.duration_ms                                AS recall_ms,
-    LEFT(r.synthesis, 200)                       AS synthesis_preview
-FROM recent_recalls r
-LEFT JOIN LATERAL (
-    SELECT *
-    FROM formulate_events fe
-    WHERE fe.bank_id = r.bank_id
-      AND fe.created_at <= r.created_at
-    ORDER BY fe.created_at DESC
-    LIMIT 1
-) f ON TRUE
-ORDER BY r.created_at DESC;
+    r.duration_ms,
+    r.depth,
+    r.n_llm_calls,
+    r.cost_usd,
+    r.queries->>0                                AS first_query,
+    r.rerank->'per_query'->0->>'fallback_reason' AS stage2_fallback
+FROM recall_events r
+WHERE r.bank_id = 'default'
+ORDER BY r.created_at DESC
+LIMIT 10;
 ```
 
-### Per-chunk inspection of a specific recall
+`stage2_fallback` is NULL when the cross-encoder answered, and says why when the Stage 1 order stood (timeout, HTTP error, no transport).
 
-`recall_events.results` is a JSONB array — one element per surfaced chunk. Unwrap with `jsonb_array_elements` to see source, document_id, rank, per-channel scores, and the 200-char preview for each chunk that came back.
+### Per-hit inspection of a specific recall
+
+`recall_events.results` is a JSONB array, one element per surfaced note:
 
 ```sql
 SELECT
@@ -95,34 +100,37 @@ WHERE id = <RECALL_EVENT_ID>
 ORDER BY (elem->>'rank')::int;
 ```
 
-(Pull `<RECALL_EVENT_ID>` from the "last 5 recalls" query above.)
-
-### LLM call audit by prompt name
-
-Each LLM site (`index_text`, `formulate`, `synthesize`) emits an `llm_calls` row. Group to see call volume and timing distribution; head the prompt + response to verify what's actually going over the wire.
+(Pull `<RECALL_EVENT_ID>` from the query above.) The candidates a channel found, including those that did not make the result:
 
 ```sql
--- Volume + timing distribution, last 24h
+SELECT query_index, channel, rank, round(score::numeric, 5) AS score, document_id
+FROM recall_event_candidates
+WHERE recall_event_id = <RECALL_EVENT_ID>
+ORDER BY query_index, rank;
+```
+
+### Model-call audit by purpose, with cost
+
+```sql
+-- Volume, timing, tokens and cost by purpose, last 24h
 SELECT
     prompt_name,
     COUNT(*)                                     AS calls,
     ROUND(AVG(duration_ms))                      AS avg_ms,
     MAX(duration_ms)                             AS max_ms,
-    COUNT(*) FILTER (WHERE error IS NOT NULL)    AS errors
+    COUNT(*) FILTER (WHERE error IS NOT NULL)    AS errors,
+    SUM(tokens_in)                               AS tokens_in,
+    SUM(tokens_out)                              AS tokens_out,
+    ROUND(SUM(cost_usd)::numeric, 4)             AS cost_usd
 FROM llm_calls
 WHERE bank_id = 'default'
   AND created_at >= now() - INTERVAL '24 hours'
 GROUP BY prompt_name
 ORDER BY calls DESC;
 
--- Most recent prompt + response per site
-SELECT
-    created_at,
-    prompt_name,
-    duration_ms,
-    LEFT(prompt_text,   400)                     AS prompt_head,
-    LEFT(response_text, 400)                     AS response_head,
-    error
+-- Most recent prompt + response per purpose
+SELECT created_at, prompt_name, model, duration_ms,
+       LEFT(prompt_text, 400) AS prompt_head, LEFT(response_text, 400) AS response_head, error
 FROM llm_calls
 WHERE bank_id = 'default'
 ORDER BY created_at DESC
@@ -131,29 +139,20 @@ LIMIT 10;
 
 ### Sweeper status
 
-One row per `(bank_id, corpus_path)` reflecting the last completed sweep. Use this to see whether the background sweeper is keeping up and where errors are landing.
+One row per `(bank_id, corpus_path)` reflecting the last completed sweep:
 
 ```sql
-SELECT
-    corpus_path,
-    last_pass_ended_at,
-    last_pass_duration_ms,
-    last_pass_files_seen,
-    last_pass_files_indexed,
-    last_pass_files_pruned,
-    last_pass_errors,
-    last_error
+SELECT corpus_path, last_pass_ended_at, last_pass_duration_ms, last_pass_files_seen,
+       last_pass_files_indexed, last_pass_files_pruned, last_pass_errors, last_error
 FROM sweeper_state
 WHERE bank_id = 'default'
 ORDER BY last_pass_ended_at DESC NULLS LAST;
 ```
 
-For historical sweep cadence (was it running every 5 minutes? did it stop?):
+For the history (was it running every 5 minutes? did it stop?):
 
 ```sql
-SELECT
-    started_at, ended_at, duration_ms,
-    files_seen, files_indexed, files_pruned, errors_count
+SELECT started_at, ended_at, duration_ms, files_seen, files_indexed, files_pruned, errors_count
 FROM sweep_passes
 WHERE bank_id = 'default'
 ORDER BY started_at DESC
@@ -162,18 +161,13 @@ LIMIT 20;
 
 ### Bank stats one-liner
 
-For document/item counts, the easiest path is the CLI:
-
-```bash
-prospecta stats
-```
-
-Or via SQL directly:
+The CLI: `prospecta stats`. Or in SQL:
 
 ```sql
 SELECT
     b.bank_id,
     b.embedding_dim,
+    b.channel_config = '[]'::jsonb                              AS legacy_bank,
     (SELECT COUNT(*) FROM documents     WHERE bank_id = b.bank_id) AS documents,
     (SELECT COUNT(*) FROM memory_items  WHERE bank_id = b.bank_id) AS items,
     (SELECT COUNT(*) FROM retain_events WHERE bank_id = b.bank_id) AS retains,
@@ -181,17 +175,6 @@ SELECT
 FROM banks b
 ORDER BY b.bank_id;
 ```
-
-## Reading a recall event end-to-end
-
-A worked example: walk through what happens when an agent calls `m.recall_synth("when's kelly's birthday?")`, in order.
-
-1. **`formulate_events` row inserted** — the LLM expanded the user's message into N sub-questions. `raw_response` has the verbatim JSON the LLM returned; `parse_fallback` tells you whether parsing succeeded; `error_kind` discriminates the failure mode (`malformed_json` vs `schema_mismatch` vs NULL). The parsed sub-questions become the input to recall.
-2. **Per-channel retrieval runs** (HNSW + content_tsv ts_rank_cd + body_tsv ts_rank_cd), three CTEs FULL OUTER JOIN'd via RRF. No event row per channel — this is in-flight SQL, not a logged event.
-3. **`recall_events` row inserted** — `queries` lists the sub-questions, `mode='hybrid'` (or `semantic`/`lexical`), `n_results=N`, `results` is a JSONB array with one entry per surfaced chunk (source, document_id, rank, per-channel scores dict, 200-char content preview), `synthesis` is the RAG output text, `duration_ms` is total wall-clock for the recall+synth.
-4. **`llm_calls` row inserted for the synthesize call** — `prompt_name='synthesize'`, `prompt_text` is the rendered RAG-synthesize template with the retrieved chunks substituted in, `response_text` is the verbatim synthesis.
-
-So from one `recall_synth`, you get 1 `formulate_events` row + 1 `recall_events` row + 2 `llm_calls` rows (one for `formulate`, one for `synthesize`). The formulate `llm_call` shows you the JSON-mode prompt + the raw LLM JSON; the synthesize `llm_call` shows you the chunk-stuffed prompt + the answer. Plain `recall()` (no synthesis) drops the synthesize `llm_call` and leaves `recall_events.synthesis` NULL.
 
 ## Configuration
 
@@ -263,13 +246,14 @@ The six event names are stable: `retain`, `recall`, `formulate_queries`, `sweep_
 
 Honest about the boundaries:
 
-- **Cosine distance / HNSW probe details.** Individual vector arithmetic isn't logged; you see the surfaced result + RRF score, not the per-channel internal scoring within the HNSW probe. To inspect at that level, query `memory_items` directly or use `Memory.search(mode='semantic')` / `mode='lexical'` to compare channels in isolation.
+- **Cosine distance / HNSW probe details.** Individual vector arithmetic isn't logged; you see the surfaced result and each candidate's rank and fused score, not the scoring inside the HNSW probe. To inspect at that level, query `memory_items` directly.
 - **Chunker decisions.** Markdown chunking happens before retain; the chunked text lands as `memory_items.original_chunk`, but the chunker's reasoning (split here vs. there) isn't recorded.
-- **Per-channel scores for items that did NOT surface in the top-K.** Only the returned chunks land in `recall_events.results`. Items that scored below the cutoff are not retained in the event row. (Exception: banks with a non-empty `channel_config` also persist every channel candidate in `recall_event_candidates`, migration 0007.)
+- **Items that did NOT surface.** Only the returned notes land in `recall_events.results`. A bank with a non-empty `channel_config` also persists every channel candidate in `recall_event_candidates` (migration 0007); a legacy bank (`channel_config = []`) does not.
+- **Plain `Memory.search`.** It records nothing; `recall` and the Mode 1 calls do.
 
 ## Performance impact
 
-Event-table writes are append-only INSERTs (`sweeper_state` is the one UPSERT). Each event is a single small row; the load is dominated by the LLM calls and the retrieval SQL themselves, not by the trace persistence. For comparison: a typical `recall_synth` runs 2 LLM calls (~1–3 s each) and ~10–100 ms of hybrid SQL — adding 3 event-table INSERTs (~1 ms each) is negligible.
+Event-table writes are append-only INSERTs (`sweeper_state` is the one UPSERT). Each event is a single small row; the load is dominated by the LLM calls and the retrieval SQL themselves, not by the trace persistence. For comparison: a Mode 1 recall makes a writer call, up to 20 rerank requests (each a few hundred milliseconds) and tens of milliseconds of Stage 1 SQL; the event-table INSERTs (~1 ms each, one per model call plus the recall) are negligible.
 
 If trace volume becomes a concern long-term, you have three levers:
 
@@ -279,6 +263,7 @@ If trace volume becomes a concern long-term, you have three levers:
 
 ## See also
 
-- [`docs/design/prospecta/schema.md`](design/prospecta/schema.md) — canonical DDL for all tables.
+- [`docs/schema.md`](schema.md) — the tables and columns.
+- [`docs/recall-stages.md`](recall-stages.md) — the stages whose records these tables hold.
 - [`PRINCIPLES.md`](../PRINCIPLES.md) — load-bearing principles, including the observability principle.
 - [`prospecta/observability/postgres_sink.py`](../prospecta/observability/postgres_sink.py) — payload contract reference for each event handler.

@@ -1,7 +1,7 @@
 """T13 — read-side bilateral spine: formulate_queries (JSON-mode + parse-fallback).
 
 Acceptance criteria per task spec. Library NEVER raises on malformed LLM JSON
-(schema.md §13 — parse-fallback is canonical observability).
+(parse-fallback is recorded in formulate_events: docs/observability.md).
 """
 from __future__ import annotations
 

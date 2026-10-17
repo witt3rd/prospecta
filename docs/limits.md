@@ -1,116 +1,84 @@
 # Numeric limits (audit)
 
-Standing rule: **no caps**. A limit is kept only if it is physical (a provider,
-database or model window forces it) or a tuning/design constant that does not
-clip content or evidence. Everything else is removed or score-based. Where a
-physical limit forces clipping, the full untruncated text is logged in a warning.
+Standing rule: **no caps**. A limit is kept only if it is physical (a provider, database or
+model window forces it) or a tuning / design constant that does not clip content or evidence.
+Everything else is removed or score-based. Where a physical limit forces clipping, the full
+untruncated text is logged in a warning.
 
-Kind: **physical** = imposed from outside; **design** = a parameter chosen for a
-physical window, not a clip; **tuning** = a constant of an algorithm, not a cap;
-**ours-config** = our bound on work or cost, configurable, never clips evidence.
+Kind: **physical** = imposed from outside; **design** = a parameter chosen for a physical
+window, not a clip; **tuning** = a constant of an algorithm, not a cap; **ours-config** = our
+bound on work or cost, configurable, never clips evidence; **caller** = the caller's own
+argument.
+
+This page lists the limits of the current design (`docs/postgres-hybrid.md`). The limits of the
+retired graph, linker, reader / hop, BM25 and grounded-synthesis code are in that code
+(`docs/legacy.md`).
+
+## The write path
 
 | Limit | Where | Value | Why | Kind |
 |---|---|---|---|---|
-| Scope promotion count (`PROMOTE_MAX`) | `channels/meta.py` | **removed** | replaced by a score boost: `promote_weight` (meta param, 1.0) × top score × cosine; no count | was ours |
-| Scope-set size for grounded synthesis (`SCOPE_MAX`) | `_synth.py` | **removed** | an explicit `scope=` is always the whole set | was ours |
-| Evidence clip for the reranker (`EVIDENCE_CHARS`, 1000) | `stages.py` | **removed** | the best chunk goes in full; a chunk is already bounded by chunking | was ours |
-| Jev passage clip (`JEV_PASSAGE_CHARS`, 2400) | `stages.py`, `_linker.py` | **removed** | replaced by `fit_passage`: cut only if one passage cannot fit a request (below), with a full-text warning | was ours |
-| Jev request size | `stages.py` `JEV_INPUT_BYTES` | 60,000 B | Jev provider request limit; items are split across requests, a lone passage over `JEV_PASSAGE_MAX_BYTES` is cut with a warning | physical |
-| Jev candidates per request (reranker) | `JEV_BATCH` / `JEV_MAX_BATCH` | 15 / 16 | the reranker sends at most 16 candidates per request; larger pools use several requests | physical |
-| Linker Jev questions per request | `JevRelationJudge(max_questions_per_call=JEV_MAX_QUESTIONS_PER_CALL, relations_per_call=True)` | 96 | verified live: 48, 96, 150, 300 questions answered; the cap is a config, larger sets split | ours-config |
-| Linker Jev input tokens per request | `JevRelationJudge(max_input_tokens=JEV_MAX_INPUT_TOKENS)` | 45,000 (est. 4 chars/token) | verified live: 56.6k tokens ok, 300 questions x 1,000 chars (419 KB) fails HTTP 400 `max_tokens_exceeded`; requests split by the estimate, never drop or cut a candidate; a 400 halves and retries | physical |
-| Jev timeout | `JEV_TIMEOUT_S` | 10 s | latency bound on an optional stage; failure keeps the fused order | ours-config (constructor arg) |
-| Cross-encoder request size | `stages.py` `RERANK_BATCH_TOKENS` | 32,000 tokens (est. 4 chars/token) | `qwen/qwen3-reranker-8b` reads 41K tokens; the rest is margin for tokenizer variance, the instruction and the query. A larger pool goes out as several requests (scores are calibrated, so they merge); a lone note is never cut | design |
-| Cross-encoder `top_n` / timeout | `recall_config.rerank.top_n` / `timeout_s` | 10 / 2.5 s | the notes kept after the floor and near-copy collapse; a latency bound on an optional stage (failure keeps the fused order) | ours-config |
-| Query expansion's near-copy collapse | `stages.py` `NEAR_COPY_JACCARD` / `NEAR_COPY_COSINE`; call argument `near_copy_cosine=`, `recall_config.expansion.near_copy_cosine`, `PROSPECTA_NEAR_COPY_COSINE` | 0.88 token Jaccard, then 0.90 chunk-embedding cosine | a record at or above the cosine to a better-scored kept record is a copy of it and collapses (it is listed in the kept one); 0.90 was measured on the live banks (docs/postgres-hybrid.md, Mode 1 point 6): the same note in several wordings is at 0.91 and above, distinct notes at 0.876 and below | ours-config (measured) |
-| Stage 1 reserved slots and HNSW `ef_search` | `db/queries.py` `STAGE1_*`; `hybrid_chunk` params `semantic_limit` / `stemmed_limit` / `exact_limit` / `fused_limit` / `hnsw_ef_search` | 25 / 20 / 20 / 50, 100 | the plan's quotas (docs/postgres-hybrid.md): each retriever keeps its own top slots so an exact hit always reaches the reranker, which reads the fused ~50; none clips evidence | design, ours-config (channel params) |
-| Fallback chunk (`_matching_chunk`) | `_retain.py` | **removed clip** | the text is returned whole when a note has no chunk items | was ours |
-| Graph hop clamp (`MAX_HOPS` min) | `channels/graph.py` | **removed clamp**; default 2 | `max_hops` is a walk-depth param; default stays 2 | ours-config |
-| Graph node cap (was `node_cap` 60) and hop-2 `frontier` (200) | `channels/graph.py` `node_min_rel` | **removed**; every reached neighbour with score >= 0.4 x the best reached | scores only fall along a path, so the walk expands a hop-1 item only if one more step (decay x the largest type weight) could still reach `node_min_rel` x the best hop-1 score, and keeps what clears the relative cut. A stored `node_cap`/`frontier`/`seeds` param is ignored | was ours |
-| Rerank pool (was `RERANK_POOL` 30) | `stages.py`, `recall_config.rerank.min_rel_score`; named depths `standard` 0.15 / `deep` 0.05 (`recall(..., depth=)`, `recall_config.depth`, see `recall-stages.md`) | **removed**; fused score >= 0.15 x the best fused score (`POOL_MIN_REL`, the scout's knee) | the pool decides only the size of the RERANK input and is the quality/cost knob: configurable down to 0.05 (about 1,083 notes per question on the scout's corpus; 0.15 dropped 27 of 273 strict-gold notes only together with the old channel cuts). The pool is every fused note at or above the relative score; the reranker sees all of it. Bounded only by the reader model's window (below) | was ours |
-| Hop follow-ups (was `max_follow_ups` 2) and new notes (was `max_new` 10) | `stages.py` `_hop` | **removed** | the reader gives one follow-up per distinct missing fact (cheap searches, no LLM); every new note at or above `reader.hop_min_rel_score` (0.4) x the best of its follow-up run joins and the joined set is reranked again | was ours |
-| Reader `top` 8 / `join_top` 15 | `stages.py` `_hop`, `reader.min_rel_score` | **removed**; rerank grade (0..3, else fused score) >= 0.6 x the best | the reader sees every qualifying note; the whole reranked set stays ahead of new candidates | was ours |
-| Channel candidate `limit` 50, fusion `POOL` 30 | `channels/semantic.py`, `bm25.py`, `meta.py`, `recall.py`, `fusion.py` | **removed**; channels do not cut: `min_rel` defaults to 0 (cosine and BM25 alike; override per bank via the `min_rel` param), meta = whole filter set | a channel returns every candidate it can fetch (`fetch_until_cut`: fetches in pages of 64 (throughput) and doubles until the cut is reached). Fusion keeps every document; the pool cut is the stage's. A stored `limit`/`recall_config` count key is ignored | was ours |
-| Graph seeds (was `seeds` 10) | `channels/graph.py` `seed_min_rel` | **removed**; every pool document with RRF >= 0.5 x the best | the walk's starting set | was ours |
-| Linker caps (was `NEIGHBOURS` 10, `VECTOR_TOP` 5, `TEMPORAL_CLOSE_CAP` 5) | `_linker.py` `neighbour_min_rel` 0.9, `neighbour_min_cos` 0.5, `temporal_min_rel` 0.5 | **removed** | candidates per anchor: the pgvector neighbours with cosine >= 0.9 x the nearest, ending at the first marginal drop > 0.1 x the nearest, and never below the absolute cosine `neighbour_min_cos` 0.5 (HNSW top-n, doubling only until the stop is decided: cost is linear in notes; per-document candidates examined/judged and LLM cost are in the link state stats); the model-free fallback also keeps the absolute `vector_floor` 0.75; TEMPORALLY_CLOSE: every note within `TEMPORAL_DAYS` (3) whose closeness 1/(1+days) >= 0.5 x the closest. Jev judges candidates in batches of its request limit (physical); each unordered pair is judged once (`memory_link_pairs`). Not counts: `ENTITY_HUB` 30 and graph `hub_cap` 200 (hub-entity definition and walk work bound, design) | was ours |
-| `top` / `limit` on `search` | `Memory.search(limit=10)` | 10 | the caller's request for how many results | caller's argument |
-| Grounded evidence notes (was `TOP_NOTES` 6) and chunks per note (was `CHUNKS_PER_NOTE` 3) | `_synth.py` | **removed** | notes and chunks are kept by score: `>= recall_config.evidence.min_rel_score` (0.5) x the best; an explicit `scope=` is the whole set; `evidence_top` is an optional per-call note count, `None` by default | was ours |
-| Synthesizer context window | `_synth.py` `DEFAULT_CONTEXT_TOKENS` | 200,000 tokens (`recall_config.evidence.context_tokens`) | physical model window (4 chars/token estimate, 4,000 tokens reserved for template/question/answer); only this can drop evidence, lowest-ranked first, with one full warning naming what was dropped | physical |
-| Chunk size / overlap | `_retain.py` `CHUNK_MAX_CHARS` 1000, `CHUNK_OVERLAP_CHARS` 100 | | **design parameter** sized for the embedder window and precise retrieval; not a clip: the whole text is kept as chunks | design |
-| Embedding dimension | schema | 1536 | `text-embedding-3-large` cut to 1536 (pgvector index limit is 2000) | physical |
+| Chunk size / overlap | `_retain.py` `CHUNK_MAX_CHARS` 1000, `CHUNK_OVERLAP_CHARS` 100; `index_directory(chunk_size=1000, chunk_overlap=200)` | | sized for the embedder window and precise retrieval; **not a clip**: the whole text is kept as chunks | design |
+| Embedding dimension | `banks.embedding_dim` | 1536 for the default embedder | `text-embedding-3-large` cut to 1536 (pgvector's HNSW limit is 2000); fixed per bank at creation | physical |
 | Embedding batch | `_embed_migrate.py` `BATCH_SIZE` | 128 | provider batch efficiency; no effect on content | ours-config |
-| Import batch | `prospecta import-hindsight --batch` | 1000 | rows per transaction | ours-config |
-| RRF `k` | `rrf_k`, `Memory(rrf_k=60)` | 60 | **fusion constant** (dampens rank differences), not a cap | tuning |
-| Graph `decay`, type weights, `promote_weight` | channel params | 0.5, .., 1.0 | score weights, not caps | tuning |
-| Gate threshold | `recall_config.gate.threshold` | 2.95 | score cut on Jev's 0..3 scale; a decision, not a clip | tuning |
+| Import batch | `prospecta import hindsight --batch` | 1000 | rows per transaction | ours-config |
+| Date parse `[:10]` | `_filters.py` | 10 characters | an ISO date is 10 characters | format |
+
+## Stage 1 (the `hybrid_chunk` channel)
+
+| Limit | Where | Value | Why | Kind |
+|---|---|---|---|---|
+| Reserved slots and HNSW `ef_search` | `db/queries.py` `STAGE1_*`; channel params `semantic_limit` / `stemmed_limit` / `exact_limit` / `fused_limit` / `hnsw_ef_search` | 25 / 20 / 20 / 50, 100 | each retriever keeps its own top slots so an exact hit always reaches the reranker, which reads the fused 50; none clips evidence | design, ours-config |
+| RRF weights and `k` | `_STAGE1_SQL` | 0.45 / 0.25 / 0.30, k = 60 | the fallback score inside the fused 50 and the order when Stage 2 does not run; the cross-encoder re-scores every pair, so only membership of the 50 matters | tuning |
+| Plain-question OR | `docs/exact-tsv.md` | **no cap** on words | a cap dropped words silently; what a long question costs is measured in `docs/exact-tsv.md` | measured |
+| Date-only listing | `fused_limit` | 50 | the newest chunks inside the window | design |
+
+## Stage 2 (the cross-encoder) and the rerank pool
+
+| Limit | Where | Value | Why | Kind |
+|---|---|---|---|---|
+| Rerank pool | `recall_config.rerank.min_rel_score`, depths `standard` 0.15 / `deep` 0.05 (`depth=`, `recall_config.depth`, `docs/recall-stages.md`) | fused score >= **0.15 x the best fused score** (`POOL_MIN_REL`, `_scorecut.py`), 0.05 for `deep` | the pool decides only the size of the RERANK input: it is every fused note at or above the relative score, never a count. With Stage 1's reserved slots it admits the whole fused 50 in practice | tuning |
+| Cross-encoder request size | `stages.py` `RERANK_BATCH_TOKENS` | 32,000 tokens (est. 4 chars / token) | `qwen/qwen3-reranker-8b` reads 41K tokens; the rest is margin for tokenizer variance, the instruction and the query. A larger pool goes out as several requests (scores are calibrated, so they merge); a lone note is never cut | design |
+| Score floor | `rerank.min_score` | 0.15 | an absolute cut on the calibrated 0..1 score; the only thing that empties a result | tuning |
+| `top_n` | `rerank.top_n` | 10 | the notes kept after the floor and the near-copy collapse (Mode 1 keeps every note above the floor) | ours-config |
+| Timeout | `rerank.timeout_s` | 2.5 s | latency bound on an optional stage; failure keeps the Stage 1 order | ours-config |
+| Near-copy collapse inside Stage 2 | `NEAR_COPY_JACCARD` | token Jaccard 0.88 | two notes this alike are one answer (`deduplicate_near_copies`) | tuning |
+| Evidence clip for the reranker | `stages.py` | **none** | the best chunk goes in full; a chunk is already bounded by chunking | removed |
+
+## Mode 1 (query expansion)
+
+| Limit | Where | Value | Why | Kind |
+|---|---|---|---|---|
+| Deadline | `expansion.deadline_s` / `deadline=` | 7 s | one clock for the gate, the writer, every search and every rerank; a search still running at the deadline is dropped and recorded | ours-config |
+| Gate share | `_expand.py` `GATE_SHARE` | 30% of the deadline | a gate that is late lets the message through | ours-config |
+| Writer share | `WRITER_SHARE`, `SEARCH_RESERVE` | 50% of the deadline, and the searches always keep 25% | the writer cannot starve the searches | ours-config |
+| Searches | `expansion.max_searches` | 20 | the hard maximum: a bad model reply cannot explode the fan-out; a reply over it is cut (first searches kept) and recorded | ours-config |
+| Concurrency | `expansion.max_concurrency` | 8, and never more than the pool | searches in the database at once; a search's embed and rerank hold no connection | ours-config |
+| Token valve | `expansion.max_tokens` | 0 (off) | the block is sized by relevance, never by a count; the valve keeps records best first until the estimate is reached (always at least one) and says how many it left out | ours-config |
+| Stage 1 order cut without a rerank | `expansion.fallback_min_rel` | 0.5 x the search's best RRF score | never a count | ours-config |
+| Near-copy collapse by meaning | `stages.py` `NEAR_COPY_JACCARD` / `NEAR_COPY_COSINE`; call argument `near_copy_cosine=`, `recall_config.expansion.near_copy_cosine`, `PROSPECTA_NEAR_COPY_COSINE` | 0.88 token Jaccard, then 0.90 chunk-embedding cosine | a record at or above the cosine to a better-scored kept record is a copy of it and collapses (it is listed in the kept one); 0.90 was measured on the live banks (`docs/postgres-hybrid.md`, Mode 1 point 6): the same note in several wordings is at 0.91 and above, distinct notes at 0.876 and below | ours-config (measured) |
+| Gate threshold | `stage0_gate.needs_memory_threshold` | 0.5 | a decision on the 0..1 `needs_memory` noul, not a clip | tuning |
+| Suggested searches | `suggest_searches` | chat: 3 up to 30 words, 5 up to 80, 8 up to 200, 12 beyond; task: one per 15 words, 8 to 20 | the writer is told the number; the maximum above is the only limit | tuning |
+| Period sanity | `MIN_DATE`, a year ahead | 1990-01-01 .. +1 year | a period the writer names outside it, or reversed, is dropped (no window, never a wrong one) | design |
+| Term length | `TERM_MAX_CHARS` | 200 characters | a quoted phrase longer than this is not a verbatim term | design |
+
+Measured latency of 20 searches (`tests/test_expand_perf.py`) is in `docs/postgres-hybrid.md`,
+section 1, point 9.
+
+## Stage 3 (the sufficiency gate)
+
+| Limit | Where | Value | Why | Kind |
+|---|---|---|---|---|
+| Threshold | `stage3_sufficiency.threshold`, `STAGE3_THRESHOLD` | 0.70 | `evidence_sufficient` / 3 under this runs one broadened retry; a decision, not a clip | tuning |
+| Decision-model request size | `stages.py` `JEV_INPUT_BYTES` | 60,000 B | the provider's request limit; a lone passage over `JEV_PASSAGE_MAX_BYTES` is cut with a full-text warning | physical |
+| Decision-model timeout | `JEV_TIMEOUT_S` | 10 s | latency bound on an optional stage | ours-config |
+
+## Calls and display
+
+| Limit | Where | Value | Why | Kind |
+|---|---|---|---|---|
+| `limit` on `search` / `recall` / `ask` | `Memory.search(limit=10)`, `ask(limit=8)` | 10 / 8 | the caller's request for how many results | caller |
+| `/lookup` | `service.py` `MAX_LIMIT`, questions per call | 100, 50 | request bounds of the service; a task takes no `limit` | ours-config |
 | `content_preview` | `memory.py` `PREVIEW_LEN` | 200 chars | inspection-only audit column in `recall_events`; full content stays in `memory_items` | display only |
-| Regex/filter date parse `[:10]` | `_filters.py` | 10 chars | an ISO date is 10 characters | format |
 
-## Score-based pools (what a stage sees)
-
-Rule: a stage sees everything at or above a score relative to the best; only the reading
-model's physical window can split it. Window: Claude Sonnet 5.5, 200,000 tokens
-(`SONNET_CONTEXT_TOKENS`, 4 chars/token estimate, 4,000 reserved). A qualifying set that
-exceeds it is split into consecutive batches and map-reduced, never truncated:
-
-- **Rerank**: each batch is graded by its own listwise call; grades merge into one order
-  (grade first, then the fused order). One batch (the usual case) is the unchanged call.
-- **Reader**: each batch is read; sufficient only if every batch is, follow-ups are the union.
-- **Failure**: a failed batch is retried once (`BATCH_ATTEMPTS`), then the stage fails loudly
-  with a full untruncated warning (query and every note id) and the fused order stands: nothing is dropped.
-- Defaults (`_scorecut.py`): pool 0.4, reader 0.6, hop 0.4, channels as above. Chosen from the
-  design's RRF arithmetic (single-channel rank 30 ~0.6 of a top note) and tuned only on synthetic
-  data: still to be tuned on the real 120 questions + the Greg question against a real bank.
-  `min_rel 0` means no cut.
-- **Thresholds are unmeasured starting defaults chosen by the author**: pool 0.4 of the best
-  fused RRF score, channel cuts 0.6 cosine / 0.15 BM25, reader 0.6, hop 0.4. Config keys:
-  channel param `min_rel`; `recall_config.rerank.min_rel_score`, `recall_config.reader.min_rel_score`,
-  `recall_config.reader.hop_min_rel_score`. The rung-caretaker scout tunes them on roger with the
-  real question set. `max_follow_ups` no longer applies (the cut is score-based).
-- **Reranker cost on the synthetic bank goes down**: the pool (fused notes >= 0.4 x best) was 6-27
-  notes over 8 probe queries (mean ~14) against the old fixed 30. On a real bank, where scores
-  are flatter, it may be larger: that is what the tuning on real data decides.
-- **Semantic channels never stop at an index's reach**: an HNSW scan returns about `ef_search`
-  (40) rows, so a short page would look like an exhausted source. Each page fetch runs in its
-  own transaction with `hnsw.iterative_scan = relaxed_order` (pgvector >= 0.8) or, on older
-  pgvector, with index scans off (exact), logging one warning. BM25 backends (pg_search
-  `LIMIT n`, in-process ranking of every match) return exactly `n` rows when more exist, so a
-  short page is true exhaustion there.
-- `prospecta eval` no longer slices to 30 (`pool=None` scores the whole selected pool).
-
-Synthetic before/after (`/tmp/e11eval.py`: 320 notes, 8 set questions, stub embedder, no LLM):
-hit@1 .875, hit@10 1.0, MRR .9375, cover@10 .906 both before and after; candidates per
-question from the question channel 50 -> about 10. Cost (LLM) not measurable offline.
-
-No `max_tokens` is passed to any LLM call. Not audited here: CLI/TUI display widths.
-
-## Recall switches that are OFF by default
-
-| Switch | Where | Default | Why |
-|---|---|---|---|
-| Rerank blend (`rerank.blend.enabled`, 0.7/0.3) | `stages.py` | **off** | with score-based pools it regressed hit@1 (V3 re-run: gold1 0.72 vs 0.86 off, gold2 0.85 vs 0.97 off) |
-| Scope-promotion re-sort (meta param `promote`) | `channels/meta.py` | **off** | same V3 regression; opt in until it beats the v2 numbers |
-
-`prospecta eval --rerank-blend/--no-rerank-blend --scope-promote/--no-scope-promote` force each per run. The promotion table below describes the code when `promote` is on.
-
-## Scope promotion: cover@10 (Q096-style synthetic set)
-
-60 non-members (fused 1.0 down), 40 members (fused ~0.3), 3 gold members buried in the set.
-Printed by `tests/test_filters.py` (`pytest -s -k q096`):
-
-| Variant | cover@10 |
-|---|---|
-| old `PROMOTE_MAX` cap (set of 40 > 12: no promotion) | 0.00 |
-| boost, gold cosine 0.9 | 1.00 |
-| boost, weak-cosine non-gold members (gold 0.85, others 0.05) | 1.00 |
-| boost, all member cosines 0 (no boost on a zero score) | 0.00 |
-
-### Graph and linker thresholds (second PR)
-
-Config names and defaults, all relative to the best score (0 = no cut): graph channel params
-`seed_min_rel` 0.5, `node_min_rel` 0.4; Linker `neighbour_min_rel` 0.9, `temporal_min_rel` 0.5.
-Like the first PR's, these are unmeasured starting defaults chosen by the author (no links
-exist on the synthetic bank, so the synthetic eval is unchanged); tuning on the real question
-set is for the rung-caretaker scout on roger. Hub entities (`hub_cap` 200 holders) remain a
-work bound of the walk; at the default cut hub neighbours (0.5 x best) pass, so a graph walk
-over a bank with huge hubs can return many notes: raise `node_min_rel` per bank if so.
+No `max_tokens` is passed to any model call. Not audited here: CLI / TUI display widths.

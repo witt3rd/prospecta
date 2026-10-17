@@ -18,8 +18,9 @@ indexes for the `keyword` channel. The migration file carries only the placehold
 the column. `tests/test_exact_tsv.py` checks that every row's column equals the expression, and that the
 Stage 1 results equal the old expression form row for row.
 
-`memory_items_keyword_gin` (migration 0018) is kept: the `keyword` channel still uses it
-(`docs/keyword-index.md`). Dropping it, or moving that channel to `exact_tsv`, is a separate decision.
+`memory_items_keyword_gin` (migration 0018) is kept: the legacy `keyword` channel still uses it
+(see "Legacy keyword index" at the end of this page). Dropping it, or moving that channel to
+`exact_tsv`, is a separate decision.
 
 ## What the migration costs (read before applying it to a live database)
 
@@ -176,3 +177,26 @@ over a second, when most of its words are common content words; a long list of c
 seconds. This is not capped here: whether to bound it (and how) is a product decision. The automatic
 recall of `docs/postgres-hybrid.md` section 1 feeds the stemmed retriever a short `query` per search, so
 the words per OR stay few there.
+
+## Legacy keyword index (`memory_items_keyword_gin`, migration 0018)
+
+Not part of Stage 1. The legacy `keyword` channel (`docs/legacy.md`) matches the question's
+words against `memory_items.original_chunk` (chunk text; for an unchunked document, the
+document text). Migration 0018 adds a GIN expression index, `memory_items_keyword_gin`, over
+that channel's word rule: the `simple` text-search configuration (stemming off) plus path
+pieces split at slashes. The channel's query uses the same expression (`indexed_expression()`
+in `prospecta/db/keyword_index.py`, the one definition `exact_tsv` is generated from), so
+Postgres uses the index and keeps it current on every write.
+
+- **New and migrated databases:** `prospecta migrate` builds it after migration 0018.
+- **Existing bank, one command:** `prospecta keyword-index` (idempotent; also repairs an
+  interrupted build). `prospecta keyword-index --rebuild` rebuilds a valid one; the old index
+  serves until the swap.
+- **No lock on writes:** built with `CREATE INDEX CONCURRENTLY`. Reads and writes continue; the
+  build takes longer and waits for transactions open when it starts.
+- **Fallback:** without a valid index, and for `stemming: true` queries, the channel runs the
+  same expression as a scan of the bank (correct, slow). `KeywordChunks.used_index` reports
+  which path ran.
+- **Cost:** disk and write cost grow with text size. The index is shared by all banks in the
+  database; the bank filter is applied after the index lookup. A bank that never uses the
+  `keyword` channel still pays for it on every write until the index is dropped.

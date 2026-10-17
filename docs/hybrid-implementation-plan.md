@@ -6,56 +6,57 @@ We already have ~80% of the pieces in place. The goal is to **simplify, unify, a
 
 ---
 
-## 1. Where We Are vs. Target (`docs/postgres-hybrid.md`)
+## Status
 
-| Area | What Prospecta Has Today | Gap to Target |
-| --- | --- | --- |
-| **Write Path (`retain`, `index_single_file`, `source.py`)** | `retain()` calls an LLM (`generate_index_text`) to generate ~5 model-written questions (`kind='question'`) per note and only writes `kind='chunk'` if `child_chunks=True`. | **Drop write-time LLM question generation.** Write `kind='chunk'` items directly (`content = original_chunk = chunk.content`), deterministic and fast ($0 LLM write cost). Existing `question` rows in `augur-v2`/`forge-v2` stay harmlessly in the table (ignored by retrieval) or can be dropped later. |
-| **PostgreSQL Schema & Indexes (`memory_items`)** | Has `embedding` (with per-bank HNSW indexes), `body_tsv` (`GENERATED ALWAYS AS to_tsvector('english', original_chunk) STORED` + GIN), and `memory_items_keyword_gin` (`simple` expression GIN index from migration `0018`; the Stage 1 exact retriever now reads the stored `exact_tsv` column of migration `0020` instead, see `docs/exact-tsv.md`). `semantic.py` already sets `SET LOCAL hnsw.iterative_scan = 'relaxed_order'`. | Almost complete. Today `keyword.py`, `bm25.py` (in-memory Python BM25), and `semantic.py` run as separate Python round-trips, and `keyword.py` builds manual `OR` `tsquery` strings instead of `websearch_to_tsquery` (so `"electric dreams"` phrase adjacency and `-exclude` don't work). Unify Stage 1 into Postgres native `websearch_to_tsquery('english', ...)` + `websearch_to_tsquery('simple', ...)` + `ts_headline` exact-match snippets, and retire the slow in-process Python BM25 rebuild. |
-| **Stage 1 Candidate Generation & Fusion** | `fusion.py` has `floor_union` and `rrf`. | Wire the 3 native Postgres retrievers (**Semantic `dense_chunk`**, **Stemmed Lexical `fts_en`**, **Exact/Phrase Lexical `fts_exact`**) with pushed-down SQL filters (`bank_id`, date range, `excluded_source_ids` anti-echo, metadata/audience) and reserved candidate quotas ($\rightarrow$ ~50 candidates) + `rrf_score` fallback + `exact_snippet` (`ts_headline` on the top 50). |
-| **Stage 2 Cross-Encoder Reranker (`stages.py`)** | `stages.py` supports `sonnet_listwise` and `jev_score` (`STAGES = ("sonnet_listwise", "jev_score")`). | Add **`cross_encoder`** stage (`CrossEncoderReranker`) calling `POST https://openrouter.ai/api/v1/rerank` with configurable model (default `qwen/qwen3-reranker-8b`), relevance floor, near-duplicate collapse, and automatic fallback to Stage 1 RRF order on timeout/error. |
-| **Stage 0 Gate & Stage 3 Sufficiency (`stages.py`, `prefetch_contract.py`)** | `prefetch_contract.py` has Stage 0 Jev gate + query writer + anti-echo, but calls `jev_score` for Stage 2 ranking; `stages.py` has Jev gate tied only to `sonnet_listwise`. | Make **decision model** configurable (`decision_model`, default `typesafe/jev-1.14`) and **reranker model** configurable (`reranker_model`, default `qwen/qwen3-reranker-8b`). Let `prefetch_contract.py` (Mode 1A chat recall) and task/service lookup (Mode 1B & Mode 2) use Stage 1 + Stage 2 (`cross_encoder`) instead of a second Jev ranking call. |
-| **Citations & Exact-Match Snippets (`RecalledMemory`, `/lookup`, RAG block)** | `RecalledMemory` has `source`, `document_id`, `scores`, `metadata`. `build_items` formats `[source | date | person]`. | Add `created_at` / `date`, `exact_snippet` (`ts_headline`), and `match_kind` (`exact`, `lexical`, `semantic`, `exact+semantic`, `date`) to `RecalledMemory`, `/lookup` JSON responses, and the formatted RAG evidence block (`format_cited_rag_block`). |
+| Slice | What | State | PR |
+| --- | --- | --- | --- |
+| 1 | Chunk-only write path; `documents.created_on` always stamped | **done, merged** | #79 |
+| 2 | Native Postgres Stage 1 (`hybrid_chunk`: reserved slots, dual `websearch_to_tsquery`, `ts_headline` snippets) | **done, merged** | #80; the stored exact vector (migration 0020), the plain-question OR and date-only questions in #83 |
+| 3 | Configurable cross-encoder Stage 2 (`stage = cross_encoder`) | **done, merged** | #78 |
+| 4 | Cited-evidence contract, `recall_for_task`, `ask` with the optional Stage 3 gate (library half) | **done, merged** | #81; Mode 1 automatic recall by query expansion (`expand_and_recall`, which replaced the task-facet decomposition) in #85; its design in #84 |
+| 4b | A bank created fresh runs the architecture with no configuration (new-bank defaults); `import hindsight` writes chunk items | **done, merged** | #86 |
+| 4c | Mode 1 recall fixes: `terms` are only names and identifiers; near-copies collapse by meaning too | **done, merged** | #87 |
+| 5 | Offline verification on `augur-v2` / `forge-v2` | **verified read-only**; no gateway was switched by this repository's changes. The live migration `0020` and any gateway restart happen only with the captain's word (the `docs/exact-tsv.md` runbook) | none (no repository change) |
+| 6 | `rung-memory-prospecta` and Spire follow the contract | **pending** (other repositories) | |
+| 7 | Documentation overhaul in this repository | **in progress** | #88 |
+
+This file stays until slices 5 and 6 finish; then it is deleted or reduced to a short record of what was done.
+
+---
+
+## 1. Where We Are (what the slices left behind)
+
+`docs/postgres-hybrid.md` is the architecture and it is built; the table below is what is true now, against the plan's original target.
+
+| Area | State |
+| --- | --- |
+| **Write path** | `retain()` writes `kind='chunk'` items (`content = original_chunk = the chunk`, at most 1000 characters, 100 of overlap) with **no model call**, and always stamps `documents.created_on`. Question items exist only when the caller passes `index_text=` (instead of the chunks) or `generate_questions=True`. |
+| **Schema and indexes** | `body_tsv` (stemmed) and the stored `exact_tsv` (migration 0020, unstemmed, rewrote `memory_items`) with GIN indexes, per-bank partial HNSW indexes, `hnsw.iterative_scan = relaxed_order` in Stage 1. `docs/schema.md`. |
+| **Stage 1** | The `hybrid_chunk` channel: semantic top 25, stemmed top 20, exact / phrase top 20, fused into 50 in one query with `exact_snippet`; filters (`date_from` / `date_to`, `excluded_sources`, metadata / audience) pushed into every retriever; plain questions read as an OR of their stemmed words; date-only questions list the window. **A bank created fresh has it** (#86); older banks keep the config they stored, and the legacy three-channel recall (`channel_config = []`, `docs/legacy.md`) still serves them. |
+| **Stage 2** | `cross_encoder` (`qwen/qwen3-reranker-8b`, floor 0.15, `top_n` 10, 2.5 s, near-copy collapse, fallback to the Stage 1 order), configurable by call, bank and environment. A bank created fresh has it. The Sonnet and Jev stages are still in `stages.py` (legacy). |
+| **Stage 0 and Stage 3** | The decision model (`typesafe/jev-1.14`, System One) answers the `needs_memory` noul (Stage 0, chat only) and the `evidence_sufficient` score question (Stage 3, off by default). The gate decides only `needs_memory`; the writer proposes the period (the plan's `time_scope` decision was never built). |
+| **Mode 1** | `Memory.expand_and_recall` / `recall_for_task`: query expansion, N searches in parallel, one cited block, a 7 s deadline. |
+| **Citations** | `RecalledMemory` carries `source`, `created_on`, `kind`, `match_kind`, `relevance_score`, `exact_snippet`; `format_cited_rag_block`; `/lookup` returns them. |
 
 ---
 
 ## 2. Configuration Contract (Models & Thresholds Configurable Everywhere)
 
-Both models and their thresholds are configurable at three levels (per-call override $\rightarrow$ per-bank `recall_config` / profile `prospecta.json` $\rightarrow$ environment variable $\rightarrow$ default):
+The plan's single JSON contract was not built as a file or a profile layer; the settings are the per-call argument, then the bank's `recall_config` / `channel_config`, then the environment, then the default. The shipped keys (`docs/recall-stages.md`):
 
-```json
-{
-  "models": {
-    "decision_model": "typesafe/jev-1.14",
-    "reranker_model": "qwen/qwen3-reranker-8b",
-    "query_writer_model": "openrouter/google/gemini-2.5-flash-lite",
-    "embedding_model": "openai/text-embedding-3-small"
-  },
-  "stage0_gate": {
-    "enabled": true,
-    "needs_memory_threshold": 0.5
-  },
-  "stage1_postgres": {
-    "semantic_limit": 25,
-    "stemmed_limit": 20,
-    "exact_limit": 20,
-    "fused_limit": 50,
-    "hnsw_ef_search": 100
-  },
-  "stage2_rerank": {
-    "enabled": true,
-    "stage": "cross_encoder",
-    "model": "qwen/qwen3-reranker-8b",
-    "top_n": 10,
-    "min_rel_score": 0.15,
-    "timeout_s": 2.5,
-    "deduplicate_near_copies": true
-  },
-  "stage3_sufficiency": {
-    "enabled": false,
-    "threshold": 0.70
-  }
+```python
+recall_config = {
+  "rerank":  {"enabled": True, "stage": "cross_encoder", "model": "qwen/qwen3-reranker-8b",
+              "top_n": 10, "min_score": 0.15, "timeout_s": 2.5, "deduplicate_near_copies": True},
+  "models":  {"decision_model": "typesafe/jev-1.14",
+              "query_writer_model": "openrouter/google/gemini-2.5-flash-lite"},
+  "stage0_gate": {"enabled": True, "needs_memory_threshold": 0.5},
+  "expansion": {"max_searches": 20, "max_concurrency": 8, "deadline_s": 7},
+  "stage3_sufficiency": {"enabled": False, "threshold": 0.70},
 }
+channel_config = [{"name": "hybrid_chunk", "weight": 1,
+                   "params": {"semantic_limit": 25, "stemmed_limit": 20, "exact_limit": 20,
+                              "fused_limit": 50, "hnsw_ef_search": 100}}]
 ```
 
 **Environment variable defaults:**
@@ -65,16 +66,18 @@ Both models and their thresholds are configurable at three levels (per-call over
 
 ---
 
-## 3. Implementation Slices (In Order, All in `prospecta` First)
+## 3. Implementation Slices (In Order, All in `prospecta` First): the record
 
-### Slice 1: Stop Write-Time Question Generation (`_retain.py`, `_index.py`)
+The text below is the plan as written; the Status table above says what happened.
+
+### Slice 1: Stop Write-Time Question Generation (`_retain.py`, `_index.py`) — done (#79)
 * **Change:**
   * In `Memory.retain()`, make chunk-only indexing the default (`kind='chunk'`, `content = original_chunk = chunk.content`), with no LLM call to `generate_index_text()`.
   * Keep `index_text=...` only when a caller explicitly passes manual index strings; remove automatic LLM question generation from the default write path.
   * Ensure `documents.created_on` is always populated at write time (defaulting to the retain date when frontmatter has no date) so citations are never `undated`.
 * **Verification:** Unit + Postgres tests confirming `retain()` makes **0 LLM calls**, writes `kind='chunk'` rows with `body_tsv` and `embedding`, and stamps `created_on`.
 
-### Slice 2: Native Postgres Stage 1 — Dual `websearch_to_tsquery` + Reserved-Slot Hybrid + `ts_headline` Snippets (`db/queries.py`, `channels/`)
+### Slice 2: Native Postgres Stage 1 — Dual `websearch_to_tsquery` + Reserved-Slot Hybrid + `ts_headline` Snippets (`db/queries.py`, `channels/`) — done (#80, #83)
 * **Change:**
   * Use the existing stored `body_tsv` (`english`) and the stored `exact_tsv` = `word_vector('simple', original_chunk)` (migration `0020`, with its own GIN index; the same rule `memory_items_keyword_gin` of migration `0018` indexes) with **`websearch_to_tsquery('english', query)`** and **`websearch_to_tsquery('simple', query)`**.
   * Support `"exact phrase"` adjacency (`<->`, case-insensitive, unstemmed in `simple`), `OR`, and `-exclude` natively.
@@ -88,7 +91,7 @@ Both models and their thresholds are configurable at three levels (per-call over
   4. `exact_snippet` returning verbatim `<<...>>` highlights.
   5. Filter pushdown (`date_from`/`date_to`, `excluded_sources`) with `SET LOCAL hnsw.iterative_scan = relaxed_order`.
 
-### Slice 3: Configurable Cross-Encoder Reranker in Stage 2 (`stages.py`)
+### Slice 3: Configurable Cross-Encoder Reranker in Stage 2 (`stages.py`) — done (#78)
 * **Change:**
   * Add `CrossEncoderReranker` (`stage: "cross_encoder"`) to `prospecta/stages.py` alongside `jev_score` and `sonnet_listwise`.
   * Transport: `openrouter_rerank_transport(api_key=..., url="https://openrouter.ai/api/v1/rerank")` sending `{model, query: "Instruct: ...\nQuery: ...", documents, top_n}` with configurable `model` (`PROSPECTA_RERANKER_MODEL` / `recall_config.rerank.model`, default `qwen/qwen3-reranker-8b`), `timeout_s` (default `2.5s`), and `min_rel_score` (default `0.15`).
@@ -97,7 +100,7 @@ Both models and their thresholds are configurable at three levels (per-call over
   * On any HTTP/timeout error, fall back cleanly to Stage 1's RRF order.
 * **Verification:** Offline transport tests (mock + error fallback + near-duplicate collapse) + one gated live OpenRouter integration check verifying `qwen/qwen3-reranker-8b` and a swapped model name.
 
-### Slice 4: Mode 1 (Automatic Recall for Chats & Tasks) and Mode 2 (Interactive Search & Cited RAG Output) (`memory.py`, `service.py`, `hermes-prospecta`)
+### Slice 4: Mode 1 (Automatic Recall for Chats & Tasks) and Mode 2 (Interactive Search & Cited RAG Output) (`memory.py`, `service.py`, `hermes-prospecta`) — library half done (#81, #85); the `hermes-prospecta` half is slice 6
 * **Change:**
   * **Cited evidence contract (`RecalledMemory` & `format_cited_rag_block`):** Every returned item includes `source`, `created_on` (`YYYY-MM-DD`), `category`/`kind`, `match_kind`, `relevance_score`, `exact_snippet`, and `original_chunk`.
   * **Mode 1A (Conversational automatic recall in `hermes-prospecta`):**
@@ -112,14 +115,14 @@ Both models and their thresholds are configurable at three levels (per-call over
     * `memory.ask()` (Mode 2B interactive RAG) optionally runs Stage 3 (`decision_model` sufficiency gate when `stage3_sufficiency.enabled=True`) and synthesizes a grounded answer with `[1] [source | date]` citations and verbatim snippets.
 * **Verification:** End-to-end tests for Mode 1A (chat turn), Mode 1B (task brief), Mode 2A (direct keyword/phrase search with snippets), and Mode 2B (cited RAG answer).
 
-### Slice 5: Offline Verification on `augur-v2` and `forge-v2` (Read-Only, Before Any Live Switch)
+### Slice 5: Offline Verification on `augur-v2` and `forge-v2` (Read-Only, Before Any Live Switch) — verified read-only
 * **Change:** None to live gateways.
 * **Verification (read-only against the existing database):**
   1. Confirm `augur-v2` and `forge-v2` chunk coverage (Note: `augur-v2` has 9,987 `chunk` items and `forge-v2` has 76,636 `chunk` items already in `memory_items`, alongside the old `question` items; verify 100% of `documents` in both banks have at least one `kind='chunk'` item before ignoring `kind='question'`).
   2. Run a 20-query offline check (exact quotes like `"electric dreams"`, proper names, dates, conversational follow-ups, and technical queries) measuring Stage 1 latency, Stage 2 Qwen latency, citation/snippet formatting, and total time.
   3. Present the 20-query output table to the captain. **Only after your explicit word** do we update `augur-v2` / `forge-v2` `channel_config` & `recall_config` and restart the gateways.
 
-### Slice 6 (Follow-On): Update `rung-memory-prospecta` (and Spire) to Match
+### Slice 6 (Follow-On): Update `rung-memory-prospecta` (and Spire) to Match — pending
 * **Change (`witt3rd/rung-memory-prospecta`):**
   * Bump the pinned `prospecta` dependency to the new hybrid `main`.
   * Wire the Rung MCP memory provider hooks (`recall` before turn, `retain` after turn, and agent-facing search/ask tools) to the new contract:
@@ -128,7 +131,7 @@ Both models and their thresholds are configurable at three levels (per-call over
     * Expose `PROSPECTA_DECISION_MODEL`, `PROSPECTA_RERANKER_MODEL`, and `PROSPECTA_QUERY_WRITER_MODEL` in the provider's container/env config.
 * **Change (Spire):** Apply the same Stage 0 $\rightarrow$ Stage 1 $\rightarrow$ Stage 2 (`qwen/qwen3-reranker-8b`) + cited snippet pattern once Augur and Forge are verified.
 
-### Slice 7 (Follow-On): Full Documentation Overhaul in `witt3rd/prospecta`
+### Slice 7 (Follow-On): Full Documentation Overhaul in `witt3rd/prospecta` — in progress
 * **Why:** The repo carries a lot of legacy documents (the question-indexing spine, the graph/linker/entity era, the map-reduce and bake-off era, BM25 seams, and design history) that describe approaches we no longer run and add confusion.
 * **Change:**
   * Make `docs/postgres-hybrid.md` the one normative architecture, and rewrite `README.md` to describe Prospecta as it is: chunk-only write path, Stage 0 decision gate, native Postgres Stage 1, Stage 2 cross-encoder, optional Stage 3, the cited-evidence contract, and the modes (chat recall, task recall, search, ask), with the configurable models.
@@ -142,5 +145,5 @@ Both models and their thresholds are configurable at three levels (per-call over
 ## 4. What Stays Untouched Until You Say Go
 
 * **Augur and Forge live gateways and configs** stay frozen as they are right now.
-* **Existing database rows** in `augur-v2` and `forge-v2` are not deleted or modified duringSlices 1–4.
+* **Existing database rows** in `augur-v2` and `forge-v2` are not deleted or modified during Slices 1–4.
 * **Spire (`spire-venue`)** waits until Prospecta's implementation and offline verification are complete and you are happy with how Augur and Forge behave.

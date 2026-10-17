@@ -1,24 +1,23 @@
-# Grounded synthesis and `prospecta eval`
+# `prospecta eval`
 
-## Grounded synthesis (opt-in)
+`prospecta eval QUESTIONS.md [--ablate] [--synth] [--judge] [--json] [--depth standard|deep]`
+scores a bank's recall on a questions file and reports latency and cost per stage. Library:
+`prospecta.evaluation` (`load_questions`, `run_eval`, `format_report`).
 
-`recall_synth(message, grounded=True)` replaces the plain RAG step with the
-cited synthesis of the hybrid design (8.8). Evidence: the best chunk of each of
-the notes of the blended recall scoring at least `evidence.min_rel_score` of
-the best, each with its chunks kept by score (see `docs/limits.md`; `evidence_top`
-is an optional per-call note count, `None` by default), or, with `scope=[note names or
-document ids]` that resolves to any number of notes, the whole scope set (one recall, the question as the only query; `scope` defaults to the extracted filter set). The model
-cites `[note name]` for every claim and answers `not in memory` when the
-evidence lacks it. `RAGResult.citations` (`note`, `document_id`, `known`; unknown
-= the model cited a name not in the evidence), `.evidence` and `.synth_call`
-(model, tokens, cost, latency) come back. The synthesis LLM is `Memory(synth_llm=...)`, falling back to the general `llm` (not the rerank LLM); `synth_call['model']` comes only from the `LLMResult` and is `None` when it reports none. The eval report names which LLM ran (`synth_llm` / `general llm`) and its reported model(s), or `unreported`. The citation list is stored in
-`recall_events.citations` (migration 0011, one nullable column). Default
-`recall_synth` is unchanged.
+## What it measures, and what it does not
 
-## `prospecta eval QUESTIONS.md [--ablate] [--synth] [--judge] [--json]`
+It runs each question through the same pipeline as `Memory.search`: the bank's own
+`channel_config` (for a bank created fresh, Stage 1 `hybrid_chunk`) and its `recall_config`
+stages (Stage 2, the cross-encoder). A bank with no channel config (a legacy bank) is scored with
+`prospecta.channels.DEFAULT_CHANNEL_CONFIG` and the report says so.
 
-Library: `prospecta.evaluation` (`load_questions`, `run_eval`, `format_report`).
-Questions file:
+It does **not** run Mode 1 (`expand_and_recall`, the query writer and the gate) or Mode 2B (`ask`):
+there is no measurement of the automatic recall's expansion or of the cited answer here. `--synth`
+runs the legacy grounded synthesis (`recall_synth(grounded=True)`, `docs/legacy.md`), not `ask`.
+Judging Mode 1 ("did the agent have what it needed") is the `ExpandedRecall` record of
+`docs/postgres-hybrid.md`, section 1, point 10, on real prompts.
+
+## Questions file
 
 ```
 ## Q001 | multinote
@@ -28,21 +27,24 @@ gold2: kelly-trip.md
 answer: She said it was too expensive; we stayed at the Harbour Inn.
 ```
 
-The project's `questions.md` format is also read directly: `### Qnnn` blocks with
-`class:`, `question:` (may continue on following lines), `gold:` and optional
-`gold2:` / `answer:` lines (used when the file has `###` blocks and no `##`).
+The project's `questions.md` format is also read directly: `### Qnnn` blocks with `class:`,
+`question:` (may continue on following lines), `gold:` and optional `gold2:` / `answer:` lines
+(used when the file has `###` blocks and no `##`).
 
-`gold` (note names = `documents.source`; folder and `.md` ignored) and the
-optional second gold `gold2` give hit@1, hit@10, MRR and cover@10 each; `answer`
-is for `--judge` (answer-correct by a Sonnet judge). `--ablate` reruns with
-each live channel off, each enabled stage (rerank, gate, reader) off, and each
-registered channel the bank lacks on at weight 1; a channel **earns** its
-weight when removing it costs hit@10, hit@1 or MRR ≥ 0.03 on either gold, or
-cover@10 ≥ 0.03 on the multi-note questions (a channel not yet run **gains** by
-the same margin). The report gives latency and cost per stage (each channel,
-each LLM stage, total). Recall runs through the production path (`_search_channels`: filter extraction,
-promotion, rerank, hop), and a channel or stage error is shown in the report
-(`ERROR xN`). Nothing is written to the bank (no config change, no
-`recall_events` rows from the retrieval runs); `--synth` runs real
-`recall_synth(grounded=True)` and so does log those events. Eval never changes
-channel weights: it tells the owner which to set.
+## Metrics
+
+`gold` (note names = `documents.source`; folder and `.md` ignored) and the optional second gold
+`gold2` give hit@1, hit@10, MRR and cover@10 each; `answer` is for `--judge` (answer-correct by a
+Sonnet judge, with `--synth`).
+
+`--ablate` reruns with each live channel off, each enabled stage (rerank, gate, reader) off, and
+each registered channel the bank lacks on at weight 1; a channel **earns** its weight when
+removing it costs hit@10, hit@1 or MRR >= 0.03 on either gold, or cover@10 >= 0.03 on the
+multi-note questions (a channel not yet run **gains** by the same margin). The channels it tries
+on include the retired ones (`docs/legacy.md`). The report gives latency and cost per stage (each
+channel, each model stage, total), and a channel or stage error is shown in it (`ERROR xN`).
+Nothing is written to the bank (no config change, no `recall_events` rows from the retrieval
+runs); `--synth` runs real `recall_synth(grounded=True)` and so does log those events. Eval never
+changes channel weights: it tells the owner which to set. `--rerank-blend/--no-rerank-blend` and
+`--scope-promote/--no-scope-promote` force the two legacy switches per run;
+`--depth` sets the rerank pool cut for the run (`docs/recall-stages.md`).

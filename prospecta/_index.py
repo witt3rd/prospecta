@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ParserPlugin Protocol (decision-record-1 §addendum 2026-05-19)
+# ParserPlugin Protocol (a caller-supplied parser for a source format; see prospecta/_parser.py)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)

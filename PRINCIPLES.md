@@ -1,147 +1,91 @@
 # Prospecta — Principles
 
-Load-bearing principles for the **prospecta** library and **hermes-prospecta** adapter. Each principle names a failure mode it prevents. ≤15 entries by design — the anchor, not the manual.
+Load-bearing principles for the **prospecta** library. Each names a failure mode it prevents. At most 15 entries by design — the anchor, not the manual. The numbers are stable identifiers (code and docs cite them: `P4`, `P5`, `P14`, `P19`); a retired principle's number is not reused, so the list has gaps. The architecture these principles serve is `docs/postgres-hybrid.md`.
 
 ---
-
-## P1 — Bilateral synthesis is the spine, not a feature
-
-Both write-side (`index_text` frontmatter / generated index_text for indexed-as-line entries) and read-side (`formulate_queries` fan-out) are LLM-mediated. The embedding match happens in question-space, not content-space. Any design that lets the spine become optional, an add-on, or a flag — collapses prospecta back into a worse LlamaIndex.
-
-**Prevents:** drifting into classical content-space RAG and losing the only thing worth building.
 
 ## P2 — Standalone first, plugin second
 
-The library has no Hermes dependency. The Hermes plugin is one of N possible adapters. If a design move requires Hermes-specific knowledge inside the library, that's a code smell: the move belongs in the adapter.
+The library has no agent-framework dependency. A Hermes plugin, a venue server calling the HTTP service, a script or a notebook are adapters over the same `Memory` API. If a design move requires host-specific knowledge inside the library, that is a code smell: the move belongs in the adapter.
 
-**Prevents:** coupling that prevents Cookie, animus, scripts, notebooks, future agents from using prospecta directly.
+**Prevents:** coupling that stops other agents, scripts and notebooks from using prospecta directly.
 
-## P3 — LLM as injected callable, not provider
+## P3 — Models are injected callables, not providers
 
-The library takes a single `llm` callable from the caller. No `openai`, `anthropic`, `litellm` imports. The Hermes adapter passes `ctx.llm.complete`-wrapping; an animus caller passes `invoke_prompt`-wrapping; a notebook passes its own.
+The library takes an `embed` callable and an `llm` callable from the caller; the decision model and the reranker are reached through injected transports (`Memory(jev=...)`, `Memory(rerank_transport=...)`). The library code imports no provider SDK: `prospecta.defaults` (LiteLLM) and `prospecta.embed.*` (OpenAI, sentence-transformers) are the modules that do. (`litellm` is nevertheless listed in the core `dependencies` of `pyproject.toml`, so `pip install prospecta` installs it.)
 
-**Prevents:** locking the library to one provider; turning prospecta into a provider-routing layer it's not.
+**Prevents:** locking the library to one provider; turning prospecta into a provider-routing layer it is not.
 
 ## P4 — Caller wins on every override
 
-`retain(index_text=...)` overrides auto-generation. `recall(queries=[...])` skips formulation. `Memory(corpus_paths=..., embedding_model=...)` overrides defaults. Library auto-generates *if absent*; it never overrides what the caller supplied.
+Per-call arguments beat the bank's `recall_config`, which beats the environment, which beats the default: the reranker, decision and query-writer models, `deadline`, `max_searches`, `date_from` / `date_to`, `excluded_sources`, `depth`. `expand_and_recall(decision=...)` replaces the gate with the caller's own; `retain(index_text=...)` supplies the question items instead of the chunks. The library fills in what is absent and never overrides what the caller supplied.
 
-**Prevents:** the library out-thinking callers who have more context. Animus's `pre_engage` already classifies and may want different formulator prompts — the low-level entry has to be exposed and honored.
+**Prevents:** the library out-thinking callers who have more context (a venue that already decided a message needs no memory; a caller that knows the period it means).
 
-## P5 — Full content, no truncation (from animus CODING.md)
+## P5 — Full content, no truncation
 
-`SearchResult → RetrievedChunk → RAGResult → RecalledMemory` carries content through unfiltered. The library does not pre-judge what's "needed." The caller decides what to use. No "we'll return the first 200 chars."
+The note is stored verbatim (`documents.original_text`); a chunk reaches the caller whole (`RecalledMemory.original_chunk`) and goes whole to the reranker. The library does not pre-judge what is "needed": no "first 200 characters". The only clip is a physical provider limit, and then the full untruncated text is logged in a warning (`docs/limits.md`).
 
-**Prevents:** load-bearing context being thrown away at API boundaries; debugging by spelunking lost data.
+**Prevents:** load-bearing context thrown away at API boundaries; debugging by spelunking lost data.
 
-## P6 — Let the LLM cook (from animus CODING.md)
+## P7 — One write path, deterministic
 
-Where prospecta delegates judgment to an LLM — index_text generation, query formulation, RAG synthesis, episode summarization-if-indexable — Python orchestrates and routes; Python does not heuristic the LLM's job. No regex parsing where a prompt suffices. No keyword filters where an LLM-decision belongs.
+`retain` is the primary write path: it cuts the note into chunks, embeds them and writes the rows, in one transaction, with no model call. The background sweeper is the drift safety net for files that change outside the library; both write chunk rows. Writing the same content under the same source replaces its items; the same content under another source is an error, not a silent re-bind (`docs/schema.md`).
 
-**Prevents:** brittle heuristics rotting in place; subtle bias from rule-based content judgment.
+**Prevents:** a write that costs a model call and can fail or drift; two different "what gets indexed" implementations.
 
-## P7 — Single write path through `index_single_file`
+## P8 — Postgres + pgvector is the substrate; the cost is owned, not hidden
 
-`retain` writes the file AND upserts to chroma. The background sweeper also calls `index_single_file` on changed paths. Two callers, one function. The sweeper is the drift safety net; `retain` is the primary write path. They do not diverge.
+The substrate is Postgres with pgvector 0.8 or newer. It buys HNSW, full-text search, one-query hybrid candidate generation, multi-tenancy by bank and transactional writes. The cost is that the client must reach a running Postgres before the first `search`. We do not pretend that cost away: a one-command bootstrap (`prospecta init` brings up the compose file, migrates and creates the default bank), a bank that needs no configuration, and a quickstart of three commands. The trade is named in `docs/deployment.md`, not buried.
 
-**Prevents:** code paths that drift apart, retain-then-no-search-for-24h surprise, two different "what gets indexed" implementations.
+**Prevents:** drifting back toward embedded-store "convenience" that would forfeit the substrate; and the opposite failure, a powerful library nobody can stand up in five minutes.
 
-## P8 — Postgres+pgvector is the substrate; the cost is owned, not hidden
+## P11 — Tests over prose specifications
 
-The substrate is Postgres + pgvector (locked in `decision-record-1.md`). This buys HNSW + FTS + RRF + multi-tenancy + transactional writes — capabilities embedded chroma cannot match for the production case. The cost is that the client must reach a running Postgres before first `recall`.
+The library API is locked by tests, not docstrings. The public surface — `retain`, `search`, `recall`, `ask`, `expand_and_recall`, `recall_for_task`, `index_directory`, the sweeper, the service — has end-to-end tests against a real Postgres with pgvector (a testcontainer, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`). The docs are checked the same way where they can be: a test verifies every relative link and every doc path a source file cites.
 
-We do **not** pretend that cost away. We compensate for it: a one-command bootstrap (`prospecta init` → docker-compose + migrate + default-bank in one shot), sane defaults at every layer, and a README quickstart that is three lines after `init`. The trade is named in the docs, not buried.
+**Prevents:** API drift, "we changed the return shape and forgot three callers", confident-sounding docs that do not match code.
 
-**Prevents:** drift back toward embedded-chroma "convenience" that would forfeit the substrate; AND the opposite failure — shipping a powerful library nobody can stand up in under five minutes.
+## P14 — The background sweeper is the safety net, not the primary path
 
-## P9 — Hermes plugin is a thin adapter, not a fork
+The sweeper handles drift (files added, modified or deleted outside the library). It does not handle the hot path: `retain` does. Its cadence is conservative (default 24 h, configurable) and a sweeper failure must not block the hot path.
 
-`hermes-prospecta`'s `__init__.py` constructs `Memory`, delegates every method, owns nothing of substance. Plugin LOC budget: ~300-500 LOC including CLI. If the plugin grows beyond that, the library is missing a feature — push it down.
-
-**Prevents:** the plugin reimplementing library logic for Hermes-flavored reasons; divergence between standalone and plugin behavior.
-
-## P10 — Surface adjacent mechanisms; don't reinvent them
-
-If hermes-agent ships a way to do something the plugin needs — credential pool, vision routing, structured JSON, async — use it via `ctx.llm` / `ctx`. Don't reimplement. Animus's existing patterns that fit prospecta's scope (chunker, ignore, parser) port as-is rather than getting rewritten.
-
-**Prevents:** parallel-build; the plugin shipping its own provider client because the integrator missed `ctx.llm`.
-
-## P11 — Tests over prose specifications (from animus CODING.md)
-
-Library API is locked by tests, not by docstrings. Public surface — `retain`, `recall`, `recall_synth`, `search`, `formulate_queries`, `index_directory`, sweeper lifecycle — has end-to-end tests with a real chroma instance (embedded, ephemeral dir). Plugin has integration tests against `MemoryManager` like `tests/agent/test_memory_plugin_e2e.py`.
-
-**Prevents:** API drift, "we changed the return shape and forgot to update three callers," confident-sounding docs that don't match code.
-
-## P12 — Honest config surface
-
-`get_config_schema()` returns ≤6 fields for `hermes memory setup`. Anything else lives in a `prospecta.json` at `hermes_home`. Library defaults are sane; setup wizard never asks 12 questions.
-
-**Prevents:** setup-wizard fatigue; users abandoning the plugin because configuration felt heavyweight.
-
-## P13 — Prompts live with the library, are overridable by the caller
-
-The three load-bearing prompts (`rag-synthesize`, `formulate-queries`, `log-index` / `generate-index-text`) ship inside the package at `prospecta/prompts/`. They're loaded by default. Callers can override per-call (animus, who has refined prompts already, will). Adding a fourth prompt requires a design reason; the four-prompt surface is intentionally small.
-
-**Prevents:** prompt sprawl; callers having to fork the library to change prompt language.
-
-## P14 — Background sweeper is the safety net, not the primary path
-
-The sweeper handles drift (files added/modified/deleted outside the library). It does NOT handle the hot path — `retain` does that directly via `index_single_file`. Sweeper cadence is conservative (default 24h, configurable). Sweeper failure must not block the hot path.
-
-**Prevents:** waiting-on-sweeper latency in the agent's recall; sweeper-down meaning new retains aren't searchable.
-
-## P15 — Spine is documented in the README
-
-Prospecta's README leads with bilateral synthesis. It says *this is what makes us different from LlamaIndex / Khoj / mem0*. Not buried in §4 of an architecture doc. The pattern is the value proposition; the implementation is in service of it.
-
-**Prevents:** the project being mistaken for "yet another markdown indexer" by drive-by readers; contributors not internalizing why the LLM calls on the write side matter.
+**Prevents:** waiting-on-sweeper latency in the agent's recall; "sweeper down" meaning new retains are not searchable.
 
 ## P16 — Client lift is a first-class design surface
 
-Every change that touches the path from `pip install` to first successful `recall` answers one question: *does this add a step?* If yes, it justifies the step or compensates for it (default, wizard, one-command bootstrap, env-var fallback). The "steps to first recall" count is a tracked number, not a side effect.
+Every change that touches the path from `pip install` to the first successful `search` answers one question: *does this add a step?* If yes, it justifies the step or compensates for it (a default, a one-command bootstrap, an environment fallback). The step count is a tracked number: `prospecta init`, `prospecta retain ...`, `prospecta search ...`. A bank created fresh runs the whole architecture without configuration, so there is no fourth step.
 
-Concretely: substrate-up, migrate, bank-create, embedder-config, llm-config, first `retain`, first `recall` are the seven sites where lift accumulates. The library and CLI work together to keep the *user-visible* step count at three or fewer for the happy path. Power users get the explicit surface; first-time users get `prospecta init && prospecta retain ... && prospecta recall ...`.
+**Prevents:** the substrate's power being inaccessible because the on-ramp is six manual steps; the plugin shipping convenience the library lacks.
 
-**Prevents:** the substrate's real power being inaccessible because the on-ramp is six manual steps; "I'll try it tomorrow" becoming "I never tried it"; the plugin shipping convenience the library lacks (which would violate P9).
+## P17 — Capable defaults ship as an extras module
 
-## P17 — Capable defaults ship as an extras module, not as core dependencies
+Provider code lives in `prospecta.defaults` (`pip install 'prospecta[defaults]'`: LiteLLM, `make_default_embedder()`, `make_default_llm()`) and `prospecta.embed.*` (`[embedder]`, `[embed-openai]`, `[embed-openai-compatible]`). They read environment variables (`OPENAI_API_KEY`, `PROSPECTA_EMBED_MODEL`, `PROSPECTA_EMBEDDER`) and return callables that satisfy the injection contract; callers that pass their own `embed=` / `llm=` always win (P4). The pattern is "capable defaults, bring your own API key, the caller can always override the abstraction."
 
-The core library has zero provider imports (P3 enforces the injection contract). Capable defaults live in `prospecta.defaults`, installed via `pip install prospecta[defaults]`, which pulls in LiteLLM and exposes `make_default_embedder()` and `make_default_llm()`. These factories read env vars (`OPENAI_API_KEY`, `PROSPECTA_EMBED_MODEL`, `PROSPECTA_LLM_MODEL`) and return callables that conform to the injection contract. Callers that supply their own `embed=` / `llm=` always win (P4).
-
-The pattern is **"capable defaults, bring your own API key, caller can always override the abstraction."** It serves three audiences with one architecture:
-
-| Audience | Embed | LLM |
-|---|---|---|
-| Notebook / script user | `prospecta.defaults` | `prospecta.defaults` |
-| Hermes plugin | `prospecta.defaults` | `ctx.llm.complete` (host-provided, free) |
-| Animus / Cookie / advanced caller | own embedder | own LLM router |
-
-The Hermes plugin case is load-bearing in this design: `ctx.llm` covers the LLM half of the spine without any provider deps in the plugin or library, but it does not cover embeddings — so `prospecta.defaults` exists *specifically* to fill that gap cleanly without forcing core to import LiteLLM.
-
-**Prevents:** core dependency creep ("just one little import"); alternately, no-defaults rigidity that forces every caller — including the Hermes plugin — to hand-roll provider clients; and the plugin growing its own embedding routing in violation of P9.
-
-## P18 — Hybrid retrieval is the spine's safety net along two axes
-
-The hybrid retrieval is the spine's safety net along **two distinct axes**. v0.1 ships both axes honestly via three-channel RRF fusion (semantic + lexical_content + lexical_body).
-
-1. **Phrasing-drift rescue (within the indexed string).** When the embedder misses on minor phrasing drift (plurals/singulars, derivational forms), the embedded `index_text` no longer matches the query's vector shape. Postgres stemming via `to_tsvector('english', content)` (the `content_tsv` channel) catches the overlap on the same indexed string.
-
-2. **Body-fallback rescue (across channels).** When the LLM-generated `index_text` drifts semantically AND lexically from the query (the worst case: questions phrased so differently they share no terms with the query), the previous two channels both go dark — the embedder misses on shape, and `content_tsv` has no lexical overlap. The body channel (`body_tsv` over `original_chunk`) still surfaces the document via a full-text match (`ts_rank_cd`, all query terms must match) on the source text. Note this is oversold on natural-language questions: `websearch_to_tsquery` requires every term, so the body channel returns anything for few questions (34 of 100 measured, hit@10 0.09).
-
-The spine (P1) is the value proposition; the hybrid retrieval ensures the value still lands when the spine half-fails. Distinct from P14 (sweeper as drift safety net for filesystem changes): P14 protects against substrate drift between writes; P18 protects against retrieval drift between question-shape and query-shape at recall time. Different mechanisms, different failure modes, both load-bearing.
-
-**Prevents:** silent retrieval failure when LLM-generated `index_text` is wrong-shape; the spine being all-or-nothing rather than gracefully degrading; the safety net being marketed but not actually present in the substrate.
+**Prevents:** provider code spreading into the core ("just one little import"); and the opposite, no defaults, which forces every caller to hand-roll a provider client.
 
 ## P19 — Observability is durable, not ephemeral
 
-Every event a user might want to inspect after the fact is persisted in Postgres event tables, not flushed to stderr. The six event types (`retain_events`, `recall_events`, `formulate_events`, `llm_calls`, `sweep_passes`, `sweeper_state`) are append-only — except `sweeper_state` which is upsert — and carry the full payload, not summaries: verbatim user messages, verbatim LLM JSON expansions, verbatim generated `index_text`, verbatim prompts and responses, the actual chunks that surfaced with their per-channel scores, the actual synthesis text.
+Every event a user might want to inspect after the fact is persisted in Postgres, not flushed to stderr: `retain_events`, `recall_events` with `recall_event_candidates`, `llm_calls` (every model call with its purpose, model, tokens, cost, and the verbatim prompt and response), `formulate_events` (the legacy question path), `sweep_passes` and `sweeper_state`. The tables are append-only except `sweeper_state`, and they carry the payload, not summaries: the notes that surfaced with each channel's rank and score, the stage records (the rerank's cuts and fallback reason), the accounting.
 
-The tracer fan-out (P3-shaped: `Tracer` is an injected Protocol, `PostgresSink` is the default; callers can supply `NoOpTracer`, `RecordingTracer`, `CompositeTracer`, or their own) means the persistence is one consumer of the event stream, not the only one. But the *default* must be durable. Logs to stderr are forgotten as soon as the agent's session ends; the questions an operator or a user will ask — *what did the agent retain last week? which chunks surfaced for that recall? did the formulate step fall back to identity on a malformed LLM response?* — only have honest answers if the record outlasts the process.
+The tracer fan-out (`Tracer` is an injected Protocol, `PostgresSink` the default; callers can supply `NoOpTracer`, `RecordingTracer`, `CompositeTracer` or their own) means persistence is one consumer of the event stream, not the only one, but the *default* must be durable. When a feature produces a load-bearing event, the default action is to **add a column** to the event table (or a new table), not to log a line. Logs are for transient breadcrumbs.
 
-Concretely, this means: when adding a feature that produces a load-bearing event, the default action is **add a column** to the relevant event table (or a new table), not **log a line**. Logs are for transient operator-facing breadcrumbs (warnings, performance hints); the durable trace is for the questions that arrive later.
+**Prevents:** "what just happened" being unanswerable once the session ends; the inspection surface drifting from the architecture because nobody touched the documented schema when shipping a feature.
 
-**Prevents:** the system being inspectable only via live attached debuggers; "what just happened" being an unanswerable question once the session ends; debugging by spelunking ephemeral logs that may or may not have rotated; the inspection surface drifting from the architecture surface because nobody touched the documented schema when shipping a new feature.
+## P20 — The chunk is the unit
 
----
+What is stored is the note's own text in chunks, embedded as written and indexed lexically twice (stemmed and exact). There is no model-written proxy for a note at write time. A match is a match on what the note says, and the citation quotes it.
 
-*Authored 2026-05-18 by Forge ⚒️ as PRINCIPLES.md for the prospecta ralplan. Distilled from the assessment doc (`~/forge/wiki/2026-05-18_memory-library-and-plugin-assessment.md`) and animus's CODING.md operating philosophy.*
+**Prevents:** retrieval depending on what a model once guessed a note would be asked; a write path whose quality moves with a model version.
+
+## P21 — Every output is cited
+
+Neither search nor automatic recall nor an answer returns unattributed prose: each hit says where it is from (`source`), when (`created_on`), what kind of record it is, why it matched (`match_kind`, the `exact_snippet`) and how relevant it is; an answer cites `[n]` for every statement and each `[n]` ties to a verbatim sentence of the chunk. Recalled material is quoted, never instructions.
+
+**Prevents:** an agent acting on a memory it cannot trace; unverifiable answers; injected text in a note steering the agent.
+
+## P22 — Recall degrades, it never raises into the caller
+
+A reranker that times out, a gate that fails, a writer that returns garbage, a search that runs late: each degrades (the Stage 1 order stands, the message goes through, one search with the prompt itself, the late search is dropped) and says so in the result (`fallbacks`, `fallback_reason`, the event). A provider failure in `expand_and_recall` comes back as an error field, not an exception (a call with invalid arguments still raises `ValueError`); a failed Stage 3 gate never blocks the answer. The cost of one unremembered turn is larger than the cost of one degraded recall.
+
+**Prevents:** an optional stage taking down the agent's turn; failures that leave no record of why the result was worse.

@@ -10,10 +10,10 @@ reads the contract below.
 Set `PROSPECTA_SCHEMA` (or `Memory(schema=...)`, `run_migrations(url, schema=...)`).
 Every table, index, function and the `prospecta_schema_version` table live in
 that one schema; every connection runs with `search_path = "<schema>", public`.
-Nothing is created elsewhere. The `vector` extension (and `pg_search`, if you
-want the BM25 index) must already be installed by the database owner; in this
-mode Prospecta never creates an extension and migration 0012 skips `pg_search`
-unless it is installed.
+Nothing is created elsewhere. The `vector` extension must already be installed by
+the database owner; in this mode Prospecta never creates an extension (migration
+0012's optional `pg_search` index, a legacy channel's, is skipped unless that
+extension is installed).
 
 - `run_migrations` creates the schema when missing (an existing one is left alone).
 - A configuration check runs before any start (`Memory(...)`, migrations,
@@ -58,28 +58,23 @@ Until then lookups use the old key (`/coverage` lists the record as `stale`).
 
 The service refuses to start if a view is missing, lacks a column or is not readable.
 
-What Prospecta keeps: its own derived items only (chunks, anticipated
-questions, embeddings, entities, links), each stamped with
+What Prospecta keeps: its own derived items only (chunks and their embeddings;
+anticipated questions only when a library caller asks for them), each stamped with
 `kind`, `record_id`, `revision` (plus `person`, `project`, `audience_key`,
 `created_date` for filters), and one `source_refs` row per record
 (kind, record id, revision, filter columns; **no text**). The `documents` row
 that anchors the items has `original_text = ''`. Chunks are derived items and do
 contain pieces of the text, as they do for any Prospecta index; they are
-rebuilt from the view and removed with the record. The entity linker reads
-its text back from those chunks.
-
-Limits: the map-reduce recall (`recall_mapreduce`) scans `documents.original_text`,
-so in-place records are not covered by it.
+rebuilt from the view and removed with the record.
 
 ### Allowed-audience filter
 
 `allowed_audience_keys` (list of strings) and `allowed_projects` (list of
 strings) are optional. When given, a record whose audience key (project) is not
-in the list is never a candidate in any channel (keyword, meaning, questions,
-links, graph): it cannot appear in a result, a rerank input or a follow-up
-question. The condition is part of each channel's query, applied before
-ranking, and the graph walk never reaches or crosses a disallowed item. An
-empty list allows nothing. A record with an empty or missing audience key
+in the list is never a candidate: it cannot appear in a result or a rerank
+input. The condition is part of each retriever's query in Stage 1, applied
+before its slots are cut (the legacy channels apply it too). An empty list
+allows nothing. A record with an empty or missing audience key
 (project) is visible only if the list contains `""`. When a list is absent
 there is no restriction (unchanged behavior). In the library the same filter is
 `metadata_filter={"_allow": {"audience_key": [...], "project": [...]}}`.
@@ -108,7 +103,11 @@ All idempotent; they take the record's reference, never its text.
 |---|---|---|
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score","created_on","match_kind","exact_snippet","relevance_score"}]}]}` |
-| `POST /lookup` (a task brief) | `{"task":{"title","ask","done"?,"project"?}, "limit":10, ...the optional fields above}` | `{"task":{"queries":[...], "context":"## Recalled Project Context ...", "results":[{"source","created_on","kind","record_id","revision","project","match_kind","exact_snippet","relevance_score"}]}}` |
+| `POST /lookup` (a task brief) | `{"task":{"title","ask","done"?,"project"?}, "max_tokens"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` (no `limit`) | `{"task":{"queries":[...], "context":"## Recalled Project Context ...", "searches":[{"query","terms","date_from","date_to"}], "results":[{"source","created_on","kind","record_id","revision","project","match_kind","exact_snippet","relevance_score","found_by"}], "fallbacks":[...], "error":null}}` |
+| `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
+| `POST /remove` | `{"kind","record_id"}` | status |
+| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
+| `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
 
 Every hit says where and when it is from and why it matched (the cited-evidence contract of
 `docs/postgres-hybrid.md`): `created_on` (the record's date, `YYYY-MM-DD`), `match_kind`
@@ -116,24 +115,32 @@ Every hit says where and when it is from and why it matched (the cited-evidence 
 context, `<<marked>>`, or null) and `relevance_score` (the cross-encoder's 0..1 score when the bank
 runs stage 2 with it, else the fused `score`). `date_from` / `date_to` (`YYYY-MM-DD`, the record's
 date, inclusive) and `excluded_sources` (document sources to leave out, the anti-echo list) apply
-inside Stage 1 and need the `hybrid_chunk` channel in the bank's config (else 400);
-`reranker_model` / `decision_model` override the stage 2 / Jev model for the call. No stage 0
-gate runs on a lookup. The task form splits the brief into 2 to 4 facet queries (the
-query-writer model), runs each through Stage 1 + Stage 2 and returns one cited context block: the
-task's `project` first, other projects' notes labeled with theirs.
+inside Stage 1 and need the `hybrid_chunk` channel in the bank's config (else 400; every bank created
+fresh has it);
+`reranker_model` / `decision_model` override the stage 2 / decision model for the call.
 
-`/lookup` accepts `"explain": true` (default false; must be a boolean). The default
-response is otherwise unchanged. With it, each question's object gains `channels_run` (channels
+**The questions form** runs each question through Stage 1 + Stage 2 (no Stage 0 gate) and returns the
+best hit per record.
+
+**The task form** is Mode 1 (`docs/postgres-hybrid.md`, section 1): `Memory.recall_for_task`. The
+query writer expands the brief into searches (up to `expansion.max_searches`, 20), every search runs
+through Stage 1 + Stage 2 in parallel against its own query inside the deadline (7 s), and one cited
+context block comes back: the task's `project` first, other projects' notes labeled with theirs.
+`searches` says what ran (`query`, verbatim `terms`, the period), `results` the items of the block
+with `found_by` (the searches that found each: their numbers in the block), `fallbacks` every
+degraded step and `error` a failure that stopped the recall (the call itself still answers 200). The
+block is sized by relevance, not by count, so the task form takes **no `limit`** (400);
+`max_tokens` (default 0: off) is only a safety valve. The task is never gated and is recorded
+(`recall_events`, `llm_calls`).
+
+`/lookup` accepts `"explain": true` (default false; must be a boolean) on the questions form. The
+default response is otherwise unchanged. With it, each question's object gains `channels_run` (channels
 that ran and did not fail) and `channels_failed` (`[{"channel","reason"}]`, a reason in
 words, starting `failed:` for an error or `skipped:` for a channel disabled in the bank's
 config), and each hit gains `channels`: `[{"channel","rank","score","weight"}]` for every
 channel that returned it (rank within the channel, the channel's raw score, the fusion
-weight applied). Banks without a channel config use the fixed legacy fusion: `channels_run`
+weight applied). A legacy bank (no channel config) uses the fixed legacy fusion: `channels_run`
 names its three channels and a hit's `rank` and `weight` are null.
-| `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
-| `POST /remove` | `{"kind","record_id"}` | status |
-| `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
-| `GET /coverage?kind=&project=` | | `{"coverage":[...]}` |
 
 ### Reconcile
 

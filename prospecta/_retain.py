@@ -1,6 +1,6 @@
 """Bilateral-spine write path: Memory.retain() implementation.
 
-Replace-on-source-match per schema.md §6:
+Replace-on-source-match (docs/schema.md, "Re-retain"):
   - Same content_hash + same source → REPLACE: keep documents row, delete
     existing memory_items, regenerate fresh memory_items.
   - Same content_hash + DIFFERENT source → raise DocumentSourceConflictError.
@@ -64,8 +64,6 @@ def retain(
     child_chunks: bool = False,
 ) -> str:
     """Write-side bilateral spine. Returns document_id (str UUID).
-
-    See plan-v2.md §3.4 for the canonical signature & semantics.
 
     Default: the note is written as kind='chunk' items of at most 1,000 chars
     at paragraph boundaries (small overlap), each carrying the parent
@@ -182,7 +180,7 @@ def retain(
             logger.exception("tracer raised on llm_call (index_text); ignoring")
 
     # ------------------------------------------------------------------
-    # Re-retain check (schema.md §6).
+    # Re-retain check (docs/schema.md, "Re-retain").
     # ------------------------------------------------------------------
     with memory._pool.connection() as conn:
         with conn.cursor() as cur:

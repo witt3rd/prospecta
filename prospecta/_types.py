@@ -1,7 +1,6 @@
 """Public type definitions for prospecta.
 
 All Protocols and dataclasses defined here are the public API surface.
-See plan-v2.md §3.4 for the canonical contract.
 """
 from __future__ import annotations
 
@@ -210,7 +209,7 @@ class RAGResult:
 class DocumentSourceConflictError(Exception):
     """Raised when retain() finds same content_hash already stored under a different source.
 
-    Per schema.md §6 (re-retain replace-on-source-match): identical content
+    Per docs/schema.md ("Re-retain", replace-on-source-match): identical content
     (same content_hash) under a *different* caller-supplied source is treated
     as an error rather than silently re-binding the document. The library
     treats `source` as opaque (substrate-opacity); the caller is the only

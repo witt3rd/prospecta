@@ -300,7 +300,7 @@ class Memory:
     def set_link_config(self, config: dict, bank_id: str | None = None) -> None:
         """Set a bank's linker switches (banks.link_config). Keys: `links` (default
         False: write link rows) and `entities` (default True: extract entities and
-        aliases). A key left out keeps its default; see docs/graph-links.md."""
+        aliases). A key left out keeps its default; see docs/legacy.md."""
         import json as _json
 
         from prospecta._linker import validate_link_config
@@ -534,7 +534,7 @@ class Memory:
           - the note is indexed as kind='chunk' items, no LLM call
           - caller-supplied index_text writes those question items instead (P4)
           - generate_questions=True opts in to LLM-written question items
-          - replace-on-source-match (schema.md §6)
+          - replace-on-source-match (docs/schema.md, "Re-retain")
           - DocumentSourceConflictError on hash collision with different source
         """
         from prospecta import _retain
@@ -889,7 +889,7 @@ class Memory:
 
         Returns list[Query]. On parse failure, falls back to
         [Query(text=message)] and records a formulate_events row with
-        parse_fallback=True (schema.md §13). The library NEVER raises
+        parse_fallback=True (docs/observability.md). The library NEVER raises
         on malformed LLM JSON.
         """
         import time as _time
@@ -961,8 +961,6 @@ class Memory:
         depth: "Literal['standard','deep'] | None" = None,
     ) -> RAGResult:
         """Chain: formulate_queries → recall → synthesize. Returns RAGResult.
-
-        See plan-v2.md §3.4 for canonical semantics.
 
         grounded=True (opt-in) swaps the final step for the cited synthesis of
         design 8.8: the evidence is every note of the blended recall scoring

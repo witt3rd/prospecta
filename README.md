@@ -1,57 +1,66 @@
 # Prospecta
 
-**Bilateral prospective synthesis for memory retrieval.** Both ends of the exchange — the writer storing a memory and the reader querying it — speak through the same LLM-mediated abstraction: anticipated questions. The match happens in question-space, not content-space.
+**Long-term memory for agents, on Postgres.** Prospecta stores what an agent (or a person) writes as verbatim notes cut into chunks, finds them again with one native Postgres query plus a cross-encoder, and hands back **cited evidence**: every hit says where it is from, when, why it matched, and quotes the matching words.
 
-When a document is **stored**, an LLM writes the `index_text` that says *"this is what someone would ask to retrieve this."* The embedded vector encodes the anticipated question, not the body of the document.
+- **Write path: chunks, no model.** `retain` cuts a note into chunks of at most 1000 characters, embeds them and writes them, in one transaction. The note is kept verbatim. Nothing calls a model at write time.
+- **Stage 1: native Postgres.** One query runs three retrievers over the chunks, each with its own reserved slots: semantic (pgvector HNSW, top 25), stemmed lexical (top 20) and exact / phrase lexical (top 20; `"quoted phrases"`, identifiers, `v1.14`). They fuse into the top 50 with an `exact_snippet` (`ts_headline`) per hit, with the date window, anti-echo list and scope pushed into every retriever.
+- **Stage 2: cross-encoder.** `qwen/qwen3-reranker-8b` (through OpenRouter) re-scores every candidate against the query with a calibrated 0..1 score; a floor, a near-copy collapse and a timeout fallback to the Stage 1 order keep it safe.
+- **Stage 0 and Stage 3 (optional gates).** A decision model skips acknowledgements and live-state questions before a chat message costs a recall (Stage 0); an optional sufficiency check lets `ask` widen its search once (Stage 3, off by default).
+- **The cited-evidence contract.** `source`, `created_on`, `kind`, `match_kind`, `relevance_score`, `exact_snippet`, and the full chunk, on every hit and in every block handed to a model (quoted material, never instructions).
 
-When a message **arrives**, a second LLM call writes the questions this exchange's memory should service. The query vector also encodes a question, not the user's verbatim text.
+The design is `docs/postgres-hybrid.md`; it is the one normative description.
 
-Two anticipations, written in the same register, by similar prompts, aimed at meeting each other. The embedding similarity is the matching mechanism. The body of the source document is preserved verbatim and indexed via a third channel (Postgres full-text rank over the original text) so that when the LLM-synthesized index_text drifts from the query, the body still rescues the document. The hybrid retrieval is the safety net under a spine that lives in question-space.
+## Three ways to ask
 
-This is **not** classical RAG over chunks. Classical RAG embeds content and hopes the user's question lives nearby in embedding space. Prospecta makes both ends LLM-synthesized in anticipation language, then matches question-to-question — closer to how human memory actually works: you don't remember a transcript, you remember "what was this about."
-
----
+| | mode | entry points | what runs |
+|---|---|---|---|
+| **Mode 1** | automatic recall for a chat message or a task brief | `Memory.expand_and_recall`, `Memory.recall_for_task`, `POST /lookup {"task": ...}` | Stage 0 gate (chat only) → a query writer turns the prompt into N structured searches (`query`, verbatim `terms`, a period) → every search through Stage 1 and Stage 2 in parallel → one merged, cited block, inside a 7 s deadline |
+| **Mode 2A** | direct lookup: keywords, phrases, filters | `Memory.search`, `Memory.recall`, `prospecta search`, `POST /lookup {"questions": ...}` | Stage 1 + Stage 2, no gate, no writer |
+| **Mode 2B** | a question answered from memory | `Memory.ask` | Stage 1 + Stage 2, optional Stage 3, then an answer with `[n]` citations tied to `[source \| date] "verbatim snippet"` |
 
 ## Status
 
-**v0.1, ship-ready.** Test suite: see `tests/` (Postgres-backed tests use testcontainers). Bilateral spine validated empirically (see `tests/integration/test_bilateral_spine.py`). Hybrid safety net validated empirically (see `tests/integration/test_hybrid_safety_net.py`).
+**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]`, a `cross_encoder` rerank and no linker (`prospecta/bank_defaults.py`). Banks created earlier keep the config they stored; the retired recall machinery that still serves them is in `docs/legacy.md`, and is not how new banks run. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
 
-Substrate: Postgres 14+ with the `pgvector` extension. The library has zero provider imports — embedding model and LLM are injected callables; pick your own, or use the LiteLLM-backed defaults.
+Substrate: Postgres with the `pgvector` extension, **0.8 or newer** (Stage 1 uses iterative index scans). Models: an embedder and an `llm` are injected callables; the Stage 2 reranker and the decision model are reached over HTTP with an `OPENROUTER_API_KEY`. Without that key retrieval still works: the Stage 1 order stands instead of a rerank and a chat message is not gated (the result says so).
 
 ---
 
 ## Install
 
 ```bash
-# Core only — bring your own embedder and LLM callable
-pip install prospecta
+pip install prospecta                       # the library and the CLI (this also installs litellm)
 
 # Capable defaults via LiteLLM (any provider it supports)
 pip install 'prospecta[defaults]'
 
-# Or single-provider minimal-deps paths
+# Or single-provider minimal-deps embedders
 pip install 'prospecta[embedder]'                      # local sentence-transformers, no API key
                                                        # (embed-sentence-transformers is a backward-compatible alias)
 pip install 'prospecta[embed-openai]'                  # direct OpenAI HTTP
 pip install 'prospecta[embed-openai-compatible]'       # infinity-emb, vLLM, etc.
 ```
 
+The library code imports no provider SDK; `prospecta.defaults` and `prospecta.embed.*` do (`PRINCIPLES.md`, P3, P17).
+
 ## Quickstart
 
-Three commands from `pip install` to first useful recall:
+Three commands from `pip install` to the first useful recall, once the environment is set (run from a checkout that has the bundled `docker-compose.yml`; `.env.example` has the two database variables):
 
 ```bash
 export OPENAI_API_KEY="sk-..."
-prospecta init                    # docker compose up + migrate + create default bank
+export POSTGRES_PASSWORD=changeme
+export DATABASE_URL="postgresql://prospecta:changeme@localhost:5432/prospecta"
+prospecta init                    # docker compose up + migrate + create the default bank
 prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 prospecta search "Kelly birthday"
 ```
 
-`prospecta init` is idempotent — re-runs detect already-up containers, already-applied migrations, and the already-created default bank. See `docs/deployments/{local-direct,neon,azure}.md` for non-Docker substrates.
+`prospecta init` is idempotent — re-runs detect already-up containers, already-applied migrations, and the already-created default bank. For a database you already have, `prospecta init --no-substrate` with its `DATABASE_URL`. `docs/deployment.md` covers Docker, a local Postgres, Neon and Azure.
 
 ### Offline / keyless retain
 
-The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. `retain` makes no LLM call by default (it indexes the note as chunks), so the write path needs **no API key** with local sentence-transformers embeddings:
+The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. `retain` makes no model call, so the write path needs **no API key** with local sentence-transformers embeddings:
 
 ```bash
 pip install 'prospecta[embedder]'
@@ -63,13 +72,11 @@ prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 `PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (sentence-transformers default `all-MiniLM-L6-v2`).
 
-**One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. With `OPENROUTER_API_KEY` set the CLI also builds the Sonnet-5.5 reranker/synth LLMs, the cross-encoder transport and Jev (`PROSPECTA_JEV=off` opts out). It builds the linker only for a bank whose `link_config` enables links or entities (a bank created fresh stores both off; a bank that stored `{}` keeps entity extraction on) or when `PROSPECTA_LINKER=on`; `PROSPECTA_LINKER=off` never builds it.
+**One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality: a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
-**A new bank runs the hybrid architecture out of the box.** `create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` (Stage 1), `recall_config = {"rerank": {"enabled": true, "stage": "cross_encoder"}}` (Stage 2, `qwen/qwen3-reranker-8b`; model, floor and timeout come from the code defaults and `PROSPECTA_RERANKER_MODEL`, not from the bank) and `link_config = {"links": false, "entities": false}`: no manual bank configuration and no `PROSPECTA_LINKER=off`. Banks that already exist are never changed: a bank that stored `channel_config = []` keeps the legacy three-channel recall described below.
+With `OPENROUTER_API_KEY` set the CLI also builds the Stage 2 rerank transport, the decision model (Jev, System One) and the accounted LLMs of the legacy stages and the synthesis. `PROSPECTA_JEV=off` opts out of Jev. The linker is built only for a bank whose `link_config` enables links or entities (a new bank stores both off) or when `PROSPECTA_LINKER=on`; `PROSPECTA_LINKER=off` never builds it (`docs/legacy.md`).
 
 **Note dates:** every retained note gets `documents.created_on`: its own date (frontmatter `created` / `created_on` / `date`, or the `metadata=` kwarg), else today's date in the zone named by `PROSPECTA_TIMEZONE` (an IANA name such as `America/Los_Angeles`; UTC when unset).
-
-**BM25 index files:** persisted only under `PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25`; with neither set the index stays in memory (nothing is written under `~/.cache`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
 ### Health check
 
@@ -77,285 +84,125 @@ prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 ---
 
-## API at three layers
-
-### Library — embedding-injected, host-agnostic
+## The library
 
 ```python
 from prospecta import Memory
 from prospecta.defaults import make_default_embedder, make_default_llm
+from prospecta.stages import JevScore, openrouter_jev_transport, openrouter_rerank_transport
 
 m = Memory(
     database_url="postgres://localhost:5432/prospecta",
     bank_id="default",
-    embed=make_default_embedder(),   # or your own (list[str]) -> list[list[float]]
-    llm=make_default_llm(),          # or your own (messages, *, json_mode) -> str
+    embed=make_default_embedder(),                    # or your own: (list[str]) -> list[list[float]]
+    llm=make_default_llm(),                           # or your own: (messages, *, json_mode, model=None) -> str
+    jev=JevScore(openrouter_jev_transport()),         # Stage 0 gate and Stage 3 (optional)
+    rerank_transport=openrouter_rerank_transport(),   # Stage 2 (optional)
 )
 
-# Write side: the note is indexed as chunks, no LLM call
-# (generate_questions=True asks the LLM for anticipated questions instead)
-document_id = m.retain(
-    "Kelly was born March 4th 1990. Her birthday party in 2026 was epic.",
-    source="kelly.md",
-    tags=["family", "kelly"],
-)
+m.create_bank("default", embedding_dim=1536)   # once (prospecta init does it); a new bank needs no more configuration
 
-# Read side: LLM generates the multi-query expansion; RAG synthesizes the answer
-result = m.recall_synth("when's kelly's birthday again?")
-print(result.synthesis)              # the answer
-for query, chunks in result.queries_to_results.items():
-    print(query, len(chunks))        # which sub-question retrieved what
-```
+# Write: the note is cut into chunks and embedded; no model call
+m.retain("Kelly was born March 4th 1990. Her birthday party in 2026 was epic.",
+         source="kelly.md", tags=["family", "kelly"], metadata={"created_on": "2026-03-05"})
 
-For SET / discovery questions ("what are Greg's nicknames?") top-k retrieval
-cannot be complete. `recall_mapreduce` reads every note tied to the entity
-(`documents.person`, the entity table by name or `aliases`, `metadata_filter`),
-plus alias-text matches that score at least `scan_relevance` x the best
-text hit (a recall net, not a full scan), in batches, extracts the asked facts with a citation each, and merges them into
-one deduplicated cited list. For a hub entity (linked to more than 100 notes) a linked note is kept only when its
-text names the entity or an alias (or `documents.person` matches); notes are mapped best-score first.
-Progress, cost, notes visited and facts found are
-recorded in `recall_events.plan` (mode `mapreduce`).
-
-```python
-res = m.recall_mapreduce("what are Greg's nicknames?", entity="Greg", batch_size=8)
-print(res.synthesis, res.citations)
-```
-
-### Cited recall, task recall and ask (the hybrid architecture)
-
-With the `hybrid_chunk` channel (and, optionally, the cross-encoder stage) every hit is a cited item: `source`,
-`created_on`, `kind`, `match_kind`, `relevance_score`, `exact_snippet` (the matched words, `<<marked>>`) and
-`original_chunk`. See `docs/recall-stages.md` ("Cited evidence and the modes").
-
-```python
+# Mode 2A: search. Phrases, OR, -exclude and identifiers work; the filters apply inside Stage 1
 hits = m.search('"electric dreams" 0x80070005', date_from="2024-01-01", excluded_sources=["turn:41"])
-task = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")
-print(task.block)       # "## Recalled Project Context": cited notes, the project's own first (see the next section)
-res = m.ask("how are deletes handled?", sufficiency=True)   # optional stage 3 gate
-print(res.rendered)     # the answer with [n] markers, then [n] [source | date] "verbatim snippet"
-```
+hits[0].source, hits[0].created_on, hits[0].match_kind, hits[0].relevance_score, hits[0].exact_snippet
 
-### Automatic recall by query expansion (Mode 1: chat messages and tasks)
+# Mode 2B: ask. Every statement carries [n]; optional Stage 3 widens the search once if the evidence falls short
+res = m.ask("how are deletes handled?", sufficiency=True)
+print(res.rendered)       # the answer, then   [n] [source | date] "verbatim supporting snippet"
 
-`Memory.expand_and_recall(prompt, kind="chat" | "task", ...)` is the one entry point for the automatic recall
-of `docs/postgres-hybrid.md` (section 1). It expands the prompt into N structured searches whose job is to find the
-**surrounding context** useful for responding (entities, governing decisions, earlier work, people, periods), runs
-them all through Stage 1 and Stage 2 in parallel, merges the records and returns one cited block. It never raises and
-stays inside a deadline.
-
-```python
+# Mode 1: automatic recall, a chat message or a task brief
 got = m.expand_and_recall("do you remember who I saw it with?", agent_last="You mentioned the Spring show.",
-                          excluded_sources=["turn:41", "turn:42"], date_from="2024-01-01")        # a chat message
-got = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")   # a task
-print(got.block)       # the searches that ran, "cite [n]", then the numbered items (source, date, kind, match, snippet)
-got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting   # what ran, what was found, what degraded, ms, tokens and cost
+                          excluded_sources=["turn:41", "turn:42"], date_from="2024-01-01")
+got = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")
+print(got.block)          # the searches that ran, "cite [n]", then the numbered items
+got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting    # what ran, what was found, what degraded, ms, tokens and cost
 ```
 
-1. **Gate** (chat only; a task is never gated): `needs_memory` from the decision model (default `typesafe/jev-1.14`, the
-   Memory's `jev=` transport) skips acknowledgements, go-aheads, greetings and live-state questions (at or above 0.5 it
-   goes on). `decision=callable` injects the caller's own (a number, a bool, a `GateDecision`); `gate=False` switches it off.
-2. **Writer** (the Memory's `llm`; model `query_writer_model=`, else `recall_config.models.query_writer_model`, else
-   `PROSPECTA_QUERY_WRITER_MODEL`, else `openrouter/google/gemini-2.5-flash-lite`): about 3 searches for a short message,
-   up to 10 to 20 for an elaborate one, **at most `max_searches` (20)**. Each search is `{query, terms, date_from,
-   date_to}`: the `query` feeds the semantic and stemmed retrievers and the reranker; the `terms` (**only** proper names,
-   identifiers, versions, paths, error codes and "quoted phrases", verbatim from the prompt, never common words: a filter
-   drops a plain English word the prompt did not quote) feed the exact retriever; a period is pushed into Stage 1. A name,
-   identifier or quoted phrase of the prompt that no search carries is put back into the first one. A bad reply falls back
-   to one search: the prompt itself. If the filter drops every search, nothing is asked (a skipped, empty result).
-3. **Stage 1 and 2 in parallel**, each search against its own query, with the same filters (`metadata_filter`,
-   `excluded_sources`, the search's own period else `date_from` / `date_to`); at most `max_concurrency` (8, never more
-   than the connection pool) searches are in the database at once, and a search's rerank holds no connection.
-4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed (by wording, then by meaning:
-   chunk-embedding cosine of 0.90 or more; the kept record lists what collapsed into it), best first, a task's own
-   project first and other projects labeled; **sized by relevance, never by a count** (`max_tokens`, default 0 = off, is
-   only a safety valve).
+**Mode 1 in five lines** (`docs/postgres-hybrid.md`, section 1, is the design; `docs/recall-stages.md` has every setting):
 
-| setting | call argument | bank `recall_config` | default |
-|---|---|---|---|
-| deadline for everything | `deadline=` | `expansion.deadline_s` | 7 s |
-| hard maximum of searches | `max_searches=` | `expansion.max_searches` | 20 |
-| searches in the database at once | `max_concurrency=` | `expansion.max_concurrency` | 8 (and the pool size) |
-| token valve | `max_tokens=` | `expansion.max_tokens` | 0 (off) |
-| Stage 1 order cut when no rerank | | `expansion.fallback_min_rel` | 0.5 x the best |
-| near-copies collapsed by meaning (embedding cosine at or above) | `near_copy_cosine=` | `expansion.near_copy_cosine` (env `PROSPECTA_NEAR_COPY_COSINE`) | 0.90 |
-| gate threshold / switch | `needs_memory_threshold=`, `gate=` | `stage0_gate.needs_memory_threshold`, `.enabled` | 0.5 / on |
-| score floor of Stage 2 | `min_score=` | `rerank.min_score` | 0.15 |
-| models | `query_writer_model=`, `decision_model=`, `reranker_model=` | `models.*`, `rerank.model` | see above |
+1. **Gate** (chat only; a task is never gated): the decision model's `needs_memory` skips acknowledgements, go-aheads, greetings and live-state questions (at or above 0.5 it goes on). `decision=callable` injects your own; `gate=False` switches it off.
+2. **Writer**: about 3 searches for a short message, up to 10 to 20 for an elaborate one, at most `max_searches` (20). Each is `{query, terms, date_from, date_to}`: `query` feeds the semantic and stemmed retrievers and the reranker; `terms` (**only** proper names, identifiers, versions, paths, error codes and "quoted phrases", verbatim from the prompt, never common words: a deterministic filter drops a plain English word the prompt did not quote) feed the exact retriever; a period is pushed into Stage 1. A name, identifier or quoted phrase of the prompt that no search carries is put back into the first one. A bad reply falls back to one search: the prompt itself. If the filter drops every search, nothing is asked (a skipped, empty result).
+3. **Stage 1 and 2 in parallel**, each search against its own query, with the same filters; at most `max_concurrency` (8) searches in the database at once.
+4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed (by wording, then by meaning: chunk-embedding cosine of 0.90 or more; the kept record lists what collapsed into it), best first, a task's own project first; sized by relevance, never by a count.
+5. **Never raises on a provider failure and stays inside the deadline** (7 s): a step that fails or runs late degrades and is named in `fallbacks`.
 
-`recall_for_task` replaced the old 2-4 facet decomposition (the facets, `TaskRecall`, `max_facets` and its `limit` are
-gone); `POST /lookup {"task": ...}` returns the same block plus `searches`, `fallbacks` and `error`, and no longer takes
-`limit`. Calls and one `recall` event are recorded for a task by default (`record=`), not for a chat.
+For the library to run Mode 1 on a bank it needs the bank's `channel_config` to hold `hybrid_chunk` (every new bank does). A bank that stored `[]` is a legacy bank: `expand_and_recall` returns an `error` and the Stage 1 filters raise `ValueError` (`docs/legacy.md`).
 
-### Caller-supplied index_text — the spine override
+Other entry points: `Memory.index_directory` (walks a corpus; frontmatter `created`, `person`, `source_kind` become the note's date, person and kind), `Memory.start_sweeper` (drift safety net), `Memory.set_channel_config` / `set_recall_config` (`docs/recall-stages.md`), `Memory.bank_stats`. The `SourceIndexer` indexes a host's records in place from database views (`docs/source-contract.md`).
 
-When the caller knows the right anticipated questions (or has refined them via a tighter prompt elsewhere), pass them directly. The library uses them verbatim, as the note's question items instead of its chunks (`child_chunks=True` writes both). **Caller wins on every override.**
-
-```python
-m.retain(
-    "Kelly was born March 4th 1990.",
-    source="kelly.md",
-    index_text=[
-        "When was Kelly born?",
-        "What year was Kelly born in?",
-        "Kelly's date of birth?",
-    ],
-)
-```
-
-Same for read-side: pass `formulate_prompt_override=` to replace the default formulate prompt, or `synth_prompt_override=` for the synthesis prompt.
-
-### CLI — full surface
+## The CLI
 
 ```bash
+prospecta init                           # docker compose up + migrate + create the default bank
 prospecta migrate                        # apply pending migrations
-prospecta create-bank --id alice --embedding-dim 384
-prospecta index ./corpus                 # walk a directory; chunk + retain
-prospecta search "query" --mode hybrid   # or semantic / lexical
-prospecta eval questions.md --ablate     # score recall, ablate channels, cost/latency per stage (docs/eval.md)
-prospecta retain "content..." --source X --tags a,b
+prospecta create-bank --id alice --embedding-dim 1536
+prospecta migrate-bank --source-bank alice   # backfill alice-v2 at a new dimension (docs/embedding-migration.md)
+prospecta retain "content..." --source X --tags a,b      # or "@path/to/file"
+prospecta index ./corpus                 # walk a directory; chunk + embed
+prospecta search "query" [--limit N] [--depth standard|deep] [--json]
+prospecta eval questions.md [--ablate]   # score recall; docs/eval.md
+prospecta import hindsight postgres://...   # docs/import-hindsight.md
 prospecta sweep ./corpus --watch         # background sweeper for filesystem drift
-prospecta stats                          # bank/document/event counters
+prospecta stats                          # bank / document / event counters
+prospecta health                         # database + embedder; non-zero if down
 prospecta config                         # show loaded config (passwords redacted)
+prospecta backup FILE / restore FILE     # docs/backup-restore.md
 ```
 
----
+Legacy-bank commands (`link-pass`, `drop-links`, `keyword-index`, `retain --index-text`, `search --mode semantic|lexical`) are in `docs/legacy.md`. The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else `PROSPECTA_BANK`, default `prospecta`).
+
+## The HTTP service
+
+`python -m prospecta.service` (or the `Dockerfile`): stdlib HTTP, JSON.
+
+- `POST /lookup {"questions": [...], "limit": 10, ...}` — Mode 2A for each question: ranked records, each with its citation fields (`created_on`, `match_kind`, `exact_snippet`, `relevance_score`).
+- `POST /lookup {"task": {"title", "ask", "done"?, "project"?}}` — Mode 1: the cited context block plus `searches`, `results`, `fallbacks` and `error`. No `limit`: the block is sized by relevance.
+- `POST /index`, `/remove`, `/reconcile`, `GET /coverage`, `GET /healthz` — in-place indexing of a host's records.
+
+Filters on a lookup: `date_from`, `date_to`, `excluded_sources` (the anti-echo list), `kind`, `project`, `person`, `allowed_audience_keys`, `allowed_projects`; per-call `reranker_model` and `decision_model`. The contract, shared-database mode and every environment variable are in `docs/source-contract.md`.
 
 ## Observability
 
-Every load-bearing event of the bilateral spine is recorded in Postgres event tables — a durable audit trail, not ephemeral stderr. Six tables capture the full flow:
+Every load-bearing event is recorded in Postgres event tables, a durable audit trail rather than ephemeral stderr: `retain_events`, `recall_events` (the queries, the surfaced notes, the per-stage trace with the rerank's cuts and fallback reason, cost and tokens) with `recall_event_candidates`, `llm_calls` (every model call with its purpose, model, tokens, cost and, opt-out, the verbatim prompt and response), `sweep_passes` and `sweeper_state`. `docs/observability.md` is the inspection guide with the `psql` cheat sheet, the tracer, and the opt-outs.
 
-- **`retain_events`** — what was retained, with the verbatim LLM-generated `index_text` (the anticipated questions) when not caller-supplied.
-- **`recall_events`** — what was queried, the formulated sub-questions, the surfaced results (with per-channel scores), and the synthesized answer.
-- **`formulate_events`** — the user's verbatim message, the LLM's JSON expansion, and parse-fallback diagnostics (`error_kind` discriminates `malformed_json` from `schema_mismatch`).
-- **`llm_calls`** — every LLM call's verbatim prompt and response (opt-out via `PostgresSink(persist_llm_text=False)`).
-- **`sweep_passes`** + **`sweeper_state`** — background filesystem sweeper timing and outcomes.
-
-Inspect a session end-to-end with a few SQL queries from `pgcli` or any Postgres client. See [`docs/observability.md`](docs/observability.md) for the inspection guide, the cheat-sheet of queries, custom-tracer patterns, and the opt-outs.
-
-### prospecta-tui — the interactive inspection surface
-
-[`tui/`](tui/README.md) is a Rust + Ratatui terminal UI that makes the durable trace legible without SQL: five tabs covering bank/document browsing, a live event-stream with end-to-end recall/retain thread views, a per-bank health dashboard (24h signals + sweep status), cross-channel search, and a manual retain form. Read paths go direct via `sqlx` (schema-checked at compile time); the retain write path shells out to this CLI so the spine stays library-owned. Install with `cargo install --path tui`; see [`tui/README.md`](tui/README.md) for tabs, keybindings, and the offline-build notes.
+[`tui/`](tui/README.md) is a Rust + Ratatui terminal UI that makes the trace legible without SQL: bank and document browsing, a live event stream with end-to-end thread views, a per-bank health dashboard, lexical search and a manual retain form. Install with `cargo install --path tui`.
 
 ---
 
-## Where prospecta sits in the agent-memory landscape
+## Documentation
 
-There is no one-size-fits-all for agentic memory. Different systems make different bets about what's worth remembering and how to find it later. A quick survey of the 2025-2026 landscape, organized by primary retrieval mechanism. Where [Hermes Agent](https://hermes-agent.nousresearch.com) ships a bundled provider in a category, it's named inline.
-
-**Buffer + summarize** *(e.g., LangChain `ConversationBufferMemory` / `ConversationSummaryMemory`).* A sliding window of recent turns, optionally LLM-compressed when the buffer grows. Cheap, simple, conversation-centric. Hermes's built-in `MEMORY.md` / `USER.md` files cover this lightweight always-in-context need at the platform level. Good fit when "memory" means "the last N exchanges" and recall is implicit.
-
-**Content-space RAG** *(LlamaIndex, Khoj).* Documents are chunked, embedded as-is, and retrieved by embedding the user's verbatim query against the chunk vectors. Excellent composable primitives, broad ecosystem, mature tooling. Works best when query language matches document language closely — technical docs, code search, well-curated knowledge bases.
-
-**Extract-then-store** *(mem0; Hermes-bundled providers: `mem0`, `supermemory`, `retaindb`).* An LLM extracts discrete facts or memories at write time; storage is then retrieved via semantic search, often with reranking. **mem0** is the canonical pattern — server-side fact extraction + dedup. **supermemory** adds profile recall + session-end conversation ingest. **retaindb** adds explicit memory types (preference, fact, event, etc.) and hybrid vector+BM25+rerank. Write-side is LLM-touched; the read-side embeds the query verbatim. Good fit for assistant memory where the unit is "a fact about the user."
-
-**Hierarchical / tiered retrieval** *(Hermes-bundled providers: `byterover`, `openviking`).* Knowledge organized as a tree or filesystem-style hierarchy; retrieval walks the hierarchy with tiered escalation (fuzzy match → semantic → LLM-driven deep search). **byterover** is local-first with optional cloud sync; **openviking** (Volcengine) treats memory as a `viking://` URI namespace with abstract/overview/full read modes. Good fit when memory has inherent structure worth navigating, not just searching.
-
-**Knowledge-graph memory** *(Zep, Graphiti, Cognee; Hermes-bundled provider: `hindsight`).* Entities and relations extracted into a graph, often with temporal awareness. Retrieval blends graph traversal with semantic search. **hindsight** supports three deployment modes (cloud, local-embedded with built-in Postgres, local-external Docker) and adds entity resolution + multi-strategy retrieval on top of the graph. Excellent when relationships between entities are the primary query shape ("who works with whom," "what changed between then and now") and when investment in ontology pays back across many queries.
-
-**Compositional / vector-symbolic memory** *(Hermes-bundled provider: `holographic`).* Holographic Reduced Representations (HRR) — fixed-dimensional vectors that compose via circular convolution, allowing structured-fact storage with trust scoring and entity resolution. Local SQLite + FTS5. Good fit when facts have role-filler structure ("Kelly's mother is Janet"; "the meeting on Tuesday was about pricing") that should compose at recall time rather than being flattened to text.
-
-**User-model dialectic** *(Hermes-bundled provider: `honcho`).* Cross-session user modeling via multi-pass dialectic reasoning. The unit isn't an individual fact, it's the evolving model of who the user is — refined turn-over-turn through bidirectional peer tools and persistent conclusions. Strong fit when the assistant needs to *understand* the user across time, not just retrieve facts about them.
-
-**Hierarchical agent memory** *(MemGPT / Letta).* Tiered memory (core / recall / archival) with the agent itself managing eviction and promotion via tool calls — OS-style memory management for LLMs. Strong fit when memory is mutable working state under agent control, less so when memory is a stable corpus.
-
-**Bilateral prospective synthesis** *(prospecta).* Both ends of the exchange are LLM-mediated in the same register — anticipated questions. The write-side LLM authors `index_text` as "what someone would ask to retrieve this"; the read-side LLM expands the message into the questions the memory should service. The match happens in question-space. A three-channel hybrid index (semantic + content-stem + body-stem, fused via RRF) catches the cases where the spine's anticipations drift from each other.
-
-### Where prospecta is a strong fit
-
-- The corpus is markdown-shaped documents that will be queried in language often quite different from how they were written. (Personal memory; project notes; conversational substrate; anything where the writer and reader weren't thinking the same words.)
-- You can afford an LLM call at both index time AND query time. The cost buys robustness to phrasing drift that content-space RAG can't deliver — and the body channel rescues the document if the LLM mis-anticipates.
-- You want a hot path through your own Postgres (local, Neon, Azure Flexible Server, etc.) rather than a managed service or a graph database.
-- The caller-wins override surface matters: you'll sometimes know the right anticipated questions yourself and want the library to honor that verbatim.
-
-### Where something else is likely better
-
-- **Conversation-as-memory** where the unit is "the last N turns" — Hermes's built-in `MEMORY.md` or LangChain buffer memory is sufficient.
-- **High-volume, low-margin retrieval** where two LLM calls per exchange exceeds the budget — content-space RAG with a good embedder is cheaper.
-- **Cross-session user modeling** where the goal is understanding the user, not retrieving documents — reach for `honcho`.
-- **Entity-relationship queries** that need graph traversal as the primary mechanism — reach for `hindsight`, Zep, or Graphiti.
-- **Role-filler structured facts** that should compose at recall — reach for `holographic`.
-- **Per-user fact storage** with a managed cloud backend — reach for `mem0`, `supermemory`, or `retaindb`.
-- **Sliding agent-state memory** under tool-call eviction — Letta is purpose-built.
-
-Prospecta is the spine + the safety net. Not the universal answer; a specific bet about where document retrieval breaks down (phrasing drift between writer and reader) and what fixes it (matching in question-space, with a body-channel safety net).
-
-### The three retrieval channels
-
-| Channel | What it embeds | What it rescues |
-|---|---|---|
-| Semantic (HNSW over `embedding`) | The anticipated question — LLM-authored at retain time | The default match path. Question-on-question similarity in vector space. |
-| Lexical content (`ts_rank_cd` over `content_tsv`; all query terms must match) | The same anticipated question, stemmed via Postgres `to_tsvector('english', ...)` | Phrasing drift the embedder misses — plurals vs singulars, derivational variants. |
-| Lexical body (`ts_rank_cd` over `body_tsv`; all query terms must match) | The full source body verbatim, stemmed | The hard case: when the LLM-synthesized `index_text` drifts semantically AND lexically from the query, the body channel still surfaces the document. |
-
-Three channels, fused via Reciprocal Rank Fusion (k=60 default, configurable per call). The spine carries when it works; the safety net carries when it doesn't.
-
----
-
-### Configurable channels (v0.2; a new bank stores `[hybrid_chunk]`)
-
-`banks.channel_config` lists a bank's recall channels (a bank created fresh stores `[hybrid_chunk]`; a bank that stored `[]` is a legacy bank), the legacy-path example `prospecta.channels.DEFAULT_CHANNEL_CONFIG` (`dense_chunk` weight 4 over `kind='chunk'` items, `question` weight 1 over `kind='question'` items), plus `graph` (weight 0, silent). `Memory.set_channel_config(config)` sets it. With a non-empty config, hybrid `search`/`recall` runs the channels, fuses them by weighted RRF at document level (k=60, ties by source name) and records the plan, per-channel counts/latency/errors, the fusion and one `recall_event_candidates` row per channel candidate (migration 0007). An empty config keeps the three-channel recall above unchanged. New channels implement `prospecta.channels.Channel` and register in `REGISTRY`.
-
-**Filters and scope (migration 0005).** `documents` carries `created_on`, `person` and `source_kind`, filled at `retain` / directory index from the frontmatter (`created`/`created_on`/`date`, `person`, `source_kind`/`type`; the `metadata=` kwarg wins). With a `meta` channel enabled (weight 3 in the default config), each recall extracts `people[]`, `date_from`, `date_to` and `hard` from the question: one LLM call through the injected `llm` (model `params.extract_model` on the `meta` entry, default `anthropic/claude-sonnet-5.5`, passed as an optional `model=` keyword only if the callable accepts it; people validated against the bank's own `documents.person` values), with a regex baseline (never `hard`) when there is no LLM or its output is unusable. `MetadataScope` returns the notes inside the filter ranked by their best item's dense score. **Opt-in (default off):** the re-sort below only runs with meta param `promote: true`; the scout's V3 re-run showed it regressing hit@1 under score-based pools until it beats the v2 numbers. After fusion and the stages, when the filter is `hard` and `promote` is on, every member of its set gets a score boost of `promote_weight` (meta param, default 1.0) × the top score × the member's cosine; there is no count limit, the boost decides, and the filter never excludes a note. See `docs/limits.md` for every numeric limit.
-
-**Recall regression switches (default OFF).** The 0.7/0.3 rerank blend (`recall_config.rerank.blend.enabled`) and the scope-promotion re-sort (`meta` param `promote`) both regressed hit@1 / hit@10 on the V3 re-run (gold1 0.72/0.96 and gold2 0.85/0.98 with both on, vs 0.86/0.98 and 0.97/1.00 with both off; v2 design: 0.86/0.97 and 0.97/0.99). The code is kept; both are opt-in. `prospecta eval` takes `--rerank-blend/--no-rerank-blend` and `--scope-promote/--no-scope-promote` to force each on or off per run for ablation.
-
-The `graph` channel (links and entities, `Linker`, `JevReader`; migration 0006) ships in the default config at weight 0, and links are off by default: see `docs/graph-links.md`.
-
-**`bm25` channel (opt-in: add `{"name": "bm25", "weight": 1}` to the config; superseded by `hybrid_chunk`).** Real Okapi BM25 (k1=1.5, b=0.75, stemmed, stop words removed, OR semantics, so a natural-language question still matches) over the bank's `kind='chunk'` items, in process: no extension, no database change. The in-process index is **not** the default backend: without a `pg_search` index the channel fails (the recall trace records it, the other channels still answer) instead of rebuilding an in-memory index after every write; opt in with `Bm25Chunks.backend = AutoBm25(fallback=InProcessBm25())`. The per-bank index is persisted as gzip JSON under `$PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25` (in memory when neither is set) and rebuilt automatically whenever the bank's chunk fingerprint (count, newest `created_at`, id hash) changes; it holds postings only, and evidence text is read from the database for the top hits. Memory grows with the corpus (not yet measured on a Forge-sized bank). *Seam, not built:* `prospecta.channels.Bm25Backend` (`search(conn, bank_id, query, n)`); a `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text` ordered by `pdb.score(id)`; hit@10 0.71 against 0.76 for the in-process one in the design measurements) would implement it, but needs the extension on the live Postgres, which is main's decision (design 8.6, migration `0009_bm25_optional`).
-
-**`hybrid_chunk` channel (the default of a bank created fresh; for a bank that stored another config, add `{"name": "hybrid_chunk", "weight": 1}`; the native Postgres Stage 1 of `docs/postgres-hybrid.md`).** One query over the bank's `kind='chunk'` items with three retrievers, each keeping its own reserved slots: semantic (HNSW, top 25), stemmed lexical (`body_tsv`, `english`, top 20) and unstemmed exact / phrase (`simple`, the stored `memory_items.exact_tsv` column and its GIN index of migration 0020, top 20). The question is read by `websearch_to_tsquery`, so `"exact phrase"` (adjacent, case-insensitive, unstemmed), `OR` and `-exclude` work, and identifiers such as `v1.14` or `0x80070005` match whole. **A plain question (no search operator: no straight double quote, no standalone upper-case `OR`, no word led by `-`) is read by the stemmed retriever as the OR of its stemmed words (stop words drop; every word is used, there is no cap), ranked by `ts_rank_cd`, so a natural-language question finds a chunk that shares only some of its words; the exact retriever still ANDs the words as written, and a question with an operator keeps websearch semantics on both retrievers.** The bank, the note-date window (`COALESCE(documents.created_on, created_at::date)`), the anti-echo `excluded_sources` and the metadata / `_allow` filter apply inside all three retrievers before their slots are cut (`RecallState.date_from` / `date_to` / `excluded_sources`, set by the caller). They are fused in SQL (`FULL OUTER JOIN`, top 50) with an RRF fallback score, and a `ts_headline` `exact_snippet` (`<<matches>>`) is computed for those winners when a lexical retriever matched. Params (the plan's `stage1_postgres`): `semantic_limit` 25, `stemmed_limit` 20, `exact_limit` 20, `fused_limit` 50, `hnsw_ef_search` 100. Needs pgvector >= 0.8. **A question with no searchable words (blank, punctuation, only stop words) and a date window is a date-only question: no retriever runs and the question is not embedded; Stage 1 lists the chunks inside the window, newest note first (`created_on`, then the note created last), up to `fused_limit`, with `match_kind` `date`; every other filter still applies. No words and no window is empty.** The exact retriever reads the stored `exact_tsv` vector (migration 0020, which rewrites `memory_items`: see `docs/exact-tsv.md` before applying it to a live bank), so nothing is re-tokenized at query time; ranking a very common word still scores every chunk that holds it (`ts_rank_cd`), a few microseconds per matching chunk.
-
-**`keyword` channel (opt-in: add `{"name": "keyword", "weight": 1}`).** Raw words of the question against the raw `original_chunk` text of every stored item (any kind, so a bank holding only question-kind items is still searched): lower-cased, OR semantics, **no stemming and no stop-word removal** (Postgres `simple` configuration). Stemming only when asked: `"params": {"stemming": true}` (`english`). It is never silently empty over a bank with passages: no shared word is recorded as a `note` on the channel in the recall trace, and a question with no usable word raises (the trace records the error). Unlike `bm25` it has no index: it scans the bank per query.
-
-**Fusion setting (`recall_config.fusion`, default absent = weighted RRF).** `{"method": "floor_union", "floor": 3}` keeps the same fused scores but puts first (in fused order) every document in the top `floor` (default 3) of any live channel (weight > 0), then the rest in fused order, so the one channel that holds the answer is not buried when the others agree on something else. Opt-in; RRF stays the default until a retrieval-only measurement says otherwise. The recall trace records `method` and `floor`.
-
-**Abstention in `prospecta eval`.** Each report shows abstained (retrieval returned nothing; synthesis said "not in memory") together with false abstain (abstained although the question's `gold` note exists), for both retrieval and synthesis. `false abstain` is n/a only when no question has ground truth.
-
-## What's load-bearing
-
-Read `PRINCIPLES.md` for the full set of 18 principles that govern this codebase. The four that matter most for users:
-
-- **P1 — Bilateral synthesis is the spine, not a feature.** Both write-side `index_text` generation and read-side multi-query formulation are LLM-mediated by design. The embedding match happens in question-space. Designs that let the spine become optional collapse prospecta back into a worse LlamaIndex.
-- **P3 — LLM and embedder are injected callables.** The library imports neither openai nor anthropic nor litellm. You inject what you want. `prospecta.defaults` and `prospecta.embed.*` are extras modules that *also* don't ship in core.
-- **P4 — Caller wins on every override.** `retain(index_text=...)` skips the LLM. `recall(queries=[...])` skips formulation. Any prompt can be overridden per-call.
-- **P5 — Full content, no truncation.** `RecalledMemory.content` carries the matched index_text. `RecalledMemory.original_chunk` carries the source body. The library does not pre-judge what the caller will need.
-
----
+| | |
+|---|---|
+| [`docs/postgres-hybrid.md`](docs/postgres-hybrid.md) | **The architecture**: the modes, the stages, the lexical engine, the SQL, the call sequence |
+| [`docs/recall-stages.md`](docs/recall-stages.md) | `channel_config` / `recall_config`: Stage 1 params, Stage 2, the models, Mode 1 settings, Stage 3, depth, the cited-evidence contract |
+| [`docs/schema.md`](docs/schema.md) | the tables, indexes, write semantics and migrations 0001 to 0020 |
+| [`docs/limits.md`](docs/limits.md) | every numeric limit and why it is there |
+| [`docs/observability.md`](docs/observability.md) | the event tables, the `psql` cheat sheet, tracers |
+| [`docs/exact-tsv.md`](docs/exact-tsv.md) | the stored exact vector (migration 0020, which rewrites `memory_items`), its operator runbook, the cost of plain questions |
+| [`docs/deployment.md`](docs/deployment.md) | Docker, local Postgres, Neon, Azure; pgvector 0.8 |
+| [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |
+| [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
+| [`docs/legacy.md`](docs/legacy.md) | the retired recall machinery that existing banks still use |
+| [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
+| [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 
 ## Caveats (v0.1)
 
-Honest about what isn't there yet:
+Honest about what is not there:
 
-- **Sync only.** All `retain` / `recall` / `recall_synth` calls are blocking. Async surface is post-v0.1.
-- **English-only stemming.** The `content_tsv` and `body_tsv` channels use `to_tsvector('english', ...)`. Other languages will lose stemming benefit (semantic + body-raw channels still work).
-- **Embedding-dim change requires bank rebuild.** A bank's `embedding_dim` is fixed at creation. Switching embedder dimensions means a new bank + re-index.
-- **HNSW build cost on large banks.** Postgres builds the per-bank HNSW index incrementally; first-bulk-index can be slow. Configurable via standard pgvector tuning (`m`, `ef_construction`).
-- **Single-language FTS.** No multilingual tsvector support in v0.1.
-- **Reranking.** A bank created fresh reranks with the cross-encoder (`qwen/qwen3-reranker-8b` through OpenRouter; without a rerank transport or on a provider error the Stage 1 order stands). A bank that stored `recall_config = {}` keeps RRF fusion as its order; it can add a Sonnet, Jev or cross-encoder rerank stage: see `docs/recall-stages.md`.
-
----
-
-## Deployment guides
-
-- [`docs/deployments/local-direct.md`](docs/deployments/local-direct.md) — bare Postgres + pgvector locally, no Docker.
-- [`docs/deployments/neon.md`](docs/deployments/neon.md) — Neon serverless Postgres (free tier exists).
-- [`docs/deployments/azure.md`](docs/deployments/azure.md) — Azure Database for PostgreSQL Flexible Server with pgvector.
-
----
-
-## Architecture references
-
-- [`PRINCIPLES.md`](PRINCIPLES.md) — 18 load-bearing principles.
-- [`docs/design/prospecta/schema.md`](docs/design/prospecta/schema.md) — Postgres DDL + RRF SQL canonical.
-- [`docs/design/prospecta/decision-record-1.md`](docs/design/prospecta/decision-record-1.md) — locked architectural decisions.
-
----
+- **Sync only.** All `retain` / `search` / `ask` calls block; Mode 1 runs its searches on threads inside one call. An async surface is post-v0.1.
+- **English-only stemming.** The stemmed retriever uses `to_tsvector('english', ...)`; the exact retriever (unstemmed `simple`) and the semantic retriever are language-neutral.
+- **pgvector 0.8 or newer for `hybrid_chunk`.** A bank on an older pgvector can only run the legacy path.
+- **Embedding-dim change requires a new bank** (`prospecta migrate-bank`).
+- **HNSW build cost on large banks.** Each bank has three partial HNSW indexes; the first bulk index can be slow.
+- **A very long plain question over common words is slow** in the stemmed retriever (seconds at 20 common words on a 73,000-chunk bank): measured in `docs/exact-tsv.md`; Mode 1's per-search `query` is short.
+- **Stage 2 and the gates need a key.** With no rerank transport the Stage 1 order stands; with no decision transport there is no gate. Both are recorded in the result.
+- **Migration 0020 rewrites `memory_items`** under an `ACCESS EXCLUSIVE` lock: read `docs/exact-tsv.md` before upgrading a database that holds a bank.
 
 ## License
 
 See `LICENSE`. ⚒️
-
-## Shared database, source views, service
-
-Prospecta can run inside a database another application owns (one schema), index that application's records in place from views, and serve lookups over HTTP. See [docs/source-contract.md](docs/source-contract.md).
