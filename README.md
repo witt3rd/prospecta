@@ -160,13 +160,16 @@ got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting   # what 
 2. **Writer** (the Memory's `llm`; model `query_writer_model=`, else `recall_config.models.query_writer_model`, else
    `PROSPECTA_QUERY_WRITER_MODEL`, else `openrouter/google/gemini-2.5-flash-lite`): about 3 searches for a short message,
    up to 10 to 20 for an elaborate one, **at most `max_searches` (20)**. Each search is `{query, terms, date_from,
-   date_to}`: the `query` feeds the semantic and stemmed retrievers and the reranker; the `terms` (names, identifiers and
-   "quoted phrases", verbatim from the prompt) feed the exact retriever; a period is pushed into Stage 1. A term of the
-   prompt that no search carries is put back into the first one. A bad reply falls back to one search: the prompt itself.
+   date_to}`: the `query` feeds the semantic and stemmed retrievers and the reranker; the `terms` (**only** proper names,
+   identifiers, versions, paths, error codes and "quoted phrases", verbatim from the prompt, never common words: a filter
+   drops a plain English word the prompt did not quote) feed the exact retriever; a period is pushed into Stage 1. A name,
+   identifier or quoted phrase of the prompt that no search carries is put back into the first one. A bad reply falls back
+   to one search: the prompt itself. If the filter drops every search, nothing is asked (a skipped, empty result).
 3. **Stage 1 and 2 in parallel**, each search against its own query, with the same filters (`metadata_filter`,
    `excluded_sources`, the search's own period else `date_from` / `date_to`); at most `max_concurrency` (8, never more
    than the connection pool) searches are in the database at once, and a search's rerank holds no connection.
-4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed, best first, a task's own
+4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed (by wording, then by meaning:
+   chunk-embedding cosine of 0.90 or more; the kept record lists what collapsed into it), best first, a task's own
    project first and other projects labeled; **sized by relevance, never by a count** (`max_tokens`, default 0 = off, is
    only a safety valve).
 
@@ -177,6 +180,7 @@ got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting   # what 
 | searches in the database at once | `max_concurrency=` | `expansion.max_concurrency` | 8 (and the pool size) |
 | token valve | `max_tokens=` | `expansion.max_tokens` | 0 (off) |
 | Stage 1 order cut when no rerank | | `expansion.fallback_min_rel` | 0.5 x the best |
+| near-copies collapsed by meaning (embedding cosine at or above) | `near_copy_cosine=` | `expansion.near_copy_cosine` (env `PROSPECTA_NEAR_COPY_COSINE`) | 0.90 |
 | gate threshold / switch | `needs_memory_threshold=`, `gate=` | `stage0_gate.needs_memory_threshold`, `.enabled` | 0.5 / on |
 | score floor of Stage 2 | `min_score=` | `rerank.min_score` | 0.15 |
 | models | `query_writer_model=`, `decision_model=`, `reranker_model=` | `models.*`, `rerank.model` | see above |

@@ -79,6 +79,11 @@ class RecalledMemory:
     relevance_score: float | None = None  # cross-encoder score (0..1) when stage 2 graded it, else `score`
     exact_snippet: str | None = None      # ts_headline of the matched words, <<marked>>
     found_by: tuple[int, ...] | None = None   # query expansion: the numbers of the searches that found it
+    item_id: str | None = None            # the chunk (memory_items.id) whose text `original_chunk` is
+    # query expansion's merge: the records that collapsed into this one as near-copies (by wording or
+    # by meaning), best scored first: their document ids, and their sources (each once)
+    collapsed_ids: tuple[str, ...] | None = None
+    collapsed_sources: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
