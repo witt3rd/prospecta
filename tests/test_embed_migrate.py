@@ -114,13 +114,13 @@ def test_migrate_crash_midway_then_resume_loses_and_duplicates_nothing(old_bank,
 
     def flaky(texts):
         calls["n"] += 1
-        if calls["n"] == 2:
+        if calls["n"] == 3:
             raise RuntimeError("provider down")
         return embed64(texts)
 
     with pytest.raises(RuntimeError, match="provider down"):
         migrate_bank(old_bank, "test", embed=flaky, embedding_dim=NEW_DIM,
-                     batch_size=8, retries=0)
+                     batch_size=4, retries=0)
     partial, _ = _counts(fresh_db, "test-v2")
     assert 0 < partial < 5            # the first group of documents was written, the rest was not
     r = migrate_bank(old_bank, "test", embed=embed64, embedding_dim=NEW_DIM, batch_size=8)
