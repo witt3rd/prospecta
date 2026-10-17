@@ -119,6 +119,24 @@ Both models and their thresholds are configurable at three levels (per-call over
   2. Run a 20-query offline check (exact quotes like `"electric dreams"`, proper names, dates, conversational follow-ups, and technical queries) measuring Stage 1 latency, Stage 2 Qwen latency, citation/snippet formatting, and total time.
   3. Present the 20-query output table to the captain. **Only after your explicit word** do we update `augur-v2` / `forge-v2` `channel_config` & `recall_config` and restart the gateways.
 
+### Slice 6 (Follow-On): Update `rung-memory-prospecta` (and Spire) to Match
+* **Change (`witt3rd/rung-memory-prospecta`):**
+  * Bump the pinned `prospecta` dependency to the new hybrid `main`.
+  * Wire the Rung MCP memory provider hooks (`recall` before turn, `retain` after turn, and agent-facing search/ask tools) to the new contract:
+    * `retain`: chunk-only default (0 LLM calls at write time, `created_on` stamped).
+    * `recall`: Stage 0 (`decision_model`) + Stage 1 (`hybrid_chunk` with `excluded_sources` anti-echo and `date_from`/`date_to`) + Stage 2 (`cross_encoder` `reranker_model`), returning the cited RAG block (`format_cited_rag_block` with `exact_snippet`).
+    * Expose `PROSPECTA_DECISION_MODEL`, `PROSPECTA_RERANKER_MODEL`, and `PROSPECTA_QUERY_WRITER_MODEL` in the provider's container/env config.
+* **Change (Spire):** Apply the same Stage 0 $\rightarrow$ Stage 1 $\rightarrow$ Stage 2 (`qwen/qwen3-reranker-8b`) + cited snippet pattern once Augur and Forge are verified.
+
+### Slice 7 (Follow-On): Full Documentation Overhaul in `witt3rd/prospecta`
+* **Why:** The repo carries a lot of legacy documents (the question-indexing spine, the graph/linker/entity era, the map-reduce and bake-off era, BM25 seams, and design history) that describe approaches we no longer run and add confusion.
+* **Change:**
+  * Make `docs/postgres-hybrid.md` the one normative architecture, and rewrite `README.md` to describe Prospecta as it is: chunk-only write path, Stage 0 decision gate, native Postgres Stage 1, Stage 2 cross-encoder, optional Stage 3, the cited-evidence contract, and the modes (chat recall, task recall, search, ask), with the configurable models.
+  * Inventory every document under `docs/` (including `docs/design/`, `docs/explainer/`, `docs/deployments/`) and the top-level files, and for each decide: keep and rewrite to the current truth, fold into another doc, or delete. Delete anything describing retired approaches (question-indexing as the spine, graph/linker/entities, map-reduce recall, the in-process BM25 seam, superseded plans); git history keeps them.
+  * Keep only operational docs that are still true (schema/migrations, backup and restore, source contract, limits, testing), each corrected to the current code.
+  * Retire `docs/hybrid-implementation-plan.md` itself once all slices are done (or reduce it to a short record of what was done).
+* **Review:** The captain sees the keep / rewrite / delete list before any deletion lands.
+
 ---
 
 ## 4. What Stays Untouched Until You Say Go
