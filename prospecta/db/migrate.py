@@ -7,12 +7,12 @@ Serializes concurrent migration attempts via pg_advisory_xact_lock.
 from __future__ import annotations
 
 import logging
-import time
 import re
 from pathlib import Path
 
 import psycopg
 
+from prospecta.db.builder_locks import hold_builder_locks
 from prospecta.db.schema import (
     check_schema_writable, ensure_schema, resolve_schema, scoped_url,
 )
@@ -144,14 +144,11 @@ def finish_0004(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
     )
 
     backfilled = 0
-    with psycopg.connect(database_url, autocommit=True) as conn:
-        # Poll with try-lock rather than block: CREATE INDEX CONCURRENTLY waits on
-        # every running statement/transaction, so a peer blocked inside
-        # pg_advisory_lock (or queued on MIGRATE_LOCK_KEY) would deadlock it.
-        while not conn.execute(
-            "SELECT pg_try_advisory_lock(%s)", (MIGRATE_LOCK_KEY + 1,)
-        ).fetchone()[0]:
-            time.sleep(0.05)
+    # Every index builder's advisory key, in the one ascending order, polled with try-lock
+    # rather than blocked on (CREATE INDEX CONCURRENTLY waits on every running
+    # statement/transaction, so a peer blocked inside pg_advisory_lock, or queued on
+    # MIGRATE_LOCK_KEY, would deadlock it): see prospecta/db/builder_locks.py.
+    with psycopg.connect(database_url, autocommit=True) as conn, hold_builder_locks(conn):
         while True:
             with conn.cursor() as cur:
                 cur.execute(
@@ -216,11 +213,7 @@ def finish_0005(database_url: str, *, batch_size: int = BACKFILL_BATCH) -> dict:
 
     backfilled = 0
     after = None
-    with psycopg.connect(database_url, autocommit=True) as conn:
-        while not conn.execute(
-            "SELECT pg_try_advisory_lock(%s)", (MIGRATE_LOCK_KEY + 2,)
-        ).fetchone()[0]:
-            time.sleep(0.05)
+    with psycopg.connect(database_url, autocommit=True) as conn, hold_builder_locks(conn):
         while True:
             with conn.cursor() as cur:
                 cur.execute(
