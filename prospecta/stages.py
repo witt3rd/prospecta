@@ -631,17 +631,36 @@ def deduplicate_near_copies(texts: Sequence[str], order: Sequence[int],
     """Collapse near-copies. `order` lists indexes into `texts`, best first. A text whose token
     Jaccard with an already-kept text is over `threshold` is a near-copy of the first such
     kept text and collapses into it (the best-scored copy survives). Returns (the surviving
-    indexes, in `order`; {collapsed index: the surviving index it collapsed into})."""
-    words: dict[int, frozenset[str]] = {}
+    indexes, in `order`; {collapsed index: the surviving index it collapsed into}).
+
+    Exactly the greedy comparison of every text with every survivor, without making it: a pair
+    over the threshold must share a token among the rarest `n - ceil(threshold * n) + 1` tokens
+    of each (prefix filtering over the tokens' document frequency), so only texts that share
+    such a token are compared. A merge of hundreds of records (20 searches) stays cheap."""
+    sets = {i: _words(texts[i]) for i in order}
+    freq: dict[str, int] = {}
+    for toks in sets.values():
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+    index: dict[str, list[int]] = {}     # token -> positions (in `survivors`) whose prefix holds it
     survivors: list[int] = []
     collapsed: dict[int, int] = {}
     for i in order:
-        words[i] = _words(texts[i])
-        twin = next((j for j in survivors if _jaccard(words[i], words[j]) > threshold), None)
-        if twin is None:
+        toks = sets[i]
+        if not toks:                      # no words: nothing to be a copy of
             survivors.append(i)
-        else:
+            continue
+        ranked = sorted(toks, key=lambda t: (freq[t], t))
+        prefix = ranked[:max(1, len(ranked) - math.ceil(threshold * len(ranked) - 1e-9) + 1)]
+        candidates = sorted({pos for t in prefix for pos in index.get(t, ())})
+        twin = next((survivors[pos] for pos in candidates
+                     if _jaccard(toks, sets[survivors[pos]]) > threshold), None)
+        if twin is not None:
             collapsed[i] = twin
+            continue
+        survivors.append(i)
+        for t in prefix:
+            index.setdefault(t, []).append(len(survivors) - 1)
     return survivors, collapsed
 
 

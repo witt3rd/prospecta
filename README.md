@@ -133,10 +133,57 @@ With the `hybrid_chunk` channel (and, optionally, the cross-encoder stage) every
 ```python
 hits = m.search('"electric dreams" 0x80070005', date_from="2024-01-01", excluded_sources=["turn:41"])
 task = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")
-print(task.block)       # "## Recalled Project Context": cited notes, the project's own first
+print(task.block)       # "## Recalled Project Context": cited notes, the project's own first (see the next section)
 res = m.ask("how are deletes handled?", sufficiency=True)   # optional stage 3 gate
 print(res.rendered)     # the answer with [n] markers, then [n] [source | date] "verbatim snippet"
 ```
+
+### Automatic recall by query expansion (Mode 1: chat messages and tasks)
+
+`Memory.expand_and_recall(prompt, kind="chat" | "task", ...)` is the one entry point for the automatic recall
+of `docs/postgres-hybrid.md` (section 1). It expands the prompt into N structured searches whose job is to find the
+**surrounding context** useful for responding (entities, governing decisions, earlier work, people, periods), runs
+them all through Stage 1 and Stage 2 in parallel, merges the records and returns one cited block. It never raises and
+stays inside a deadline.
+
+```python
+got = m.expand_and_recall("do you remember who I saw it with?", agent_last="You mentioned the Spring show.",
+                          excluded_sources=["turn:41", "turn:42"], date_from="2024-01-01")        # a chat message
+got = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")   # a task
+print(got.block)       # the searches that ran, "cite [n]", then the numbered items (source, date, kind, match, snippet)
+got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting   # what ran, what was found, what degraded, ms, tokens and cost
+```
+
+1. **Gate** (chat only; a task is never gated): `needs_memory` from the decision model (default `typesafe/jev-1.14`, the
+   Memory's `jev=` transport) skips acknowledgements, go-aheads, greetings and live-state questions (at or above 0.5 it
+   goes on). `decision=callable` injects the caller's own (a number, a bool, a `GateDecision`); `gate=False` switches it off.
+2. **Writer** (the Memory's `llm`; model `query_writer_model=`, else `recall_config.models.query_writer_model`, else
+   `PROSPECTA_QUERY_WRITER_MODEL`, else `openrouter/google/gemini-2.5-flash-lite`): about 3 searches for a short message,
+   up to 10 to 20 for an elaborate one, **at most `max_searches` (20)**. Each search is `{query, terms, date_from,
+   date_to}`: the `query` feeds the semantic and stemmed retrievers and the reranker; the `terms` (names, identifiers and
+   "quoted phrases", verbatim from the prompt) feed the exact retriever; a period is pushed into Stage 1. A term of the
+   prompt that no search carries is put back into the first one. A bad reply falls back to one search: the prompt itself.
+3. **Stage 1 and 2 in parallel**, each search against its own query, with the same filters (`metadata_filter`,
+   `excluded_sources`, the search's own period else `date_from` / `date_to`); at most `max_concurrency` (8, never more
+   than the connection pool) searches are in the database at once, and a search's rerank holds no connection.
+4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed, best first, a task's own
+   project first and other projects labeled; **sized by relevance, never by a count** (`max_tokens`, default 0 = off, is
+   only a safety valve).
+
+| setting | call argument | bank `recall_config` | default |
+|---|---|---|---|
+| deadline for everything | `deadline=` | `expansion.deadline_s` | 7 s |
+| hard maximum of searches | `max_searches=` | `expansion.max_searches` | 20 |
+| searches in the database at once | `max_concurrency=` | `expansion.max_concurrency` | 8 (and the pool size) |
+| token valve | `max_tokens=` | `expansion.max_tokens` | 0 (off) |
+| Stage 1 order cut when no rerank | | `expansion.fallback_min_rel` | 0.5 x the best |
+| gate threshold / switch | `needs_memory_threshold=`, `gate=` | `stage0_gate.needs_memory_threshold`, `.enabled` | 0.5 / on |
+| score floor of Stage 2 | `min_score=` | `rerank.min_score` | 0.15 |
+| models | `query_writer_model=`, `decision_model=`, `reranker_model=` | `models.*`, `rerank.model` | see above |
+
+`recall_for_task` replaced the old 2-4 facet decomposition (the facets, `TaskRecall`, `max_facets` and its `limit` are
+gone); `POST /lookup {"task": ...}` returns the same block plus `searches`, `fallbacks` and `error`, and no longer takes
+`limit`. Calls and one `recall` event are recorded for a task by default (`record=`), not for a chat.
 
 ### Caller-supplied index_text — the spine override
 

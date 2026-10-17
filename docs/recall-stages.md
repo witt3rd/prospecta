@@ -89,7 +89,7 @@ mem.set_recall_config({
   the gate, the Jev reader, the stage 3 sufficiency gate) is the per-call `decision_model=`, then the
   `Memory(decision_model=)` argument, then `recall_config.models.decision_model`, then
   `PROSPECTA_DECISION_MODEL` (alias `PROSPECTA_JEV_MODEL`, read at import), then `typesafe/jev-1.14`.
-  The query-writer model of `recall_for_task` is the per-call `query_writer_model=`, then
+  The query-writer model of `expand_and_recall` (and so of `recall_for_task`) is the per-call `query_writer_model=`, then
   `recall_config.models.query_writer_model`, then `PROSPECTA_QUERY_WRITER_MODEL`, then
   `openrouter/google/gemini-2.5-flash-lite`; it is passed to the `llm` callable as a `model=` hint
   when the callable accepts one.
@@ -122,11 +122,13 @@ renders items as the cited, non-instructional block (`[n] source=... | date=... 
 - **Mode 2A, search** (`Memory.search`, `recall`, `POST /lookup`): Stage 1 + Stage 2, no stage 0 gate. Per-call
   `date_from`, `date_to` (the note's date, inclusive) and `excluded_sources` (the anti-echo list) are pushed into the
   `hybrid_chunk` channel's three retrievers and raise `ValueError` where that channel does not run.
-- **Mode 1B, task recall** (`Memory.recall_for_task(title=, ask=, done=, project=)`): the brief is split into 2 to
-  4 facet queries by the query-writer model (quoted strings of the brief stay verbatim; without a model the
-  brief's own title / ask / done are the queries), each facet runs Stage 1 + Stage 2 in parallel, and the notes
-  merge, once each, into `TaskRecall(queries, items, block)`: the `project`'s notes first, notes of other
-  projects after them and labeled. There is no needs-memory gate: a task always searches.
+- **Mode 1, automatic recall by query expansion** (`Memory.expand_and_recall(prompt, kind="chat" | "task")`; task
+  recall is `Memory.recall_for_task(title=, ask=, done=, project=)`, a thin wrapper of it): the gate (chat only), the
+  query writer (the prompt becomes N structured searches), every search through Stage 1 and Stage 2 against its
+  own query in parallel, one merge, one cited block, inside a deadline. The README section "Automatic recall by
+  query expansion" has the settings; `docs/postgres-hybrid.md` section 1 is the design. It returns an
+  `ExpandedRecall` (`block`, `items`, `searches`, `runs`, `fallbacks`, `timings_ms`, `accounting`; `.queries`).
+  The `/lookup` task form no longer takes `limit`: the block is sized by relevance (`max_tokens` is its valve).
 - **Mode 2B, ask** (`Memory.ask(question)`): Stage 1 + Stage 2, then the synthesis model answers from the top
   notes alone and cites `[n]` per statement. `AskResult.citations` ties each `[n]` to its source, date and the
   verbatim sentence of the chunk that supports it; `rendered` appends them as `[n] [source | date] "snippet"`.

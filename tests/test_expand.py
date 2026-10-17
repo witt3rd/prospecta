@@ -950,3 +950,58 @@ def test_the_real_writer_prompt_renders_for_every_shape():
     for kind, last in (("chat", None), ("chat", "Last turn."), ("task", None)):
         p = render_writer_prompt("a prompt with v1.14", kind=kind, agent_last=last, max_searches=20, today=TODAY)
         assert "{{" not in p and "{%" not in p and "a prompt with v1.14" in p
+
+
+def _naive_near_copies(texts, order, threshold):
+    """The definition: every text against every survivor, in order."""
+    from prospecta.stages import _jaccard, _words
+    survivors, collapsed = [], {}
+    for i in order:
+        twin = next((j for j in survivors if _jaccard(_words(texts[i]), _words(texts[j])) > threshold), None)
+        if twin is None:
+            survivors.append(i)
+        else:
+            collapsed[i] = twin
+    return survivors, collapsed
+
+
+@pytest.mark.parametrize("threshold", [0.88, 0.5, 0.95])
+def test_near_copy_collapse_equals_the_naive_comparison_on_random_texts(threshold):
+    import random
+    rng = random.Random(11)
+    vocab = [f"w{n}" for n in range(60)] + ["the", "of", "and"] * 4
+    texts: list[str] = [""]
+    for _ in range(150):
+        base = rng.choices(vocab, k=rng.randint(1, 40))
+        texts.append(" ".join(base))
+        for _ in range(rng.randint(0, 2)):                       # planted copies: a word changed, added, dropped
+            copy = list(base)
+            for _ in range(rng.randint(0, 2)):
+                op = rng.random()
+                if op < 0.4 and copy:
+                    copy[rng.randrange(len(copy))] = rng.choice(vocab)
+                elif op < 0.7:
+                    copy.append(rng.choice(vocab))
+                elif copy:
+                    copy.pop(rng.randrange(len(copy)))
+            texts.append(" ".join(copy))
+    texts += ["same words", "words same", "SAME   Words", "", "  "]
+    order = list(range(len(texts)))
+    rng.shuffle(order)
+    assert deduplicate_near_copies(texts, order, threshold) == _naive_near_copies(texts, order, threshold)
+    assert deduplicate_near_copies(texts, order[:7], threshold) == _naive_near_copies(texts, order[:7], threshold)
+    assert deduplicate_near_copies([], [], threshold) == ([], {})
+
+
+def test_near_copy_collapse_is_not_quadratic():
+    """900 distinct 120-word chunks of Zipf text (what a 20-search merge can hold): the naive
+    comparison of every text with every survivor takes seconds, this takes a fraction of one."""
+    import random
+    from tests._synthetic_bank import vocabulary
+    vocab = vocabulary()
+    weights = [1 / (n + 1) for n in range(len(vocab))]
+    rng = random.Random(5)
+    texts = [" ".join(rng.choices(vocab, weights, k=120)) for _ in range(900)]
+    t = time.monotonic()
+    survivors, collapsed = deduplicate_near_copies(texts, list(range(900)))
+    assert len(survivors) == 900 and not collapsed and time.monotonic() - t < 2.0
