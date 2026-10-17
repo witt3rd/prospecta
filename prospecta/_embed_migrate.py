@@ -25,8 +25,6 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-import psycopg
-
 from prospecta._chunker import chunk_paragraphs
 from prospecta._retain import CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS
 from prospecta.db.queries import _vec_literal, validate_bank_id
