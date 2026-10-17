@@ -188,6 +188,7 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
 | [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
+| [`AGENTS.md`](AGENTS.md) and the skills | the practice, with its reasons and evidence: [recall](skills/recall/SKILL.md), [retain](skills/retain/SKILL.md), [search-and-ask](skills/search-and-ask/SKILL.md), [tuning-and-testing](skills/tuning-and-testing/SKILL.md), [operating](skills/operating/SKILL.md); other projects adopt them, and lessons come back as PRs |
 
 ## Caveats (1.0)
 
