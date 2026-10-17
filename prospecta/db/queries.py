@@ -42,7 +42,7 @@ SELECT_BANK_STATS = """
     WHERE b.bank_id = %(bank_id)s
 """
 
-# Per-bank HNSW partial index (schema.md §4).
+# Per-bank HNSW partial index (docs/schema.md, "memory_items").
 # Index name MUST be: memory_items_embedding_<safe_bank_id>_idx
 # bank_id is interpolated as identifier (not parameterized) since CREATE INDEX
 # doesn't accept parameters for index names. Caller MUST validate bank_id is
@@ -156,7 +156,7 @@ def upsert_document(
     - If exists with divergent source → updates source bookkeeping but still
       treats it as a replace event for caller's stats.
 
-    Replace-on-source-match per schema.md §6: source-divergence at the
+    Replace-on-source-match (docs/schema.md, "Re-retain"): source-divergence at the
     document layer is *not* raised here — T9's slice indexes by file path,
     where content_hash collisions across different source paths are caller
     error best surfaced higher up. T11's retain() will impose the strict
@@ -304,7 +304,7 @@ def append_retain_event(
 ) -> None:
     """INSERT a row into retain_events.
 
-    Schema invariants (schema.md §1, migration 0003):
+    Schema invariants (docs/schema.md, migration 0003):
       - bank_id, items_count, index_text_caller_supplied, duration_ms are NOT NULL.
       - document_id is NULL-able (deletion sets it NULL via ON DELETE SET NULL).
       - index_text_generated is the verbatim LLM-authored list (NULL when caller
@@ -368,7 +368,7 @@ def append_recall_event(
     written by channel-pipeline recalls; legacy recalls leave them NULL.
     Returns the new recall_events.id.
 
-    Schema invariants (schema.md §1, migration 0003):
+    Schema invariants (docs/schema.md, migration 0003):
       - bank_id, queries (JSONB), mode, n_results, duration_ms are NOT NULL.
       - query_timestamp, trace are nullable.
       - results (JSONB): {source, document_id, rank, scores, content_preview}[]
@@ -451,7 +451,7 @@ def append_formulate_event(
 ) -> None:
     """INSERT a row into formulate_events.
 
-    Schema invariants (schema.md §1; migrations 0001 + 0003):
+    Schema invariants (docs/schema.md; migrations 0001 + 0003):
       - bank_id, message, n_queries_out, json_mode_used, parse_fallback,
         raw_response, duration_ms are NOT NULL.
       - error_kind is nullable; ``'malformed_json' | 'schema_mismatch' | NULL``.
@@ -549,7 +549,7 @@ def upsert_sweeper_state(
     last_pass_duration_ms: int,
     last_error: str | None = None,
 ) -> None:
-    """Upsert sweeper_state (current-state cache, schema.md §9)."""
+    """Upsert sweeper_state (current-state cache, docs/schema.md)."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -605,7 +605,7 @@ def append_llm_call(
     tokens_out: int | None = None,
     cost_usd: float | None = None,
 ) -> None:
-    """Append a row to llm_calls (schema.md §1; migration 0003).
+    """Append a row to llm_calls (docs/schema.md; migration 0003).
 
     bank_id is nullable (provider/setup-time calls may not have one).
     prompt_text and response_text are nullable; PostgresSink's

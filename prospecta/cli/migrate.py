@@ -19,7 +19,7 @@ def run(args) -> int:
 
 
 def run_keyword_index(args) -> int:
-    """`prospecta keyword-index [--rebuild]`: see docs/keyword-index.md."""
+    """`prospecta keyword-index [--rebuild]`: see docs/exact-tsv.md ("Legacy keyword index")."""
     from prospecta.db.keyword_index import ensure_keyword_index
     from prospecta.db.schema import resolve_schema, scoped_url
     if not args.database_url:

@@ -27,7 +27,7 @@ REGISTRY: dict[str, type] = {
 # is what a bank created fresh stores (prospecta/bank_defaults.py); this list is the legacy
 # default of banks that stored `[]`.
 # `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
-# optional and off by default (docs/graph-links.md), and a bank with no link rows
+# optional and off by default (docs/legacy.md), and a bank with no link rows
 # returns nothing from it. Set its weight per bank when the bank builds links.
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},

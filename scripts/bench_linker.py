@@ -15,7 +15,7 @@ SEMANTIC is transitive within a topical cluster, CAUSAL is not).
 
 Run once per code version (the label is only printed): the same script runs against
 current main (git archive into a dir, PYTHONPATH=<dir>) and against this branch.
-Results are in docs/graph-links.md.
+The results were recorded in the graph-links doc, removed with the retired recall docs (git log -- docs/graph-links.md).
 
   BENCH_LABEL=after PROSPECTA_TEST_PG_URL=postgresql://... python scripts/bench_linker.py 500 1000 1845 3690
 """

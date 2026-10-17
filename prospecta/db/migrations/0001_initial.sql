@@ -1,4 +1,4 @@
--- prospecta v0.1 canonical schema (schema.md §2).
+-- prospecta v0.1 initial schema (a comment-only edit later pointed this at docs/schema.md, the schema as built by 0001-0020).
 -- Per ralplan: pgvector only (no pg_trgm); banks.fts_config removed;
 -- dim-check trigger on memory_items; COMMENT ON COLUMN on spine columns.
 -- Per-bank HNSW partial indexes are NOT created here — T4's create_bank() helper

@@ -192,7 +192,7 @@ def run_one_pass(
 
         # T16: tracer dispatch (was direct append_sweep_pass +
         # upsert_sweeper_state co-write; default PostgresSink performs both
-        # writes atomically per schema.md §8 co-write contract).
+        # writes atomically: sweep_passes + sweeper_state in one transaction, docs/observability.md).
         try:
             memory._tracer("sweep_pass", {
                 "bank_id": bank_id,

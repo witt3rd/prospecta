@@ -20,7 +20,7 @@ Architecture (per T16 spec, stance (a)):
       'recall'             → append_recall_event
       'formulate_queries'  → append_formulate_event
       'sweep_pass'         → append_sweep_pass + upsert_sweeper_state
-                              (schema.md §8 co-write contract, one txn)
+                              (docs/observability.md; one txn)
       'index_single_file'  → no-op for v0.1 (no index_events table)
       'llm_call'           → append_llm_call
 """
@@ -165,7 +165,7 @@ class PostgresSink:
             conn.commit()
 
     def _handle_sweep_pass(self, p: dict[str, Any]) -> None:
-        """Schema.md §8 co-write: sweep_passes + sweeper_state in one txn."""
+        """Co-write: sweep_passes + sweeper_state in one txn (docs/observability.md)."""
         error_paths = list(p.get("error_paths", []) or [])
         error_summary = p.get("error")
         if error_summary is None and error_paths:
