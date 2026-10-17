@@ -17,6 +17,12 @@ SYLLABLES = ["ba", "ko", "ri", "tu", "ve", "lan", "mor", "sel", "dun", "fi", "ga
              "jo", "kir", "lum", "nex", "or", "pal", "quo", "sta", "tem", "vin", "wex", "zo"]
 WORDS_PER_CHUNK = 120
 CHUNKS_PER_DOC = 3
+# Ordinary prose is full of function words ("the", "and", ...): the very common words
+# every real chunk has and the English configuration drops. `function_words` below
+# gives that share of the chunks a natural sprinkle of them.
+FUNCTION_WORDS = ["the", "of", "and", "a", "to", "in"]
+FUNCTION_WEIGHTS = [5, 3, 3, 3, 3, 2]
+FUNCTION_WORD_SHARE = 0.3      # of the word slots of a chunk that has them
 
 # Planted needles: (document number, chunk text). Document numbers are small, so
 # they exist at any corpus size of at least 100 chunks.
@@ -37,7 +43,10 @@ def vocabulary(seed: int = 7, size: int = 6000) -> list[str]:
     return sorted(words)
 
 
-def load_bank(url: str, bank: str, *, n_chunks: int, dim: int = 1536, seed: int = 7) -> None:
+def load_bank(url: str, bank: str, *, n_chunks: int, dim: int = 1536, seed: int = 7,
+              function_words: float = 0.0) -> None:
+    """`function_words`: the share of the chunks (0..1) that get function words mixed
+    in; 0 leaves the text as the pseudo-words only (and the random stream untouched)."""
     rng = random.Random(seed)
     vocab = vocabulary(seed)
     noise = [(b - 127.5) / 255 for b in range(256)]      # a byte -> a value in [-0.5, 0.5]
@@ -64,7 +73,11 @@ def load_bank(url: str, bank: str, *, n_chunks: int, dim: int = 1536, seed: int 
                 doc_no = i // CHUNKS_PER_DOC + 1
                 text = needle_docs.get(doc_no) if i % CHUNKS_PER_DOC == 0 else None
                 if text is None:
-                    text = " ".join(rng.choices(vocab, weights, k=WORDS_PER_CHUNK))
+                    words = rng.choices(vocab, weights, k=WORDS_PER_CHUNK)
+                    if function_words and rng.random() < function_words:
+                        words = [rng.choices(FUNCTION_WORDS, FUNCTION_WEIGHTS)[0]
+                                 if rng.random() < FUNCTION_WORD_SHARE else w for w in words]
+                    text = " ".join(words)
                 vec = [c + noise[b] for c, b in zip(centers[rng.randrange(200)], rng.randbytes(dim))]
                 copy.write_row([bank, doc_ids[min(doc_no, n_docs) - 1], text, text, Vector(vec),
                                 "chunk", i % CHUNKS_PER_DOC])

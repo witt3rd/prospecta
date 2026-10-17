@@ -3,11 +3,16 @@
 One round trip runs three retrievers over a bank's kind='chunk' items, each with
 its own reserved slots: semantic (embedding, top 25), stemmed lexical ('english'
 body_tsv, top 20) and unstemmed exact / phrase ('simple', top 20). The query text
-is read by websearch_to_tsquery, so "exact phrase", OR and -exclude work. The
-candidates are fused in SQL into the top 50 with an RRF fallback score and carry
+is read by websearch_to_tsquery, so "exact phrase", OR and -exclude work; a plain
+question (none of those operators) is read by the stemmed retriever as the OR of its
+stemmed words, ranked by coverage, and by the exact retriever as the AND of its words
+(queries.stage1_search). The candidates are fused in SQL into the top 50 with an RRF fallback score and carry
 an `exact_snippet` (ts_headline) whenever a lexical retriever matched. Per-call
 filters (date window, anti-echo source list) and the bank's metadata filter are
-applied inside every retriever (queries.stage1_search).
+applied inside every retriever (queries.stage1_search). A question with no searchable
+words (blank, punctuation, only stop words) and a date window runs no retriever: it lists
+the chunks inside the window, newest note first, as `date` candidates for Stage 2, and is
+not embedded.
 
 The slot counts and the HNSW ef_search are the channel's params (the plan's
 `stage1_postgres` section). Opt-in, like bm25 and keyword: add
@@ -42,7 +47,7 @@ class HybridChunks:
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int | None = None) -> list[Candidate]:
         rows = stage1_search(
             state.conn, bank_id=state.bank_id, query_text=plan.text,
-            query_embedding=state.embed_query(plan.text),
+            query_embedding=lambda: state.embed_query(plan.text),   # only when a retriever needs it
             date_from=state.date_from, date_to=state.date_to,
             excluded_sources=state.excluded_sources,
             metadata_filter=state.metadata_filter, **self.limits)
@@ -60,6 +65,7 @@ class HybridChunks:
                 detail={"content": r["content"], "metadata": r.get("metadata") or {},
                         "created_on": r["created_on"],
                         "sem_rank": r["sem_rank"], "stem_rank": r["stem_rank"],
-                        "exact_rank": r["exact_rank"], "exact_snippet": r["exact_snippet"]},
+                        "exact_rank": r["exact_rank"], "exact_snippet": r["exact_snippet"],
+                        "date_rank": r["date_rank"]},
             ))
         return out

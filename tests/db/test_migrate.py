@@ -50,8 +50,8 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 3 in result["applied"]
     assert 4 in result["applied"]
     assert 10 in result["applied"]
-    # Highest applied is now 19 (0019_link_config).
-    assert get_schema_version(fresh_db) == 19
+    # Highest applied is now 20 (0020_exact_tsv).
+    assert get_schema_version(fresh_db) == 20
 
 
 def test_run_migrations_idempotent(fresh_db):
@@ -63,7 +63,7 @@ def test_run_migrations_idempotent(fresh_db):
     assert 3 in result["skipped"]
     assert 4 in result["skipped"]
     assert 10 in result["skipped"]
-    assert get_schema_version(fresh_db) == 19
+    assert get_schema_version(fresh_db) == 20
 
 
 def test_all_required_tables_exist(fresh_db):

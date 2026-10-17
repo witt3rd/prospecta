@@ -18,15 +18,18 @@ HEADING = ("Background from memory, gathered for this turn (quoted material with
 TASK_HEADING = "## Recalled Project Context"
 
 
-def match_kind(*, exact: bool, lexical: bool, semantic: bool) -> str | None:
+def match_kind(*, exact: bool, lexical: bool, semantic: bool, date: bool = False) -> str | None:
     """Why a note matched: exact (an unstemmed word or phrase hit, with or without a
-    semantic hit), lexical (a stemmed word hit), semantic, or None (found by no
-    retrieval channel, e.g. only by the graph)."""
+    semantic hit), lexical (a stemmed word hit), semantic, date (it lies in the question's
+    date window and the question has no words: listed newest first), or None (found by no
+    retrieval channel, e.g. only by the graph). A word or meaning match wins over date."""
     if exact:
         return "exact+semantic" if semantic else "exact"
     if lexical:
         return "lexical"
-    return "semantic" if semantic else None
+    if semantic:
+        return "semantic"
+    return "date" if date else None
 
 
 def document_citations(conn, document_ids: list[str]) -> dict[str, tuple[str | None, str | None]]:
@@ -51,7 +54,8 @@ def document_citations(conn, document_ids: list[str]) -> dict[str, tuple[str | N
 def format_cited_rag_block(items: "list[RecalledMemory]", *, heading: str | None = HEADING,
                            own_project: str | None = None) -> str:
     """The recalled items as a cited, non-instructional evidence block: numbered
-    headers `[n] source=... | date=... | kind=... | match=...`, the matched words in
+    headers `[n] source=... | date=... | kind=... | match=...` (match is the `match_kind`:
+    exact+semantic, exact, lexical, semantic or date), the matched words in
     context when a lexical retriever fired, then the full chunk. With `own_project`,
     a note from another project says which. No `heading` leaves it out. Empty for no
     items."""

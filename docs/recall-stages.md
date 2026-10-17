@@ -112,11 +112,11 @@ the intended one is `anthropic/claude-sonnet-5.5` through OpenRouter.
 
 Every `RecalledMemory` carries the cited-evidence contract next to `source` and `original_chunk`:
 `created_on` (`YYYY-MM-DD`), `kind` (`documents.source_kind`), `match_kind` (`exact+semantic`,
-`exact`, `lexical`, `semantic`; from the channels that found the note, `None` for a bank on the
-legacy path), `relevance_score` (the cross-encoder's 0..1 score when `rerank.stage` is
+`exact`, `lexical`, `semantic`, `date`; from the channels that found the note, `None` for a bank on the
+legacy path; `date` is a note listed only because it lies in a wordless question's date window), `relevance_score` (the cross-encoder's 0..1 score when `rerank.stage` is
 `cross_encoder` and graded the note, else the fused `score`) and `exact_snippet` (`ts_headline`
 of the matched words, `<<marked>>`, from the `hybrid_chunk` channel). `prospecta.cited.format_cited_rag_block(items)`
-renders items as the cited, non-instructional block (`[n] source=... | date=... | kind=... | match=...`, an
+renders items as the cited, non-instructional block (`[n] source=... | date=... | kind=... | match=...` with the `match_kind` above, an
 `Exact match snippet:` line when one fired, then the full chunk).
 
 - **Mode 2A, search** (`Memory.search`, `recall`, `POST /lookup`): Stage 1 + Stage 2, no stage 0 gate. Per-call

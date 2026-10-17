@@ -11,6 +11,11 @@ It is created without blocking writes (CREATE INDEX CONCURRENTLY) by
 `ensure_keyword_index`, which `run_migrations` calls after migration 0018 and
 `prospecta keyword-index` calls on demand. Stemmed queries and banks without a
 valid index use the plain scan with the same expression.
+
+The Stage 1 exact retriever does not use this index: it reads the stored column
+`memory_items.exact_tsv` (migration 0020), generated from `indexed_expression()` below
+and indexed by its own GIN index (prospecta/db/exact_tsv.py). This index still serves
+the `keyword` channel.
 """
 from __future__ import annotations
 
@@ -33,15 +38,20 @@ def indexed_expression() -> str:
     return word_vector("'simple'", "original_chunk")
 
 
-def has_keyword_index(conn: psycopg.Connection) -> bool:
-    """True when a valid keyword index exists in the connection's schema."""
+def has_index(conn: psycopg.Connection, name: str) -> bool:
+    """True when a valid index of that name exists on memory_items in the connection's schema."""
     row = conn.execute(
         "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
         "WHERE i.indrelid = to_regclass('memory_items') AND c.relname = %s "
         "AND i.indisvalid AND i.indisready AND c.relnamespace = "
         "(SELECT relnamespace FROM pg_class WHERE oid = to_regclass('memory_items'))",
-        (INDEX_NAME,)).fetchone()
+        (name,)).fetchone()
     return row is not None
+
+
+def has_keyword_index(conn: psycopg.Connection) -> bool:
+    """True when a valid keyword index exists in the connection's schema."""
+    return has_index(conn, INDEX_NAME)
 
 
 def ensure_keyword_index(database_url: str, *, rebuild: bool = False) -> dict:

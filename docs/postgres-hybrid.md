@@ -78,14 +78,20 @@ We use **Dual-Config Native PostgreSQL FTS (`english` + `simple`)** with GIN ind
 | `fts_en` | `to_tsvector('english', content)` | Stemmed keywords (`running` $\leftrightarrow$ `run`), natural-language terms, boolean operators. |
 | `fts_exact` | `to_tsvector('simple', content)` | Unstemmed exact tokens, proper names (`dan maycock`), IDs, flags, version strings (`v1.14`), and quoted exact phrases without stemmer distortion. |
 
+**Implementation names.** In Prospecta's schema `fts_en` is `memory_items.body_tsv` (migration 0002) and `fts_exact` is `memory_items.exact_tsv`, a STORED generated column (migration 0020) holding the keyword word rule over `original_chunk` (the `simple` configuration plus the pieces of a path split at slashes; defined once as `indexed_expression()` in `prospecta/db/keyword_index.py`), with its own GIN index. Adding the column rewrites the table: `docs/exact-tsv.md` is the operator runbook.
+
 ### Supported User & Agent Query Syntax (`websearch_to_tsquery`)
 
 Never pass raw strings into `to_tsquery()`. Always use `websearch_to_tsquery()`, which never throws syntax errors on punctuation and natively supports standard search operators:
 
-* **Keyword search:** `electric dreams` (implicit `AND`; matches stemmed in `fts_en` and unstemmed in `fts_exact`)
+* **Keyword search:** `electric dreams` (implicit `AND` in `fts_exact`, unstemmed; see the plain-question rule below for `fts_en`)
 * **Exact phrase match (case-insensitive):** `"electric dreams"` (enforces token adjacency via `<->`; evaluated against `fts_exact` so words inside quotes are never stemmed)
 * **Boolean `OR`:** `augur OR forge`
 * **Exclusion (`-`):** `memory -shadow`
+
+**Plain questions are an OR in the stemmed retriever.** `websearch_to_tsquery` ANDs every word, so a natural-language question ("which harbour lamps did the crew repaint before the winter storm") matched `fts_en` only in a chunk that held every one of its words. When the query has **no operator** (no straight double quote, no standalone upper-case `OR`, no word led by `-`), the stemmed retriever matches the **OR** of the query's stemmed words (`english`; stop words drop; at most the 8 longest words, since cover-density ranking costs more with every query word) and ranks by `ts_rank_cd`, so coverage orders the candidates and Stage 2 decides. The words are taken from the parser, never spliced from the query text, so no text can add an operator. The exact retriever always keeps websearch semantics (words ANDed as written, quoted phrases adjacent), and a query **with** an operator keeps websearch semantics on both retrievers: the search-box syntax above is exactly as documented.
+
+**Date-only questions.** When the query has no searchable words (its `english` reading is empty: blank, punctuation, only stop words) and a date window is given, there is nothing to match: Stage 1 returns the chunks inside the window, newest note first (`COALESCE(created_on, created_at::date)`, then the note created last), up to `fused_limit` rows with `match_kind` `date`, and Stage 2 reranks them. Every other pushed-down filter still applies. No words and no window is empty.
 
 ### Exact-Match Snippet Extraction (`ts_headline`)
 
@@ -301,7 +307,7 @@ export interface CitedEvidence {
   createdAt: string;       // ISO date for citation header (YYYY-MM-DD)
   content: string;         // Full chunk/note text for RAG context
   exactSnippet: string | null; // Verbatim highlighted snippet ("... <<electric dreams>> ...") when lexical/exact matched
-  matchKind: "exact+semantic" | "exact" | "lexical" | "semantic";
+  matchKind: "exact+semantic" | "exact" | "lexical" | "semantic" | "date";
   relevanceScore: number;  // Calibrated [0, 1] from qwen3-reranker-8b (or RRF fallback)
 }
 

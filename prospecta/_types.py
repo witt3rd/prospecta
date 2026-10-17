@@ -75,7 +75,7 @@ class RecalledMemory:
     # is from and why it matched. `source` and `original_chunk` above complete it.
     created_on: str | None = None         # the note's date, YYYY-MM-DD
     kind: str | None = None               # documents.source_kind: note, conversation, ...
-    match_kind: str | None = None         # exact+semantic | exact | lexical | semantic
+    match_kind: str | None = None         # exact+semantic | exact | lexical | semantic | date
     relevance_score: float | None = None  # cross-encoder score (0..1) when stage 2 graded it, else `score`
     exact_snippet: str | None = None      # ts_headline of the matched words, <<marked>>
 

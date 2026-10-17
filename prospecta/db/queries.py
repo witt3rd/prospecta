@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re as _re
 from prospecta._filters import filter_fields
-from prospecta.db.keyword_index import word_vector
+from prospecta.db.exact_tsv import COLUMN as EXACT_TSV_COLUMN
 
 # ---------------------------------------------------------------------------
 # Bank lifecycle
@@ -948,12 +948,18 @@ def body_lexical_search(
 # exact hit always reaches the reranker; fused by FULL OUTER JOIN into the top
 # `fused_limit` with an RRF fallback score, and ts_headline() runs on those
 # winners only. Needs pgvector >= 0.8 (hnsw.iterative_scan).
+#
+# A question whose English reading is empty (blank, punctuation, only stop words) and that
+# has a date window has nothing to match: the window itself is the question, and Stage 1
+# lists the chunks inside it, newest note first, as `date` candidates (_STAGE1_DATE_SQL).
+# No window and no words at all is empty.
 # ---------------------------------------------------------------------------
 
 STAGE1_SEMANTIC_LIMIT = 25
 STAGE1_STEMMED_LIMIT = 20
 STAGE1_EXACT_LIMIT = 20
 STAGE1_FUSED_LIMIT = 50
+STAGE1_STEM_OR_TERMS = 8
 STAGE1_HNSW_EF_SEARCH = 100
 STAGE1_HEADLINE_OPTIONS = ('StartSel=<<, StopSel=>>, MaxWords=35, MinWords=15, '
                            'MaxFragments=2, FragmentDelimiter=" … "')
@@ -977,12 +983,13 @@ _STAGE1_FILTERS = """
 # (SELECT stem FROM q) is one parsed tsquery, evaluated once and usable as an index
 # condition. __DIM__: the bank's embedding width, so the per-bank partial HNSW index
 # (an index on embedding::vector(N), see HNSW_KIND_INDEX_TEMPLATE) can serve the
-# semantic retriever. __EXACT_VEC__: the keyword channel's word rule on
-# 'simple', which memory_items_keyword_gin (migration 0018) indexes.
+# semantic retriever. __EXACT_VEC__: memory_items.exact_tsv, the stored 'simple' word
+# vector (migration 0020, memory_items_exact_tsv_gin): matched and ranked as stored, so
+# a chunk is never re-tokenized, however many match.
 _STAGE1_SQL = """
 WITH
   q AS (
-    SELECT websearch_to_tsquery('english', %(qt)s) AS stem,
+    SELECT __STEM__ AS stem,
            websearch_to_tsquery('simple', %(qt)s) AS exact
   ),
   semantic_hits AS (
@@ -1036,12 +1043,38 @@ SELECT c.id, c.document_id, d.source, c.content, c.original_chunk, c.metadata,
            ts_headline('simple', c.original_chunk, (SELECT exact FROM q), %(headline)s)
          WHEN f.stem_rank IS NOT NULL THEN
            ts_headline('english', c.original_chunk, (SELECT stem FROM q), %(headline)s)
-       END AS exact_snippet
+       END AS exact_snippet,
+       NULL::bigint AS date_rank
 FROM fused f
 JOIN memory_items c ON c.id = f.id
 JOIN documents d ON d.id = c.document_id
 ORDER BY f.rrf_score DESC, c.id
 """
+
+
+# A plain question (no search operator) matches the stemmed retriever as the OR of its
+# stemmed words: websearch_to_tsquery ANDs them, so a natural-language question matched
+# only a chunk holding every one of its words. The words come out of the parser
+# (to_tsvector: stemmed, stop words gone), never out of the text, and each is quoted for
+# tsquery (the backslash and the single quote doubled), so no text can add an operator.
+# At most STAGE1_STEM_OR_TERMS words are used, the longest first (word length tracks
+# rarity): cover-density ranking costs more per row with every query word, so an uncapped
+# long brief would rank most of the bank at tens of microseconds a row.
+_STEM_OR = r"""(SELECT COALESCE(string_agg(t.quoted, ' | '), '')::tsquery FROM (
+          SELECT '''' || replace(replace(w.lexeme, '\', '\\'), '''', '''''') || '''' AS quoted
+          FROM unnest(to_tsvector('english', %(qt)s)) AS w
+          ORDER BY length(w.lexeme) DESC, w.lexeme LIMIT %(stem_or_terms)s) t)"""
+_STEM_WEBSEARCH = "websearch_to_tsquery('english', %(qt)s)"
+# The documented search-box operators: a straight double quote, a standalone OR, a word led
+# by a hyphen (-exclude).
+_OPERATORS = _re.compile(r'"|(?:^|\s)-\w|(?:^|\s)OR(?:\s|$)')
+
+
+def has_websearch_operators(query_text: str) -> bool:
+    """True when the question uses a search operator ("quoted phrase", a standalone OR, a
+    -excluded word): its words then keep websearch semantics (AND) in both lexical
+    retrievers. Without one the stemmed retriever reads the words as an OR."""
+    return _OPERATORS.search(query_text) is not None
 
 
 def _stage1_statement(
@@ -1050,11 +1083,13 @@ def _stage1_statement(
     metadata_filter: dict | None = None,
     semantic_limit: int = STAGE1_SEMANTIC_LIMIT, stemmed_limit: int = STAGE1_STEMMED_LIMIT,
     exact_limit: int = STAGE1_EXACT_LIMIT, fused_limit: int = STAGE1_FUSED_LIMIT,
+    stem_or_terms: int = STAGE1_STEM_OR_TERMS,
 ) -> tuple[str, dict]:
     sql = (_STAGE1_SQL
+           .replace("__STEM__", _STEM_WEBSEARCH if has_websearch_operators(query_text) else _STEM_OR)
            .replace("__FILTERS__", _STAGE1_FILTERS)
            .replace("__NOTE_DATE__", _NOTE_DATE)
-           .replace("__EXACT_VEC__", word_vector("'simple'", "m.original_chunk"))
+           .replace("__EXACT_VEC__", f"m.{EXACT_TSV_COLUMN}")
            .replace("__DIM__", str(len(query_embedding))))
     params = {
         "bank_id": bank_id, "qt": query_text, "qe": _vec_literal(query_embedding),
@@ -1063,6 +1098,63 @@ def _stage1_statement(
         "meta": _meta_param(metadata_filter), "headline": STAGE1_HEADLINE_OPTIONS,
         "semantic_limit": int(semantic_limit), "stemmed_limit": int(stemmed_limit),
         "exact_limit": int(exact_limit), "fused_limit": int(fused_limit),
+        "stem_or_terms": int(stem_or_terms),
+    }
+    return sql, params
+
+
+# The date-only listing: the newest notes' chunks inside the window, every filter of the
+# three retrievers applied. Ties of one note date: the note created last, then the note's
+# chunks in order. date_rank is the position (1 = newest); rrf_score descends with it so the
+# order survives any fallback that sorts by score.
+_STAGE1_DATE_SQL = """
+WITH win AS (
+  SELECT m.id, m.document_id, d.source, m.content, m.original_chunk, m.metadata,
+         __NOTE_DATE__ AS created_on, d.created_at AS note_created_at, m.ordinal
+  FROM memory_items m JOIN documents d ON d.id = m.document_id
+  WHERE m.bank_id = %(bank_id)s AND m.kind = 'chunk'
+    __FILTERS__
+  ORDER BY __NOTE_DATE__ DESC, d.created_at DESC, m.document_id, m.ordinal, m.id
+  LIMIT %(fused_limit)s
+)
+SELECT id, document_id, source, content, original_chunk, metadata, created_on,
+       NULL::bigint AS sem_rank, NULL::bigint AS stem_rank, NULL::bigint AS exact_rank,
+       1.0 / (60 + ROW_NUMBER() OVER w) AS rrf_score,
+       NULL::text AS exact_snippet,
+       ROW_NUMBER() OVER w AS date_rank
+FROM win
+WINDOW w AS (ORDER BY created_on DESC, note_created_at DESC, document_id, ordinal, id)
+ORDER BY date_rank
+"""
+
+# Which Stage 1 shape a question gets. no_stem: its English reading is empty (blank,
+# punctuation, only stop words); no_simple: its unstemmed reading is empty too.
+_STAGE1_WORDS_SQL = """
+SELECT numnode(websearch_to_tsquery('english', %(qt)s)) = 0,
+       numnode(websearch_to_tsquery('simple', %(qt)s)) = 0
+"""
+
+
+def _stage1_mode(cur, query_text: str, date_from, date_to) -> str:
+    """'words' (the three retrievers), 'date' (list the window) or 'none' (nothing to ask)."""
+    cur.execute(_STAGE1_WORDS_SQL, {"qt": query_text}, prepare=False)
+    no_stem, no_simple = cur.fetchone()
+    if not no_stem:
+        return "words"
+    if date_from is not None or date_to is not None:
+        return "date"
+    return "none" if no_simple else "words"     # no window: stop words still match as written
+
+
+def _stage1_date_statement(
+    *, bank_id: str, date_from=None, date_to=None, excluded_sources: list[str] | None = None,
+    metadata_filter: dict | None = None, fused_limit: int = STAGE1_FUSED_LIMIT, **_unused,
+) -> tuple[str, dict]:
+    sql = _STAGE1_DATE_SQL.replace("__FILTERS__", _STAGE1_FILTERS).replace("__NOTE_DATE__", _NOTE_DATE)
+    params = {
+        "bank_id": bank_id, "date_from": date_from, "date_to": date_to,
+        "excluded": list(excluded_sources) if excluded_sources is not None else None,
+        "meta": _meta_param(metadata_filter), "fused_limit": int(fused_limit),
     }
     return sql, params
 
@@ -1070,13 +1162,17 @@ def _stage1_statement(
 def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query) -> list[dict]:
     """The Stage 1 candidates: at most `fused_limit` chunk rows, best first.
 
-    `query` is bank_id, query_text, query_embedding and optionally date_from /
+    `query` is bank_id, query_text, query_embedding (the vector, or a callable that returns
+    it: called only when the semantic retriever runs) and optionally date_from /
     date_to (the note's date, inclusive), excluded_sources (the anti-echo list of
     documents.source values), metadata_filter (the metadata / `_allow` filter of the
     other channels) and the slot counts semantic_limit / stemmed_limit / exact_limit /
     fused_limit (defaults 25 / 20 / 20 / 50). The filters apply inside every retriever,
     before its slots are cut. `query_text` is read by websearch_to_tsquery:
-    "exact phrase", OR, -exclude. The semantic retriever reads at least
+    "exact phrase", OR, -exclude. A plain question (no such operator, see
+    has_websearch_operators) is read by the stemmed retriever as the OR of its stemmed
+    words, the `stem_or_terms` longest at most (default 8), ranked by ts_rank_cd; the
+    exact retriever always keeps websearch semantics (AND). The semantic retriever reads at least
     `hnsw_ef_search` index candidates and keeps scanning (pgvector iterative scan)
     until its slots are full.
 
@@ -1084,10 +1180,27 @@ def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query)
     (the note's date: documents.created_on, else its created_at date), sem_rank /
     stem_rank / exact_rank (the chunk's rank in each retriever, None where it did not
     match), rrf_score and exact_snippet (ts_headline with <<matches>>; None for a
-    purely semantic hit).
+    purely semantic hit), and date_rank (None except in the date-only listing below).
+
+    A question with no searchable words (its English reading is empty: blank, punctuation,
+    only stop words) and a date window gets no retriever: the rows are the chunks inside the
+    window, newest note first (by `created_on`, then the note created last, then the note's
+    chunks in order), up to `fused_limit`, each with date_rank 1, 2, ... and a descending
+    rrf_score, no other rank and no snippet; every other filter still applies. A question
+    with no words at all (not even stop words) and no window is empty.
     """
-    sql, params = _stage1_statement(**query)
     with conn.transaction(), conn.cursor() as cur:
+        mode = _stage1_mode(cur, query["query_text"], query.get("date_from"), query.get("date_to"))
+        if mode == "none":
+            return []
+        if mode == "date":
+            sql, params = _stage1_date_statement(**query)
+            cur.execute(sql, params, prepare=False)
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        if callable(query["query_embedding"]):
+            query = {**query, "query_embedding": query["query_embedding"]()}
+        sql, params = _stage1_statement(**query)
         cur.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
         cur.execute(f"SET LOCAL hnsw.ef_search = {int(hnsw_ef_search)}")
         # prepare=False: a fresh plan per call, so the bank and kind literals select the

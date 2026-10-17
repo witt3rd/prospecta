@@ -37,6 +37,13 @@ def _list_migrations() -> list[tuple[int, Path]]:
     return files
 
 
+def _render(sql: str) -> str:
+    """Fill a migration's placeholders. `{{EXACT_TSV_EXPRESSION}}` (0020) is the one word
+    rule of keyword_index.indexed_expression(), so the rule is defined once."""
+    from prospecta.db.exact_tsv import column_expression
+    return sql.replace("{{EXACT_TSV_EXPRESSION}}", column_expression())
+
+
 def _ensure_version_table(conn: psycopg.Connection) -> None:
     """Create prospecta_schema_version if it doesn't exist."""
     with conn.cursor() as cur:
@@ -91,7 +98,7 @@ def run_migrations(database_url: str, schema: str | None = None) -> dict:
                 logger.debug("Migration %d already applied: %s", version, path.name)
                 continue
 
-            sql = path.read_text()
+            sql = _render(path.read_text())
             logger.info("Applying migration %d: %s", version, path.name)
             with conn.cursor() as cur:
                 cur.execute(sql)
@@ -110,6 +117,9 @@ def run_migrations(database_url: str, schema: str | None = None) -> dict:
     if 18 in current or 18 in applied:
         from prospecta.db.keyword_index import ensure_keyword_index
         ensure_keyword_index(database_url)
+    if 20 in current or 20 in applied:
+        from prospecta.db.exact_tsv import ensure_exact_tsv_index
+        ensure_exact_tsv_index(database_url)
 
     return {"applied": applied, "skipped": skipped}
 
