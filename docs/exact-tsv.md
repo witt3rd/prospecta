@@ -9,7 +9,7 @@ verification, growing linearly with the bank. Migration 0020 stores the vector:
 - `memory_items.exact_tsv tsvector GENERATED ALWAYS AS (<word rule>) STORED` — the database fills it on
   every insert and update; no application code can forget it.
 - `memory_items_exact_tsv_gin`, a GIN index on it, built `CREATE INDEX CONCURRENTLY` (writes are never
-  blocked) right after the migration commits, then `ANALYZE memory_items (exact_tsv)`.
+  blocked) right after the migration commits.
 
 **One definition of the word rule.** `indexed_expression()` in `prospecta/db/keyword_index.py` (the
 `simple` configuration plus the pieces of a path split at slashes) is the expression migration 0018
@@ -37,7 +37,7 @@ about 600 MB each, container Postgres 16.15 with pgvector 0.8.7 on a 22-core hos
 |---|---|
 | `ALTER TABLE ... ADD COLUMN exact_tsv ... STORED`, table + non-HNSW indexes only | 30 s |
 | the same with the two HNSW indexes present (rebuilt by the rewrite) | **172 s** |
-| `CREATE INDEX CONCURRENTLY memory_items_exact_tsv_gin` + `ANALYZE` of the column | 2.6 s |
+| `CREATE INDEX CONCURRENTLY memory_items_exact_tsv_gin` (no lock) | 2.6 s |
 
 | size (73,000 chunks) | before | after |
 |---|---|---|
@@ -65,7 +65,8 @@ One database holds both banks in one `memory_items` table, so this is one migrat
    stopped or idle for the window (the lock makes them wait or time out).
 3. **Migrate by hand**, with the new release's CLI and the database URL in the environment:
    `prospecta migrate`. It prints `Applied: [20]`. Expect the times above: the rewrite first (the lock),
-   then the index build and `ANALYZE` (no lock).
+   then the index build (no lock). Optionally `ANALYZE memory_items;` afterwards (autovacuum does it
+   in due course; the Stage 1 plan does not depend on it).
 4. **Verify.**
    ```sql
    SELECT attgenerated FROM pg_attribute

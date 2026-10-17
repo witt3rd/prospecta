@@ -25,7 +25,31 @@ import psycopg
 
 INDEX_NAME = "memory_items_keyword_gin"
 # MIGRATE_LOCK_KEY + 3 (migrate.py uses +0..+2); kept literal to avoid an import cycle.
-_LOCK_KEY = 0x70726F73706563 + 3
+_BASE_KEY = 0x70726F73706563
+_LOCK_KEY = _BASE_KEY + 3
+# The advisory keys of the post-commit index builders: finish_0004 +1, finish_0005 +2, this
+# index +3, the exact_tsv index +4 (prospecta/db/exact_tsv.py).
+_BUILDER_KEYS = tuple(_BASE_KEY + n for n in (1, 2, 3, 4))
+
+
+def take_other_builder_locks(conn: psycopg.Connection, own_key: int) -> list[int]:
+    """Take (polling, never blocking) the advisory keys of the OTHER post-commit index builders
+    and return them for the caller to release.
+
+    Two CREATE INDEX CONCURRENTLY on one table can deadlock: the statement waiting for the
+    table's lock already holds a snapshot, which the building one waits to end in its last
+    phase (seen between finish_0004's `CREATE INDEX CONCURRENTLY IF NOT EXISTS` and this
+    index's build when four processes migrate at once). Holding every builder's key while
+    building makes them run one at a time. Polled, because a peer blocked inside
+    pg_advisory_lock would deadlock the build the same way (the 0004 caveat)."""
+    taken: list[int] = []
+    for key in _BUILDER_KEYS:
+        if key == own_key:
+            continue
+        while not conn.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0]:
+            time.sleep(0.05)
+        taken.append(key)
+    return taken
 
 
 def word_vector(cfg: str, expr: str) -> str:
@@ -64,10 +88,12 @@ def ensure_keyword_index(database_url: str, *, rebuild: bool = False) -> dict:
     with psycopg.connect(database_url, autocommit=True) as conn:
         while not conn.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,)).fetchone()[0]:
             time.sleep(0.05)
+        others: list[int] = []
         try:
             existed = has_keyword_index(conn)
             if existed and not rebuild:
                 return {"index": INDEX_NAME, "created": False, "rebuilt": False}
+            others = take_other_builder_locks(conn, _LOCK_KEY)
             expr = indexed_expression()
             if existed:
                 tmp = INDEX_NAME + "_new"
@@ -82,4 +108,6 @@ def ensure_keyword_index(database_url: str, *, rebuild: bool = False) -> dict:
                          f"ON memory_items USING GIN (({expr}))")
             return {"index": INDEX_NAME, "created": True, "rebuilt": False}
         finally:
+            for key in reversed(others):
+                conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
             conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
