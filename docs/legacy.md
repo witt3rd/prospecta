@@ -8,8 +8,9 @@ bank that still names it does now, and what was kept on purpose.
 
 ## Removed, and how to get it back
 
-The last commit that has all of it is **`67c0706`** (main before the removal). Nothing was tagged
-(a tag is a remote object; none was created). To read or restore a file:
+It was removed in commit **`8d4593d`**, the change that follows **`67c0706`** (main before the
+removal): `67c0706` is the last commit that has all of it. Nothing was tagged (a tag is a remote
+object; none was created). To read or restore a file:
 
 ```
 git show 67c0706:prospecta/_linker.py
