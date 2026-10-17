@@ -39,6 +39,11 @@ invisible until counted. *Evidence:* [`references/bake-off.md`](references/bake-
 7. **Say the limits.** The sample, single runs, what the panel cannot see. `prospecta eval` states what it
    does not measure (`docs/eval.md`); the bake-off summary lists its own validity limits.
 
+Independent check: Spire's decision model reproduced the plugin's panel result: 18 of 42 wrongly windowed before the wording
+fix; after it 1, 0 and 1 of 42 on three runs, real windows kept 42 of 42; the one residual is a single line (an artistic
+flattery plus "this week's theme"). So measure **three runs**, not one. Slice order that worked in Spire's hybrid build, each
+slice small and red first: pool -> cited block -> reranker -> query expansion -> anti-echo -> time window -> one door.
+
 ## Tools that already exist
 
 - [`docs/eval.md`](../../docs/eval.md): `prospecta eval QUESTIONS.md [--ablate]` scores Stage 1 + 2 (hit@1,

@@ -32,7 +32,7 @@ stage the library does not have therefore keeps the Stage 1 order. (`hybrid_chun
 
 | `recall_config` key | what | page section |
 |---|---|---|
-| `rerank` | Stage 2: `enabled`, `stage` (`cross_encoder`), `model`, `top_n`, `min_score`, `timeout_s`, `deduplicate_near_copies`; `min_rel_score` (the pool cut) | Stage 2 |
+| `rerank` | Stage 2: `enabled`, `stage` (`cross_encoder`), `model`, `top_n`, `min_score`, `timeout_s`, `retries`, `deduplicate_near_copies`; `min_rel_score` (the pool cut) | Stage 2 |
 | `expansion` | Mode 1: `max_searches`, `max_concurrency`, `deadline_s`, `max_tokens`, `fallback_min_rel`, `near_copy_cosine` | Mode 1 settings |
 | `stage0_gate` | Mode 1 gate: `enabled`, `needs_memory_threshold` | Mode 1 settings |
 | `stage3_sufficiency` | Stage 3: `enabled`, `threshold` | Stage 3 |
@@ -78,6 +78,11 @@ stage removes a note and it never adds one; the record lists what each cut remov
 (`n_below_min_score`, `collapsed` as dropped -> kept document, `n_over_top_n`). The grade of a
 kept note (0..1) lands in `RecalledMemory.scores["rerank"]` and is its `relevance_score`. If the
 provider answers and nothing reaches the floor, the result is empty: that is the answer.
+
+A 503 or 429 is tried once more (`rerank.retries`, default 1; 0 turns it off) inside the same
+`timeout_s`: the retry gets the time left and only runs with at least 0.5 s left, so the whole call is never
+longer than `timeout_s`; each request of a multi-request pool retries on its own. Both attempts are logged
+(`cross_encoder_rerank` and `cross_encoder_rerank_retry`, the first with its error). A timeout is not retried.
 
 Any provider error, timeout (`timeout_s`, default 4 s), HTTP 429/503, or reply that is not
 exactly one finite score per note keeps the Stage 1 order for the whole pool and records

@@ -252,3 +252,154 @@ def test_near_copy_threshold_is_above_088():
     items = make_items([f"{ten}=0.9", f"{eight_of_ten}=0.8"])
     out = CrossEncoderReranker(fake_rerank(by_marker)).rerank(QUERY, items, [])
     assert ids(items, out) == ["d0", "d1"] and out.record["collapsed"] == {}
+
+
+# ------------------------------------------------------------------ the one retry
+
+class _Clock:
+    """A fake clock, one per thread, so parallel batches keep their own time."""
+    def __init__(self):
+        import threading
+        self.local = threading.local()
+
+    def now(self):
+        return getattr(self.local, "t", 100.0)
+
+    def advance(self, s):
+        self.local.t = self.now() + s
+
+
+def _http(code):
+    return urllib.error.HTTPError("http://x/rerank", code, "err", {}, None)
+
+
+def _scripted(script, clock, reqs=None):
+    """Each step is (seconds spent, exception | None); None answers with every note scored 0.7."""
+    steps = list(script)
+
+    def transport(req, timeout):
+        if reqs is not None:
+            reqs.append(timeout)
+        spent, exc = steps.pop(0)
+        clock.advance(spent)
+        if exc is not None:
+            raise exc
+        return fake_rerank(lambda d: 0.7)(req, timeout)
+    return transport
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    import types
+    from prospecta import stages
+    c = _Clock()
+    monkeypatch.setattr(stages, "time", types.SimpleNamespace(monotonic=c.now))
+    return c
+
+
+def run_retry(clock, script, timeout=4.0, retries=1, texts=("a=0.7",)):
+    timeouts: list = []
+    calls: list = []
+    rr = CrossEncoderReranker(_scripted(script, clock, timeouts), timeout=timeout, retries=retries)
+    try:
+        out = rr.rerank(QUERY, make_items(list(texts)), calls)
+    except Exception as exc:
+        out = exc
+    return out, calls, timeouts
+
+
+@pytest.mark.parametrize("code", [503, 429])
+def test_retry_once_on_503_or_429_then_scores_are_used(clock, code):
+    out, calls, timeouts = run_retry(clock, [(0.3, _http(code)), (0.2, None)])
+    assert out.grades == {"d0": 0.7}
+    assert [c["purpose"] for c in calls] == ["cross_encoder_rerank", "cross_encoder_rerank_retry"]
+    assert str(code) in calls[0]["error"] and calls[1]["error"] is None and calls[1]["retry"] is True
+    assert timeouts[0] == 4.0 and timeouts[1] == pytest.approx(3.7)
+
+
+def test_retry_also_503_raises_with_both_attempts_recorded(clock):
+    out, calls, _ = run_retry(clock, [(0.3, _http(503)), (0.3, _http(503))])
+    assert isinstance(out, urllib.error.HTTPError) and out.code == 503
+    assert len(calls) == 2 and all("503" in c["error"] for c in calls)
+
+
+def test_custom_transport_status_attribute_counts(clock):
+    class E(Exception):
+        status = 503
+    out, calls, _ = run_retry(clock, [(0.1, E("busy")), (0.1, None)])
+    assert out.grades == {"d0": 0.7} and len(calls) == 2
+
+
+@pytest.mark.parametrize("exc", [TimeoutError("timed out"), _http(400), _http(401), _http(404),
+                                 _http(500), _http(502), ValueError("x")])
+def test_no_retry_for_timeouts_other_statuses_or_other_errors(clock, exc):
+    out, calls, timeouts = run_retry(clock, [(1.0, exc)])
+    assert isinstance(out, Exception) and len(calls) == 1 and len(timeouts) == 1
+
+
+def test_malformed_reply_is_not_retried(clock):
+    calls: list = []
+    rr = CrossEncoderReranker(lambda req, t: {"results": "nope"})
+    with pytest.raises(ValueError):
+        rr.rerank(QUERY, make_items(["a=0.7"]), calls)
+    assert len(calls) == 1
+
+
+def test_no_retry_when_under_half_a_second_is_left(clock):
+    out, calls, _ = run_retry(clock, [(3.6, _http(503))])        # 0.4 s left
+    assert isinstance(out, urllib.error.HTTPError) and len(calls) == 1
+    out, calls, timeouts = run_retry(clock, [(3.5, _http(503)), (0.1, None)])   # exactly 0.5 s
+    assert out.grades == {"d0": 0.7} and len(calls) == 2 and timeouts[1] == pytest.approx(0.5)
+
+
+def test_total_time_never_beyond_the_original_timeout(clock):
+    start = clock.now()
+    run_retry(clock, [(1.0, _http(503)), (2.9, _http(503))], timeout=4.0)
+    assert clock.now() - start <= 4.0
+
+
+def test_retries_zero_turns_it_off(clock):
+    out, calls, _ = run_retry(clock, [(0.1, _http(503))], retries=0)
+    assert isinstance(out, Exception) and len(calls) == 1
+
+
+def test_multi_batch_each_batch_retries_inside_its_own_budget(clock):
+    from prospecta.stages import RERANK_BATCH_TOKENS
+    texts = [f"unique {i} {(f'w{i}x ') * 800}=0.5" for i in range(60)]
+    failed: set = set()
+    lock = __import__("threading").Lock()
+
+    def transport(req, timeout):
+        key = req["documents"][0]
+        clock.advance(1.0)
+        with lock:
+            first = key not in failed
+            failed.add(key)
+        if first:
+            raise _http(503)
+        assert timeout == pytest.approx(3.0)       # its own budget, 4 s minus its own 1 s
+        return fake_rerank(lambda d: 0.5)(req, timeout)
+    calls: list = []
+    out = CrossEncoderReranker(transport, top_n=60, timeout=4.0).rerank(QUERY, make_items(texts), calls)
+    assert len(out.order) == 60
+    n = out.record["requests"]
+    assert n > 1 and len(calls) == 2 * n
+    assert sum(c.get("retry", False) for c in calls) == n
+
+
+def test_retries_setting_default_zero_and_validation():
+    t = lambda *a, **k: None
+    assert build_reranker(rr_cfg(), rerank_transport=t).retries == 1
+    assert build_reranker(rr_cfg(retries=0), rerank_transport=t).retries == 0
+    validate_recall_config(rr_cfg(retries=0))
+    for bad in (-1, True, 1.5, "1"):
+        with pytest.raises(ValueError):
+            validate_recall_config(rr_cfg(retries=bad))
+    from prospecta import bank_defaults
+    assert "retries" not in bank_defaults.NEW_BANK_RECALL_CONFIG["rerank"]
+
+
+def test_expansion_reads_the_retries_setting():
+    import inspect
+    from prospecta import _expand_run
+    assert 'rr.get("retries", RERANK_RETRIES)' in inspect.getsource(_expand_run)
