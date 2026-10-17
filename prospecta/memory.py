@@ -142,6 +142,9 @@ class Memory:
         rerank_model: str | None = None,
         synth_llm: LLMCallable | None = None,
         jev: "Any | None" = None,
+        rerank_transport: "Any | None" = None,
+        reranker_model: str | None = None,
+        decision_model: str | None = None,
         linker: "Any | None" = None,
         schema: str | None = None,
     ) -> None:
@@ -162,6 +165,12 @@ class Memory:
         self._rerank_model = rerank_model
         self._synth_llm = synth_llm
         self._jev = jev
+        # Stage 2 cross-encoder (recall_config.rerank.stage = cross_encoder): its
+        # transport (prospecta.stages.openrouter_rerank_transport) and the
+        # call-argument model overrides for it and for Jev (the decision model).
+        self._rerank_transport = rerank_transport
+        self._reranker_model = reranker_model
+        self._decision_model = decision_model
         # Linker (prospecta._linker.Linker): typed links + entities after retain.
         # None = no linking; with `asynchronous` it runs on one worker thread.
         self._linker = linker

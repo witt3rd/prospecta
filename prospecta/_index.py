@@ -649,7 +649,10 @@ def _search_channels(
             fused, st = run_stages(
                 state, text, fused, config, recall_cfg,
                 StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
-                          model=memory._rerank_model),
+                          model=memory._rerank_model,
+                          rerank_transport=memory._rerank_transport,
+                          reranker_model=memory._reranker_model,
+                          decision_model=memory._decision_model),
                 k=rrf_k, depth=depth,
             )
             tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],

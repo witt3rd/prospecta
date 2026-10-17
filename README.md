@@ -264,7 +264,7 @@ Honest about what isn't there yet:
 - **Embedding-dim change requires bank rebuild.** A bank's `embedding_dim` is fixed at creation. Switching embedder dimensions means a new bank + re-index.
 - **HNSW build cost on large banks.** Postgres builds the per-bank HNSW index incrementally; first-bulk-index can be slow. Configurable via standard pgvector tuning (`m`, `ef_construction`).
 - **Single-language FTS.** No multilingual tsvector support in v0.1.
-- **No retrieval re-ranking model.** RRF fusion is the only post-retrieval step. A cross-encoder rerank layer would be additive but is post-v0.1.
+- **Reranking is opt-in.** RRF fusion is the default order. A bank can add a Sonnet, Jev or cross-encoder (`qwen/qwen3-reranker-8b` through OpenRouter) rerank stage: see `docs/recall-stages.md`.
 
 ---
 
