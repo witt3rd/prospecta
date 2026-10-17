@@ -46,11 +46,11 @@ def near(i, dim=6):
 
 
 # five notes about the same thing in five wordings (different words: the Jaccard collapse keeps all five)
-WORDINGS = ["the header of the context block was hardcoded in the template file",
-            "a template file hardcodes the context block header, which should come from settings",
-            "found it: context header hardcoded inside template, not read from config",
-            "bug report: hardcoded header in the context template instead of the configured one",
-            "the session context header sits hardcoded in a template; make it configurable"]
+WORDINGS = ["the warm filter of the lamp controller was written into the firmware image",
+            "the firmware image embeds the lamp controller warm filter, which should come from settings",
+            "found it: lamp warm filter baked inside the firmware, never read from the config",
+            "bug report: the configured filter is ignored, the controller firmware has the warm one written in",
+            "the lamp warm filter sits baked in a firmware image; make it configurable"]
 
 
 def five(scores=(0.5, 0.9, 0.6, 0.7, 0.4), found=((1,), (2,), (1, 3), (2,), (3,))):
@@ -229,19 +229,19 @@ def topic_embed(texts):
 LEDGER = {
     **{f"ledger-{i}.md": (text, {"project": "atlas", "created_on": f"2024-05-0{i + 1}"})
        for i, text in enumerate([
-           "alpha ledger entry: the header block of the context template was hardcoded in the file",
-           "alpha ledger: a template file hardcodes the header of the context block instead of the setting",
-           "ledger alpha, found it: header hardcoded in the context template, not read from config",
-           "alpha ledger bug: configured header ignored, the context template has it written in",
-           "the alpha ledger says the context header is hardcoded in a template; make it configurable"])},
-    "beta-ledger.md": ("beta ledger: the context block is cached for ten minutes per thread", {"project": "atlas"}),
-    "mixed-ledger.md": ("alpha beta ledger: header text and cache time are both settings", {"project": "atlas"}),
-    "gamma-ledger.md": ("gamma ledger: the footer of the block lists the searches", {"project": "atlas"}),
+           "alpha ledger entry: the warm filter of the lamp controller was written into the firmware image",
+           "alpha ledger: the firmware image embeds the lamp controller warm filter instead of the setting",
+           "ledger alpha, found it: lamp warm filter baked inside the firmware, not read from the config",
+           "alpha ledger bug: the configured filter is ignored, the controller firmware has the warm one written in",
+           "the alpha ledger says the lamp warm filter is baked in a firmware image; make it configurable"])},
+    "beta-ledger.md": ("beta ledger: the controller firmware is cached for ten minutes per lamp group", {"project": "atlas"}),
+    "mixed-ledger.md": ("alpha beta ledger: the filter colour and the cache time are both settings", {"project": "atlas"}),
+    "gamma-ledger.md": ("gamma ledger: the footer of the report lists the lamp groups", {"project": "atlas"}),
 }
 
 
 def ledger_scores(q, d):
-    return 0.9 if "ledger-1" in d or "a template file hardcodes" in d else 0.6
+    return 0.9 if "the firmware image embeds" in d else 0.6
 
 
 @pytest.fixture
@@ -258,14 +258,14 @@ def made(fresh_db):
 
 
 def make_mem(made, **kw):
-    mem = made(llm=FakeWriter([S("alpha ledger header hardcoded context template"),
-                               S("ledger context block settings")]),
+    mem = made(llm=FakeWriter([S("alpha ledger warm filter firmware controller"),
+                               S("ledger controller firmware settings")]),
                rerank=FakeRerank(score=ledger_scores), notes=LEDGER, rerank_cfg={"deduplicate_near_copies": False},
                **kw)
     return mem
 
 
-QUESTION = "what do the ledger notes say about the context header?"
+QUESTION = "what do the ledger notes say about the warm filter?"
 
 
 def test_five_wordings_of_one_note_come_back_once_through_the_entry_point(made):
