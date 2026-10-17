@@ -20,7 +20,7 @@ The design is `docs/postgres-hybrid.md`; it is the one normative description.
 
 ## Status
 
-**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` and a `cross_encoder` rerank (`prospecta/bank_defaults.py`). There is one design and one code path: a bank whose `channel_config` is empty runs `hybrid_chunk` with its defaults, and anything a stored config names that the library no longer has is ignored. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
+**v1.0.** Release notes: `CHANGELOG.md`. A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` and a `cross_encoder` rerank (`prospecta/bank_defaults.py`). There is one design and one code path: a bank whose `channel_config` is empty runs `hybrid_chunk` with its defaults, and anything a stored config names that the library no longer has is ignored. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
 
 Substrate: Postgres with the `pgvector` extension, **0.8 or newer** (Stage 1 uses iterative index scans). Models: an embedder and an `llm` are injected callables; the Stage 2 reranker and the decision model are reached over HTTP with an `OPENROUTER_API_KEY`. Without that key retrieval still works: the Stage 1 order stands instead of a rerank and a chat message is not gated (the result says so).
 
@@ -189,11 +189,11 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 
-## Caveats (v0.1)
+## Caveats (1.0)
 
 Honest about what is not there:
 
-- **Sync only.** All `retain` / `search` / `ask` calls block; Mode 1 runs its searches on threads inside one call. An async surface is post-v0.1.
+- **Sync only.** All `retain` / `search` / `ask` calls block; Mode 1 runs its searches on threads inside one call. An async surface is post-1.0.
 - **English-only stemming.** The stemmed retriever uses `to_tsvector('english', ...)`; the exact retriever (unstemmed `simple`) and the semantic retriever are language-neutral.
 - **pgvector 0.8 or newer.** Stage 1 uses iterative index scans; there is no fallback for an older pgvector.
 - **Embedding-dim change requires a new bank** (`prospecta migrate-bank`).

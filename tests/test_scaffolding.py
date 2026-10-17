@@ -1,4 +1,4 @@
-"""Scaffolding acceptance tests for prospecta v0.1.
+"""Scaffolding acceptance tests for prospecta.
 
 These tests verify the bootstrap layout: package, modules, packaging metadata.
 """
@@ -9,7 +9,7 @@ def test_pyproject_toml_parses():
     from pathlib import Path
     data = tomllib.loads(Path("pyproject.toml").read_text())
     assert data["project"]["name"] == "prospecta"
-    assert data["project"]["version"] == "0.1.0.dev0"
+    assert data["project"]["version"] == "1.0.0"
     deps = data["project"]["dependencies"]
     assert any("psycopg" in d for d in deps)
     assert any("pgvector" in d for d in deps)
