@@ -133,10 +133,57 @@ With the `hybrid_chunk` channel (and, optionally, the cross-encoder stage) every
 ```python
 hits = m.search('"electric dreams" 0x80070005', date_from="2024-01-01", excluded_sources=["turn:41"])
 task = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")
-print(task.block)       # "## Recalled Project Context": cited notes, the project's own first
+print(task.block)       # "## Recalled Project Context": cited notes, the project's own first (see the next section)
 res = m.ask("how are deletes handled?", sufficiency=True)   # optional stage 3 gate
 print(res.rendered)     # the answer with [n] markers, then [n] [source | date] "verbatim snippet"
 ```
+
+### Automatic recall by query expansion (Mode 1: chat messages and tasks)
+
+`Memory.expand_and_recall(prompt, kind="chat" | "task", ...)` is the one entry point for the automatic recall
+of `docs/postgres-hybrid.md` (section 1). It expands the prompt into N structured searches whose job is to find the
+**surrounding context** useful for responding (entities, governing decisions, earlier work, people, periods), runs
+them all through Stage 1 and Stage 2 in parallel, merges the records and returns one cited block. It never raises and
+stays inside a deadline.
+
+```python
+got = m.expand_and_recall("do you remember who I saw it with?", agent_last="You mentioned the Spring show.",
+                          excluded_sources=["turn:41", "turn:42"], date_from="2024-01-01")        # a chat message
+got = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")   # a task
+print(got.block)       # the searches that ran, "cite [n]", then the numbered items (source, date, kind, match, snippet)
+got.searches, got.items, got.fallbacks, got.timings_ms, got.accounting   # what ran, what was found, what degraded, ms, tokens and cost
+```
+
+1. **Gate** (chat only; a task is never gated): `needs_memory` from the decision model (default `typesafe/jev-1.14`, the
+   Memory's `jev=` transport) skips acknowledgements, go-aheads, greetings and live-state questions (at or above 0.5 it
+   goes on). `decision=callable` injects the caller's own (a number, a bool, a `GateDecision`); `gate=False` switches it off.
+2. **Writer** (the Memory's `llm`; model `query_writer_model=`, else `recall_config.models.query_writer_model`, else
+   `PROSPECTA_QUERY_WRITER_MODEL`, else `openrouter/google/gemini-2.5-flash-lite`): about 3 searches for a short message,
+   up to 10 to 20 for an elaborate one, **at most `max_searches` (20)**. Each search is `{query, terms, date_from,
+   date_to}`: the `query` feeds the semantic and stemmed retrievers and the reranker; the `terms` (names, identifiers and
+   "quoted phrases", verbatim from the prompt) feed the exact retriever; a period is pushed into Stage 1. A term of the
+   prompt that no search carries is put back into the first one. A bad reply falls back to one search: the prompt itself.
+3. **Stage 1 and 2 in parallel**, each search against its own query, with the same filters (`metadata_filter`,
+   `excluded_sources`, the search's own period else `date_from` / `date_to`); at most `max_concurrency` (8, never more
+   than the connection pool) searches are in the database at once, and a search's rerank holds no connection.
+4. **Merge**: one record once (best score, `found_by` the searches), near-copies collapsed, best first, a task's own
+   project first and other projects labeled; **sized by relevance, never by a count** (`max_tokens`, default 0 = off, is
+   only a safety valve).
+
+| setting | call argument | bank `recall_config` | default |
+|---|---|---|---|
+| deadline for everything | `deadline=` | `expansion.deadline_s` | 7 s |
+| hard maximum of searches | `max_searches=` | `expansion.max_searches` | 20 |
+| searches in the database at once | `max_concurrency=` | `expansion.max_concurrency` | 8 (and the pool size) |
+| token valve | `max_tokens=` | `expansion.max_tokens` | 0 (off) |
+| Stage 1 order cut when no rerank | | `expansion.fallback_min_rel` | 0.5 x the best |
+| gate threshold / switch | `needs_memory_threshold=`, `gate=` | `stage0_gate.needs_memory_threshold`, `.enabled` | 0.5 / on |
+| score floor of Stage 2 | `min_score=` | `rerank.min_score` | 0.15 |
+| models | `query_writer_model=`, `decision_model=`, `reranker_model=` | `models.*`, `rerank.model` | see above |
+
+`recall_for_task` replaced the old 2-4 facet decomposition (the facets, `TaskRecall`, `max_facets` and its `limit` are
+gone); `POST /lookup {"task": ...}` returns the same block plus `searches`, `fallbacks` and `error`, and no longer takes
+`limit`. Calls and one `recall` event are recorded for a task by default (`record=`), not for a chat.
 
 ### Caller-supplied index_text — the spine override
 
@@ -255,7 +302,7 @@ The `graph` channel (links and entities, `Linker`, `JevReader`; migration 0006) 
 
 **`bm25` channel (opt-in: add `{"name": "bm25", "weight": 1}` to the config; superseded by `hybrid_chunk`).** Real Okapi BM25 (k1=1.5, b=0.75, stemmed, stop words removed, OR semantics, so a natural-language question still matches) over the bank's `kind='chunk'` items, in process: no extension, no database change. The in-process index is **not** the default backend: without a `pg_search` index the channel fails (the recall trace records it, the other channels still answer) instead of rebuilding an in-memory index after every write; opt in with `Bm25Chunks.backend = AutoBm25(fallback=InProcessBm25())`. The per-bank index is persisted as gzip JSON under `$PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25` (in memory when neither is set) and rebuilt automatically whenever the bank's chunk fingerprint (count, newest `created_at`, id hash) changes; it holds postings only, and evidence text is read from the database for the top hits. Memory grows with the corpus (not yet measured on a Forge-sized bank). *Seam, not built:* `prospecta.channels.Bm25Backend` (`search(conn, bank_id, query, n)`); a `pg_search` backend (`CREATE INDEX ... USING bm25`, `original_chunk ||| :text` ordered by `pdb.score(id)`; hit@10 0.71 against 0.76 for the in-process one in the design measurements) would implement it, but needs the extension on the live Postgres, which is main's decision (design 8.6, migration `0009_bm25_optional`).
 
-**`hybrid_chunk` channel (opt-in: add `{"name": "hybrid_chunk", "weight": 1}`; the native Postgres Stage 1 of `docs/postgres-hybrid.md`).** One query over the bank's `kind='chunk'` items with three retrievers, each keeping its own reserved slots: semantic (HNSW, top 25), stemmed lexical (`body_tsv`, `english`, top 20) and unstemmed exact / phrase (`simple`, the stored `memory_items.exact_tsv` column and its GIN index of migration 0020, top 20). The question is read by `websearch_to_tsquery`, so `"exact phrase"` (adjacent, case-insensitive, unstemmed), `OR` and `-exclude` work, and identifiers such as `v1.14` or `0x80070005` match whole. **A plain question (no search operator: no straight double quote, no standalone upper-case `OR`, no word led by `-`) is read by the stemmed retriever as the OR of its stemmed words (stop words drop, at most the 8 longest words are used), ranked by `ts_rank_cd`, so a natural-language question finds a chunk that shares only some of its words; the exact retriever still ANDs the words as written, and a question with an operator keeps websearch semantics on both retrievers.** The bank, the note-date window (`COALESCE(documents.created_on, created_at::date)`), the anti-echo `excluded_sources` and the metadata / `_allow` filter apply inside all three retrievers before their slots are cut (`RecallState.date_from` / `date_to` / `excluded_sources`, set by the caller). They are fused in SQL (`FULL OUTER JOIN`, top 50) with an RRF fallback score, and a `ts_headline` `exact_snippet` (`<<matches>>`) is computed for those winners when a lexical retriever matched. Params (the plan's `stage1_postgres`): `semantic_limit` 25, `stemmed_limit` 20, `exact_limit` 20, `fused_limit` 50, `hnsw_ef_search` 100. Needs pgvector >= 0.8. **A question with no searchable words (blank, punctuation, only stop words) and a date window is a date-only question: no retriever runs and the question is not embedded; Stage 1 lists the chunks inside the window, newest note first (`created_on`, then the note created last), up to `fused_limit`, with `match_kind` `date`; every other filter still applies. No words and no window is empty.** The exact retriever reads the stored `exact_tsv` vector (migration 0020, which rewrites `memory_items`: see `docs/exact-tsv.md` before applying it to a live bank), so nothing is re-tokenized at query time; ranking a very common word still scores every chunk that holds it (`ts_rank_cd`), a few microseconds per matching chunk.
+**`hybrid_chunk` channel (opt-in: add `{"name": "hybrid_chunk", "weight": 1}`; the native Postgres Stage 1 of `docs/postgres-hybrid.md`).** One query over the bank's `kind='chunk'` items with three retrievers, each keeping its own reserved slots: semantic (HNSW, top 25), stemmed lexical (`body_tsv`, `english`, top 20) and unstemmed exact / phrase (`simple`, the stored `memory_items.exact_tsv` column and its GIN index of migration 0020, top 20). The question is read by `websearch_to_tsquery`, so `"exact phrase"` (adjacent, case-insensitive, unstemmed), `OR` and `-exclude` work, and identifiers such as `v1.14` or `0x80070005` match whole. **A plain question (no search operator: no straight double quote, no standalone upper-case `OR`, no word led by `-`) is read by the stemmed retriever as the OR of its stemmed words (stop words drop; every word is used, there is no cap), ranked by `ts_rank_cd`, so a natural-language question finds a chunk that shares only some of its words; the exact retriever still ANDs the words as written, and a question with an operator keeps websearch semantics on both retrievers.** The bank, the note-date window (`COALESCE(documents.created_on, created_at::date)`), the anti-echo `excluded_sources` and the metadata / `_allow` filter apply inside all three retrievers before their slots are cut (`RecallState.date_from` / `date_to` / `excluded_sources`, set by the caller). They are fused in SQL (`FULL OUTER JOIN`, top 50) with an RRF fallback score, and a `ts_headline` `exact_snippet` (`<<matches>>`) is computed for those winners when a lexical retriever matched. Params (the plan's `stage1_postgres`): `semantic_limit` 25, `stemmed_limit` 20, `exact_limit` 20, `fused_limit` 50, `hnsw_ef_search` 100. Needs pgvector >= 0.8. **A question with no searchable words (blank, punctuation, only stop words) and a date window is a date-only question: no retriever runs and the question is not embedded; Stage 1 lists the chunks inside the window, newest note first (`created_on`, then the note created last), up to `fused_limit`, with `match_kind` `date`; every other filter still applies. No words and no window is empty.** The exact retriever reads the stored `exact_tsv` vector (migration 0020, which rewrites `memory_items`: see `docs/exact-tsv.md` before applying it to a live bank), so nothing is re-tokenized at query time; ranking a very common word still scores every chunk that holds it (`ts_rank_cd`), a few microseconds per matching chunk.
 
 **`keyword` channel (opt-in: add `{"name": "keyword", "weight": 1}`).** Raw words of the question against the raw `original_chunk` text of every stored item (any kind, so a bank holding only question-kind items is still searched): lower-cased, OR semantics, **no stemming and no stop-word removal** (Postgres `simple` configuration). Stemming only when asked: `"params": {"stemming": true}` (`english`). It is never silently empty over a bank with passages: no shared word is recorded as a `note` on the channel in the recall trace, and a question with no usable word raises (the trace records the error). Unlike `bm25` it has no index: it scans the bank per query.
 

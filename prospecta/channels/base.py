@@ -37,6 +37,9 @@ class QueryPlan:
     formulations: list[str] = field(default_factory=list)
     filters: Filters = field(default_factory=Filters)
     now: datetime = field(default_factory=_utcnow)
+    # What the Stage 1 exact retriever reads instead of `text` (the verbatim names, identifiers
+    # and "quoted phrases" of a query expansion's search); None: it reads `text`.
+    exact_text: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -50,6 +53,7 @@ class QueryPlan:
                 "hard": self.filters.hard,
             },
             "now": self.now.isoformat(),
+            **({"exact_text": self.exact_text} if self.exact_text is not None else {}),
         }
 
 

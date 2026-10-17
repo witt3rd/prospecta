@@ -20,16 +20,15 @@ runbook.
 """
 from __future__ import annotations
 
-import time
-
 import psycopg
 
-from prospecta.db.keyword_index import has_index, indexed_expression, take_other_builder_locks
+from prospecta.db.builder_locks import hold_builder_locks
+from prospecta.db.keyword_index import has_index, indexed_expression
 
 COLUMN = "exact_tsv"
 INDEX_NAME = "memory_items_exact_tsv_gin"
-# MIGRATE_LOCK_KEY + 4 (migrate.py uses +0..+2, keyword_index.py +3); kept literal to avoid an
-# import cycle.
+# This build's own advisory key (MIGRATE_LOCK_KEY + 4); it takes every builder's key, this one
+# included, in ascending order (prospecta/db/builder_locks.py).
 LOCK_KEY = 0x70726F73706563 + 4
 
 
@@ -56,23 +55,20 @@ def ensure_exact_tsv_index(database_url: str, *, rebuild: bool = False) -> dict:
     statistics of the column (its tsquery is a parameter, costed at the default selectivity
     whatever the statistics say), and autovacuum analyzes it in due course.
 
-    The locks are polled with pg_try_advisory_lock, never waited on: CREATE INDEX
+    The build holds every index builder's advisory key, its own (+4) included, taken in the
+    one ascending order and polled with pg_try_advisory_lock, never waited on: CREATE INDEX
     CONCURRENTLY waits on every running statement and transaction, so a peer blocked inside
-    pg_advisory_lock would deadlock it (the 0004/0018 caveat). The build also holds the keys
-    of the other post-commit index builders (0004, 0005, 0018), so that no two CREATE INDEX
-    CONCURRENTLY run on the table at once (`keyword_index.take_other_builder_locks`).
+    pg_advisory_lock would deadlock it (the 0004/0018 caveat), and no two CREATE INDEX
+    CONCURRENTLY run on the table at once (prospecta/db/builder_locks.py; a builder that
+    held only its own key while polling the others' livelocked against a peer doing the same).
     """
     with psycopg.connect(database_url, autocommit=True) as conn:
         if not rebuild and has_exact_tsv_index(conn):      # the usual case: nothing to take locks for
             return {"index": INDEX_NAME, "created": False, "rebuilt": False}
-        while not conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,)).fetchone()[0]:
-            time.sleep(0.05)
-        others: list[int] = []
-        try:
+        with hold_builder_locks(conn):
             existed = has_exact_tsv_index(conn)
             if existed and not rebuild:
                 return {"index": INDEX_NAME, "created": False, "rebuilt": False}
-            others = take_other_builder_locks(conn, LOCK_KEY)
             if existed:
                 tmp = INDEX_NAME + "_new"
                 conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{tmp}"')
@@ -85,7 +81,3 @@ def ensure_exact_tsv_index(database_url: str, *, rebuild: bool = False) -> dict:
             conn.execute(f'CREATE INDEX CONCURRENTLY "{INDEX_NAME}" '
                          f"ON memory_items USING GIN ({COLUMN})")
             return {"index": INDEX_NAME, "created": True, "rebuilt": False}
-        finally:
-            for key in reversed(others):
-                conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
-            conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))

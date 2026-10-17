@@ -9,14 +9,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 
 from typing import Literal
 
 from prospecta._types import (
-    AskResult, EmbedCallable, LLMCallable, Query, RAGResult, RecalledMemory, TaskRecall, Tracer,
+    AskResult, EmbedCallable, ExpandedRecall, LLMCallable, Query, RAGResult, RecalledMemory,
+    TaskBrief, Tracer,
 )
 from prospecta.db.pool import ConnectionPool
 from prospecta.db.schema import check_schema_writable, resolve_schema, scoped_url
@@ -652,6 +653,81 @@ class Memory:
         """One llm_call event per model call record."""
         self._emit_stage_calls([{"calls": calls}])
 
+    def expand_and_recall(
+        self,
+        prompt: "str | TaskBrief",
+        kind: "Literal['chat','task']" = "chat",
+        *,
+        agent_last: str | None = None,
+        project: str | None = None,
+        date_from: "date | str | None" = None,
+        date_to: "date | str | None" = None,
+        excluded_sources: "list[str] | None" = None,
+        metadata_filter: dict | None = None,
+        deadline: float | None = None,
+        max_searches: int | None = None,
+        max_concurrency: int | None = None,
+        max_tokens: int | None = None,
+        query_writer_model: str | None = None,
+        decision_model: str | None = None,
+        reranker_model: str | None = None,
+        decision: "Callable | None" = None,
+        gate: bool | None = None,
+        needs_memory_threshold: float | None = None,
+        min_score: float | None = None,
+        depth: "Literal['standard','deep'] | None" = None,
+        record: bool | None = None,
+        now: "date | None" = None,
+    ) -> "ExpandedRecall":
+        """Mode 1 (docs/postgres-hybrid.md): automatic recall by query expansion, the one
+        entry point for a chat message (`kind="chat"`, `prompt` a string, `agent_last` the
+        agent's last turn for follow-ups) and for a task (`kind="task"`; `prompt` a TaskBrief
+        of title / ask / done / project, or the brief's text).
+
+        1. Gate (chat only): the decision model's `needs_memory` (a noul in 0..1; at or above
+           `needs_memory_threshold`, 0.5, the message goes on) skips acknowledgements, go-aheads,
+           greetings and live-state questions. `decision(prompt, agent_last)` injects the caller's
+           own decision (a number in 0..1, a bool, a GateDecision, or a mapping with needs_memory);
+           else Memory(jev=...) is asked; with neither the gate is not run. A failing gate lets the
+           message through. `gate=False` turns it off. A task is never gated.
+        2. Writer: the query-writer model (`query_writer_model`, else recall_config.models
+           .query_writer_model, else PROSPECTA_QUERY_WRITER_MODEL, else
+           openrouter/google/gemini-2.5-flash-lite; it is the Memory's `llm`) expands the prompt into
+           N searches {query, terms (verbatim names, identifiers, "quoted phrases"), date_from,
+           date_to}: about 3 for a short chat message, up to 10 to 20 for an elaborate one, never
+           more than `max_searches` (20). Terms of the prompt that no search carries are put back
+           into the first search. A bad reply falls back to ONE search: the prompt itself.
+        3. Every search runs Stage 1 (the bank's hybrid_chunk channel; its `terms` feed the exact
+           retriever, its `query` the semantic and stemmed ones) in parallel, at most
+           `max_concurrency` (8, and never more than the pool) at once, each with the same filters:
+           `metadata_filter` (scope), `excluded_sources` (anti-echo), and the search's own period, else
+           the caller's `date_from` / `date_to`.
+        4. Each search's candidates are reranked against its OWN query (the cross-encoder when the
+           bank's recall_config.rerank is a cross_encoder stage; `min_score` is its floor); a search
+           whose rerank fails keeps Stage 1's order, cut to the candidates within recall_config
+           .expansion.fallback_min_rel (0.5) of its best.
+        5. The records merge: one record once (best score, `found_by` the searches that found it),
+           near-copies collapsed, best first, the `project`'s own notes first and other projects'
+           labeled. Sized by relevance, never by a count; `max_tokens` (0 = off) is only a safety valve.
+        6. One cited block (`format_cited_rag_block`): the searches that ran, the line telling the
+           agent to cite [n], then the numbered items.
+
+        Everything is inside `deadline` seconds (7): a search still running then is dropped. It never
+        raises: the returned ExpandedRecall carries `block`, `searches`, per-stage `timings_ms`,
+        `fallbacks` and `accounting`. `record` (default: for a task, not for a chat) writes the
+        llm_call events and one `recall` event. Defaults for the numbers also come from the bank's
+        recall_config (`expansion`: max_searches, max_concurrency, deadline_s, max_tokens,
+        fallback_min_rel; `stage0_gate`: enabled, needs_memory_threshold)."""
+        from prospecta._expand_run import run_expansion
+        return run_expansion(
+            self, prompt, kind, agent_last=agent_last, project=project, date_from=date_from,
+            date_to=date_to, excluded_sources=excluded_sources, metadata_filter=metadata_filter,
+            deadline=deadline, max_searches=max_searches, max_concurrency=max_concurrency,
+            max_tokens=max_tokens, query_writer_model=query_writer_model, decision_model=decision_model,
+            reranker_model=reranker_model, decision=decision, gate=gate,
+            needs_memory_threshold=needs_memory_threshold, min_score=min_score, depth=depth,
+            record=record, now=now)
+
     def recall_for_task(
         self,
         *,
@@ -659,47 +735,19 @@ class Memory:
         ask: str,
         done: str | None = None,
         project: str | None = None,
-        limit: int = 10,
-        max_facets: int = 4,
-        query_writer_model: str | None = None,
-        depth: "Literal['standard','deep'] | None" = None,
-        date_from: "date | str | None" = None,
-        date_to: "date | str | None" = None,
-        excluded_sources: "list[str] | None" = None,
-        reranker_model: str | None = None,
-        decision_model: str | None = None,
-    ) -> "TaskRecall":
-        """Mode 1B: recall for a non-interactive task (a commission, a wake, a background
-        job). The brief is split into 2 to `max_facets` facet queries by the query-writer
-        model (`query_writer_model`, else recall_config.models.query_writer_model, else
-        PROSPECTA_QUERY_WRITER_MODEL, else the default; without an `llm` the brief's own
-        title / ask / done are the queries), every facet runs Stage 1 + Stage 2 (in
-        parallel), and the notes merge, once each, into one cited block: those of
-        `project` first, notes of other projects labeled with theirs. There is no
-        needs-memory gate: a task always searches. Returns TaskRecall(queries, items, block).
-        """
-        from prospecta.cited import TASK_HEADING, format_cited_rag_block
-        from prospecta._task import decompose_brief, resolve_query_writer_model, scope_first
-        from prospecta.stages import read_recall_config
-
+        **options,
+    ) -> "ExpandedRecall":
+        """Recall for a non-interactive task: `expand_and_recall(TaskBrief(...), kind="task")`,
+        the same entry point as a chat message (a thin wrapper that checks the brief). `options`
+        are expand_and_recall's (date_from, date_to, excluded_sources, deadline, max_tokens,
+        query_writer_model, reranker_model, ...). A task is never gated and its block is sized by
+        relevance. The result has `.queries`, `.items` and `.block`."""
         for name, value in (("title", title), ("ask", ask)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} is required (non-empty string)")
-        with self._pool.connection() as conn:
-            bank_models = read_recall_config(conn, self._default_bank_id).get("models") or {}
-            conn.rollback()
-        queries, calls = decompose_brief(
-            title, ask, done, project, llm=self._llm, max_facets=max_facets,
-            model=resolve_query_writer_model(query_writer_model, bank_models.get("query_writer_model")))
-        self._emit_calls(calls)
-        by_query: list[list[RecalledMemory]] = []
-        self.recall(
-            queries, limit=limit, depth=depth, date_from=date_from, date_to=date_to,
-            excluded_sources=excluded_sources, reranker_model=reranker_model,
-            decision_model=decision_model, parallel=True, _by_query=by_query)
-        items = scope_first(_interleave(dict(zip(queries, by_query))), project)[:limit]
-        return TaskRecall(queries=queries, items=items, block=format_cited_rag_block(
-            items, heading=TASK_HEADING, own_project=project))
+        return self.expand_and_recall(
+            TaskBrief(title=title, ask=ask, done=done, project=project), kind="task",
+            project=project, **options)
 
     def ask(
         self,

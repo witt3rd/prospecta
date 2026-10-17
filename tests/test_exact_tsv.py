@@ -20,7 +20,6 @@ from prospecta.db import migrate
 from prospecta.db.exact_tsv import (
     COLUMN, INDEX_NAME, LOCK_KEY, ensure_exact_tsv_index, has_exact_tsv_index,
 )
-from prospecta.db.migrate import MIGRATE_LOCK_KEY
 from prospecta.db.keyword_index import indexed_expression
 from prospecta.db.migrate import get_schema_version, run_migrations
 from prospecta.db.queries import _stage1_statement, stage1_search
@@ -187,27 +186,8 @@ def test_building_the_index_polls_for_its_lock_and_never_blocks_on_it(fresh_db):
         assert not t.is_alive() and done[0]["rebuilt"] is True
 
 
-@pytest.mark.parametrize("peer", [1, 2, 3])
-def test_the_build_waits_for_the_other_index_builders_by_polling(fresh_db, peer):
-    """Two CREATE INDEX CONCURRENTLY on one table can deadlock (the statement waiting for the
-    table lock holds a snapshot the builder waits for), so the 0004 / 0005 / 0018 builders and
-    this one run one at a time: while a peer holds its key, this build waits, still polling."""
-    with psycopg.connect(fresh_db, autocommit=True) as holder, \
-            psycopg.connect(fresh_db, autocommit=True) as watcher:
-        holder.execute("SELECT pg_advisory_lock(%s)", (MIGRATE_LOCK_KEY + peer,))
-        done = []
-        t = threading.Thread(target=lambda: done.append(ensure_exact_tsv_index(fresh_db, rebuild=True)))
-        t.start()
-        time.sleep(0.5)
-        assert t.is_alive()
-        assert watcher.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                               "AND wait_event = 'advisory'").fetchone()[0] == 0
-        assert not watcher.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,)).fetchone()[0]  # ours is taken
-        holder.execute("SELECT pg_advisory_unlock(%s)", (MIGRATE_LOCK_KEY + peer,))
-        t.join(timeout=30)
-        assert not t.is_alive() and done[0]["rebuilt"] is True
-        assert watcher.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,)).fetchone()[0]    # and released
-        watcher.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+# (That the build waits for the other index builders, in one ascending order, is pinned by
+# tests/db/test_builder_locks.py.)
 
 
 # --------------------------------------------------------------------------

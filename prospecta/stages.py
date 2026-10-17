@@ -17,7 +17,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from prospecta._filters import coerce_date
 from prospecta._scorecut import (HOP_MIN_REL, check_depth, pool_min_rel, POOL_MIN_REL, READER_MIN_REL, rel_cut,
@@ -122,7 +122,8 @@ def validate_recall_config(cfg: dict) -> None:
         raise ValueError("recall_config must be an object")
     for key in cfg:
         if key not in ("rerank", "gate", "reader", "evidence", "depth",
-                       "link_completeness", "fusion", "models", "stage3_sufficiency"):
+                       "link_completeness", "fusion", "models", "stage3_sufficiency",
+                       "stage0_gate", "expansion"):
             raise ValueError(f"unknown recall_config key {key!r}")
     if cfg.get("link_completeness", "all-pairs") not in ("connected", "all-pairs"):
         raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
@@ -146,6 +147,29 @@ def validate_recall_config(cfg: dict) -> None:
     v = s3.get("threshold")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1):
         raise ValueError("stage3_sufficiency.threshold must be a number in [0, 1]")
+    g0 = cfg.get("stage0_gate", {})
+    if not isinstance(g0, dict) or set(g0) - {"enabled", "needs_memory_threshold"}:
+        raise ValueError("stage0_gate must be an object of enabled/needs_memory_threshold")
+    if not isinstance(g0.get("enabled", True), bool):
+        raise ValueError("stage0_gate.enabled must be true or false")
+    v = g0.get("needs_memory_threshold")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1):
+        raise ValueError("stage0_gate.needs_memory_threshold must be a number in [0, 1]")
+    ex = cfg.get("expansion", {})
+    if not isinstance(ex, dict) or set(ex) - {"max_searches", "max_concurrency", "deadline_s",
+                                              "max_tokens", "fallback_min_rel"}:
+        raise ValueError("expansion must be an object of max_searches/max_concurrency/"
+                         "deadline_s/max_tokens/fallback_min_rel")
+    for name, floor in (("max_searches", 1), ("max_concurrency", 1), ("max_tokens", 0)):
+        v = ex.get(name)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < floor):
+            raise ValueError(f"expansion.{name} must be an integer >= {floor}")
+    v = ex.get("deadline_s")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+        raise ValueError("expansion.deadline_s must be a number > 0")
+    v = ex.get("fallback_min_rel")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1):
+        raise ValueError("expansion.fallback_min_rel must be a number in [0, 1]")
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
     for section, name in ((models, "decision_model"), (models, "query_writer_model"), (rr, "model")):
         v = section.get(name)
@@ -602,6 +626,44 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / union if union else 0.0
 
 
+def deduplicate_near_copies(texts: Sequence[str], order: Sequence[int],
+                            threshold: float = NEAR_COPY_JACCARD) -> tuple[list[int], dict[int, int]]:
+    """Collapse near-copies. `order` lists indexes into `texts`, best first. A text whose token
+    Jaccard with an already-kept text is over `threshold` is a near-copy of the first such
+    kept text and collapses into it (the best-scored copy survives). Returns (the surviving
+    indexes, in `order`; {collapsed index: the surviving index it collapsed into}).
+
+    Exactly the greedy comparison of every text with every survivor, without making it: a pair
+    over the threshold must share a token among the rarest `n - ceil(threshold * n) + 1` tokens
+    of each (prefix filtering over the tokens' document frequency), so only texts that share
+    such a token are compared. A merge of hundreds of records (20 searches) stays cheap."""
+    sets = {i: _words(texts[i]) for i in order}
+    freq: dict[str, int] = {}
+    for toks in sets.values():
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+    index: dict[str, list[int]] = {}     # token -> positions (in `survivors`) whose prefix holds it
+    survivors: list[int] = []
+    collapsed: dict[int, int] = {}
+    for i in order:
+        toks = sets[i]
+        if not toks:                      # no words: nothing to be a copy of
+            survivors.append(i)
+            continue
+        ranked = sorted(toks, key=lambda t: (freq[t], t))
+        prefix = ranked[:max(1, len(ranked) - math.ceil(threshold * len(ranked) - 1e-9) + 1)]
+        candidates = sorted({pos for t in prefix for pos in index.get(t, ())})
+        twin = next((survivors[pos] for pos in candidates
+                     if _jaccard(toks, sets[survivors[pos]]) > threshold), None)
+        if twin is not None:
+            collapsed[i] = twin
+            continue
+        survivors.append(i)
+        for t in prefix:
+            index.setdefault(t, []).append(len(survivors) - 1)
+    return survivors, collapsed
+
+
 class CrossEncoderReranker:
     """Stage 2 of docs/postgres-hybrid.md: a cross-encoder scores every
     (query, note) pair through OpenRouter's rerank endpoint (verified shape:
@@ -680,16 +742,8 @@ class CrossEncoderReranker:
         n_below = len(ranked) - len(kept)
         collapsed: dict[str, str] = {}
         if self.deduplicate:
-            words = {i: _words(items[i].evidence) for i in kept}
-            survivors: list[int] = []
-            for i in kept:
-                twin = next((j for j in survivors
-                             if _jaccard(words[i], words[j]) > NEAR_COPY_JACCARD), None)
-                if twin is None:
-                    survivors.append(i)
-                else:
-                    collapsed[items[i].doc.document_id] = items[twin].doc.document_id
-            kept = survivors
+            kept, twins = deduplicate_near_copies([it.evidence for it in items], kept)
+            collapsed = {items[i].doc.document_id: items[j].doc.document_id for i, j in twins.items()}
         order = kept[:self.top_n]
         return Outcome(order=order,
                        grades={items[i].doc.document_id: scores[i] for i in order},

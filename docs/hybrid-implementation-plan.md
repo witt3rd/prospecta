@@ -106,7 +106,7 @@ Both models and their thresholds are configurable at three levels (per-call over
     * Passes `excluded_sources` (last 2 turns of current session) into Stage 1 + Stage 2 (`reranker_model`, default `qwen/qwen3-reranker-8b`).
     * Formats the injected `<memory-context>` block with citation headers and `Exact match snippet:` lines.
   * **Mode 1B (Non-interactive task/commission recall):**
-    * Add `memory.recall_for_task(title=..., ask=..., done=..., project=...)` (and `POST /lookup` batch support) that decomposes a task brief into 2–4 facet queries, runs batched Stage 1 + Stage 2, and returns a cited RAG context block.
+    * Add `memory.recall_for_task(title=..., ask=..., done=..., project=...)` (and `POST /lookup` batch support) that returns a cited RAG context block. (Its first version decomposed the brief into 2–4 facets; that is replaced by Mode 1 query expansion, `Memory.expand_and_recall`, used by chat and task alike: see `docs/postgres-hybrid.md` section 1.)
   * **Mode 2A & 2B (Interactive Search & Interactive RAG):**
     * `memory.search()` and `POST /lookup` skip Stage 0 Jev, run Stage 1 + Stage 2, and return `exact_snippet` + citation metadata on every hit.
     * `memory.ask()` (Mode 2B interactive RAG) optionally runs Stage 3 (`decision_model` sufficiency gate when `stage3_sufficiency.enabled=True`) and synthesizes a grounded answer with `[1] [source | date]` citations and verbatim snippets.
