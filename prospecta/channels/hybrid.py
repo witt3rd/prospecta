@@ -49,7 +49,7 @@ class HybridChunks:
             state.conn, bank_id=state.bank_id, query_text=plan.text,
             query_embedding=lambda: state.embed_query(plan.text),   # only when a retriever needs it
             date_from=state.date_from, date_to=state.date_to,
-            excluded_sources=state.excluded_sources,
+            excluded_sources=state.excluded_sources, exact_text=plan.exact_text,
             metadata_filter=state.metadata_filter, **self.limits)
         out: list[Candidate] = []
         seen: set[str] = set()

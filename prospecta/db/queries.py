@@ -989,7 +989,7 @@ _STAGE1_SQL = """
 WITH
   q AS (
     SELECT __STEM__ AS stem,
-           websearch_to_tsquery('simple', %(qt)s) AS exact
+           websearch_to_tsquery('simple', %(qx)s) AS exact
   ),
   semantic_hits AS (
     SELECT m.id,
@@ -1081,6 +1081,7 @@ def _stage1_statement(
     metadata_filter: dict | None = None,
     semantic_limit: int = STAGE1_SEMANTIC_LIMIT, stemmed_limit: int = STAGE1_STEMMED_LIMIT,
     exact_limit: int = STAGE1_EXACT_LIMIT, fused_limit: int = STAGE1_FUSED_LIMIT,
+    exact_text: str | None = None,
 ) -> tuple[str, dict]:
     sql = (_STAGE1_SQL
            .replace("__STEM__", _STEM_WEBSEARCH if has_websearch_operators(query_text) else _STEM_OR)
@@ -1090,6 +1091,7 @@ def _stage1_statement(
            .replace("__DIM__", str(len(query_embedding))))
     params = {
         "bank_id": bank_id, "qt": query_text, "qe": _vec_literal(query_embedding),
+        "qx": query_text if exact_text is None else exact_text,
         "date_from": date_from, "date_to": date_to,
         "excluded": list(excluded_sources) if excluded_sources is not None else None,
         "meta": _meta_param(metadata_filter), "headline": STAGE1_HEADLINE_OPTIONS,
@@ -1127,15 +1129,22 @@ ORDER BY date_rank
 # punctuation, only stop words); no_simple: its unstemmed reading is empty too.
 _STAGE1_WORDS_SQL = """
 SELECT numnode(websearch_to_tsquery('english', %(qt)s)) = 0,
-       numnode(websearch_to_tsquery('simple', %(qt)s)) = 0
+       numnode(websearch_to_tsquery('simple', %(qt)s)) = 0,
+       numnode(websearch_to_tsquery('simple', %(qx)s)) = 0
 """
 
 
-def _stage1_mode(cur, query_text: str, date_from, date_to) -> str:
-    """'words' (the three retrievers), 'date' (list the window) or 'none' (nothing to ask)."""
-    cur.execute(_STAGE1_WORDS_SQL, {"qt": query_text}, prepare=False)
-    no_stem, no_simple = cur.fetchone()
+def _stage1_mode(cur, query_text: str, date_from, date_to, exact_text: str | None = None) -> str:
+    """'words' (the three retrievers), 'date' (list the window) or 'none' (nothing to ask).
+    `exact_text` (the exact retriever's own text, see stage1_search) that holds words is
+    something to ask even when `query_text` has none."""
+    cur.execute(_STAGE1_WORDS_SQL, {"qt": query_text,
+                                    "qx": query_text if exact_text is None else exact_text},
+                prepare=False)
+    no_stem, no_simple, no_exact = cur.fetchone()
     if not no_stem:
+        return "words"
+    if exact_text is not None and not no_exact:
         return "words"
     if date_from is not None or date_to is not None:
         return "date"
@@ -1168,7 +1177,11 @@ def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query)
     "exact phrase", OR, -exclude. A plain question (no such operator, see
     has_websearch_operators) is read by the stemmed retriever as the OR of its stemmed
     words (all of them: no cap), ranked by ts_rank_cd; the
-    exact retriever always keeps websearch semantics (AND). The semantic retriever reads at least
+    exact retriever always keeps websearch semantics (AND). `exact_text`, when given, is what
+    the exact retriever reads INSTEAD of `query_text` (and the snippet it headlines): the
+    names, identifiers and "quoted phrases" a caller copied verbatim (query expansion:
+    `query_text` then feeds the semantic and stemmed retrievers only); None (the default)
+    leaves the exact retriever reading `query_text`. The semantic retriever reads at least
     `hnsw_ef_search` index candidates and keeps scanning (pgvector iterative scan)
     until its slots are full.
 
@@ -1186,7 +1199,8 @@ def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query)
     with no words at all (not even stop words) and no window is empty.
     """
     with conn.transaction(), conn.cursor() as cur:
-        mode = _stage1_mode(cur, query["query_text"], query.get("date_from"), query.get("date_to"))
+        mode = _stage1_mode(cur, query["query_text"], query.get("date_from"), query.get("date_to"),
+                            query.get("exact_text"))
         if mode == "none":
             return []
         if mode == "date":
