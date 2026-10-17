@@ -18,7 +18,7 @@ from prospecta._expand import (
     guard_terms, is_plain_word, keep_term, parse_writer_reply, render_writer_prompt, verbatim_terms,
 )
 from prospecta._types import SearchSpec
-from tests.test_expand import FakeRerank, FakeWriter, NOTES, S, build, sources
+from tests.test_expand import FakeRerank, FakeWriter, S, build, sources
 
 TODAY = date(2024, 6, 1)
 
@@ -82,6 +82,16 @@ def test_a_markdown_heading_or_bullet_starts_a_sentence_so_its_first_word_is_no_
     text = "# Harbour watch\n\n- Check the notes\n1. Report it\n> Quote this\n**Important** is bold.\nThen go."
     assert verbatim_terms(text) == []
     assert verbatim_terms("# Harbour Watch Rota\n\nthen ask Dan Maycock.") == ["Harbour Watch Rota", "Dan Maycock"]
+
+
+def test_a_capitalised_plain_word_the_prompt_also_writes_in_lower_case_is_no_name():
+    text = "Each session you read the notes. Use the Session view and the Report list, then write the report."
+    assert verbatim_terms(text) == []
+    assert kept(text, "Session", "Report", "session") == []
+    # a plain word that only ever appears capitalised, in the middle of a sentence, is still a name
+    assert verbatim_terms("Please ask Rose about the Library again.") == ["Rose", "Library"]
+    assert verbatim_terms("Please ask Dan Maycock and the Harbour Office; the office is closed.") == [
+        "Dan Maycock", "Harbour Office"]                                    # one word of the run is not plain
 
 
 def test_contractions_of_plain_words_are_plain():

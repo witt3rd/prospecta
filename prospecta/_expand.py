@@ -333,7 +333,8 @@ def _scan(text: str) -> _Scan:
     """The quoted phrases, identifiers and capitalised names of `text`, each once, in order of
     appearance. A capitalised word is a name unless it stands at the start of a sentence or a line
     (alone), is a function word, a month or a weekday, or is written in capitals and is a plain
-    English word (IMPORTANT, SILENT, DELIVERY: emphasis, not a name)."""
+    English word (IMPORTANT, SILENT, DELIVERY: emphasis, not a name); a run of capitalised plain words
+    that the text also writes in lower case (`Session`, `session`) is emphasis too."""
     seen: set[str] = set()
 
     def once(items: list[str]) -> tuple[str, ...]:
@@ -356,12 +357,20 @@ def _scan(text: str) -> _Scan:
                           or _LINE_START.fullmatch(line_prefix) is not None)
         cleaned.append((raw.strip(_TOKEN_STRIP), sentence_start, raw))
     identifiers = once([tok for tok, _, _ in cleaned if _is_identifier(tok)])
+    lower = set(re.findall(r"\b[a-z]+\b", rest))        # the words the text also writes in lower case
+
+    def common_use(word: str) -> bool:
+        """A plain word the text also writes in lower case: its capital is emphasis or a heading, not a name."""
+        w = re.sub(r"'s$", "", word.lower())
+        return is_plain_word(w) and (w in lower or w + "s" in lower or w + "es" in lower
+                                     or (w.endswith("s") and w[:-1] in lower))
+
     names: list[str] = []
     run: list[str] = []
     run_starts_sentence = False
 
     def flush() -> None:
-        if len(run) >= 2 or (run and not run_starts_sentence):
+        if (len(run) >= 2 or (run and not run_starts_sentence)) and not all(common_use(w) for w in run):
             names.append(" ".join(run))
         run.clear()
 
