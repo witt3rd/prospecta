@@ -55,6 +55,8 @@ period**, so that notes from before it would be worthless. A relative period tha
 request (this week's theme, today's plan, tonight, next week, a deadline) is **no window**. **When in
 doubt, no window.**
 
+A window with no searchable words is a date listing: newest first, never reranked (no call, no cost).
+
 *Why:* a search with no window loses nothing; a wrong window can lose everything, because Stage 1 pushes
 the window into every retriever. *Evidence and the wording:* [`references/date-window.md`](references/date-window.md).
 

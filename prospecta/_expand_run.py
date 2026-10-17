@@ -88,6 +88,7 @@ class _Out:
     ms: dict = dataclasses.field(default_factory=dict)
     n_candidates: int = 0
     reranked: bool = False
+    date_listing: bool = False      # a date-only listing: not reranked, not a fallback
     fallback_reason: str | None = None
     error: str | None = None
 
@@ -444,7 +445,7 @@ class _Run:
             self.calls.extend(out.calls)
             if out.error:
                 self.fallbacks.append(f"search {run.index} ({run.spec.query!r}) failed: {out.error}")
-            elif out.fallback_reason and plan.rerank_on:
+            elif out.fallback_reason and plan.rerank_on and not out.date_listing:
                 self.fallbacks.append(f"search {run.index} ({run.spec.query!r}) stage 2: "
                                       f"{out.fallback_reason}: Stage 1 order")
         self.timings["searches"] = _ms(t)
@@ -535,11 +536,14 @@ def _search(memory, spec: SearchSpec, p: _Plan, cancelled: threading.Event, db) 
             out.ms["rerank"] = _ms(t)
             if outcome is None:
                 out.fallback_reason = rec["fallback_reason"]
+                out.date_listing = bool(rec.get("skipped"))
         elif items and not p.rerank_on:
             out.fallback_reason = "stage 2 is not configured"
         if outcome is not None:
             out.reranked = True
             docs = [_with_scores(it.doc, outcome) for it in ordered]
+        elif out.date_listing:      # a date-only listing: newest first, no cut
+            docs = [it.doc for it in items]
         else:       # Stage 1 order stands, cut by relevance to its best, never by count
             docs = [it.doc for it in rel_cut(items, lambda it: it.doc.score, p.fallback_rel)]
         recalled = recalled_from_fused(

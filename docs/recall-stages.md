@@ -95,6 +95,8 @@ reports it, `tokens_in` = `usage.total_tokens`, `cost_usd` = `usage.cost`, `dura
 `error`); the stage record carries the configured `model`, the totals, `latency_ms` and
 `fallback_reason`.
 
+**Date-only questions are not reranked.** A search whose items all came from the date-only listing (`match_kind` `date`: no searchable words, a date window) is a listing, newest first. Stage 2 makes no call (no cost), the order stands, `min_score` and the near-copy collapse are not applied, `reranked` is false and `fallback_reason` is `date-only listing: nothing to rank`; this is not a failure and Mode 1 adds nothing to `fallbacks`. A mixed search still reranks.
+
 Wire the transport: `Memory(rerank_transport=openrouter_rerank_transport())` (key from
 `OPENROUTER_API_KEY`; the CLI and the service build it when the key is set).
 
