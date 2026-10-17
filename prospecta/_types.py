@@ -71,6 +71,37 @@ class RecalledMemory:
     metadata: dict[str, Any]
     bank_id: str
     document_id: str
+    # The cited-evidence contract (docs/postgres-hybrid.md): where and when the hit
+    # is from and why it matched. `source` and `original_chunk` above complete it.
+    created_on: str | None = None         # the note's date, YYYY-MM-DD
+    kind: str | None = None               # documents.source_kind: note, conversation, ...
+    match_kind: str | None = None         # exact+semantic | exact | lexical | semantic
+    relevance_score: float | None = None  # cross-encoder score (0..1) when stage 2 graded it, else `score`
+    exact_snippet: str | None = None      # ts_headline of the matched words, <<marked>>
+
+
+@dataclass(frozen=True)
+class TaskRecall:
+    """Result of Memory.recall_for_task: the facet queries that ran, the cited
+    notes (own project first, other projects labeled) and the context block."""
+
+    queries: list[str]
+    items: list[RecalledMemory]
+    block: str        # format_cited_rag_block(items): the "## Recalled Project Context" block
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """Result of Memory.ask: a grounded answer with inline [n] citations, where
+    [n] is items[n-1]."""
+
+    answer: str                   # the model's answer, [n] markers inline
+    citations: list[dict]         # [{n, known, source, created_on, snippet, exact_snippet}]
+    items: list[RecalledMemory]   # the evidence the answer may cite
+    sufficient: bool | None       # the stage 3 verdict; None when the gate is off or failed
+    retried: bool                 # a broadened retrieval ran because the evidence was not sufficient
+    gate: dict | None             # {score, threshold, model} or {error}; None when off
+    rendered: str                 # the answer followed by its numbered [source | date] sources
 
 
 @dataclass(frozen=True)

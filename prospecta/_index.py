@@ -9,6 +9,7 @@ here. The retain() method stays a stub in memory.py for T11 to flesh out.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Protocol
 
 from prospecta._chunker import chunk_paragraphs, chunk_text
+from prospecta.cited import document_citations, match_kind
 from prospecta._scorecut import check_depth, resolve_depth
 from prospecta.stages import StageDeps, read_recall_config, run_stages
 from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
@@ -536,7 +538,22 @@ def remove_documents(memory: "Memory", sources: list[str]) -> int:
 # search
 # ---------------------------------------------------------------------------
 
-def search(
+def search(memory: "Memory", text: str, **kwargs) -> list[RecalledMemory]:
+    """Hits for `text`, each carrying its citation fields (created_on, kind); see _search."""
+    results = _search(memory, text, **kwargs)
+    if not results:
+        return results
+    with memory._pool.connection() as conn:
+        cited = document_citations(conn, sorted({r.document_id for r in results}))
+        conn.rollback()
+    return [dataclasses.replace(
+        r, created_on=cited.get(r.document_id, (None, None))[0],
+        kind=cited.get(r.document_id, (None, None))[1],
+        relevance_score=r.score if r.relevance_score is None else r.relevance_score)
+        for r in results]
+
+
+def _search(
     memory: "Memory",
     text: str,
     *,
@@ -546,7 +563,17 @@ def search(
     rrf_k: int = 60,
     _trace: list | None = None,
     depth: str | None = None,
+    date_from=None,
+    date_to=None,
+    excluded_sources: list[str] | None = None,
+    reranker_model: str | None = None,
+    decision_model: str | None = None,
 ) -> list[RecalledMemory]:
+    """`date_from` / `date_to` (the note's date, inclusive) and `excluded_sources` (the
+    anti-echo list of documents.source values) are Stage 1 filters of the hybrid_chunk
+    channel; asking for them where it does not run is an error, never silently ignored.
+    `reranker_model` / `decision_model` override, for this call, the Memory's, the bank's
+    recall_config and the environment's choice of the stage 2 / Jev model."""
     check_depth(depth)
     if mode not in ("hybrid", "semantic", "lexical"):
         raise ValueError(f"Invalid mode: {mode!r}")
@@ -556,16 +583,27 @@ def search(
             f"mode={mode!r}; construct Memory(embed=...)"
         )
     bank_id = memory._default_bank_id
+    stage1_filters = {"date_from": date_from, "date_to": date_to,
+                      "excluded_sources": excluded_sources}
+    wants_stage1 = any(v is not None for v in stage1_filters.values())
+    stage1_error = ("date_from, date_to and excluded_sources need the hybrid_chunk channel "
+                    "in the bank's channel_config")
 
     if mode == "hybrid":
         with memory._pool.connection() as conn:
             channel_config = read_channel_config(conn, bank_id)
         if channel_config:
+            if wants_stage1 and not any(e.get("name") == "hybrid_chunk" and e.get("enabled", True)
+                                        for e in channel_config):
+                raise ValueError(stage1_error)
             return _search_channels(
                 memory, text, bank_id, channel_config, limit=limit,
                 metadata_filter=metadata_filter, rrf_k=rrf_k, trace=_trace,
-                depth=depth,
+                depth=depth, stage1_filters=stage1_filters,
+                reranker_model=reranker_model, decision_model=decision_model,
             )
+        if wants_stage1:
+            raise ValueError(stage1_error)
         qvec = memory._embed([text])[0]
         with memory._pool.connection() as conn:
             rows = hybrid_search(
@@ -579,6 +617,8 @@ def search(
             )
         return [_row_to_recalled(r, bank_id, mode="hybrid") for r in rows]
 
+    if wants_stage1:
+        raise ValueError(stage1_error)
     if mode == "semantic":
         qvec = memory._embed([text])[0]
         with memory._pool.connection() as conn:
@@ -619,6 +659,8 @@ def _search_channels(
     memory: "Memory", text: str, bank_id: str, config: list[dict],
     *, limit: int, metadata_filter: dict | None, rrf_k: int, trace: list | None,
     recall_cfg: dict | None = None, depth: str | None = None,
+    stage1_filters: dict | None = None, reranker_model: str | None = None,
+    decision_model: str | None = None,
 ) -> list[RecalledMemory]:
     """Hybrid recall through the bank's configured channels (banks.channel_config).
     `recall_cfg` overrides the bank's stage config ({} = no stages); None reads it."""
@@ -642,7 +684,7 @@ def _search_channels(
             ))
         state = RecallState(
             conn=conn, bank_id=bank_id, embed=memory._embed,
-            metadata_filter=metadata_filter,
+            metadata_filter=metadata_filter, **(stage1_filters or {}),
         )
         if recall_cfg is None:
             recall_cfg = read_recall_config(conn, bank_id)
@@ -655,8 +697,8 @@ def _search_channels(
                 StageDeps(llm=memory._rerank_llm or memory._llm, jev=memory._jev,
                           model=memory._rerank_model,
                           rerank_transport=memory._rerank_transport,
-                          reranker_model=memory._reranker_model,
-                          decision_model=memory._decision_model),
+                          reranker_model=reranker_model or memory._reranker_model,
+                          decision_model=decision_model or memory._decision_model),
                 k=rrf_k, depth=depth,
             )
             tr.update(rerank=st["rerank"], hops=st["hops"], calls=st["calls"],
@@ -680,9 +722,15 @@ def _search_channels(
     if trace is not None:
         trace.append(tr)
     channel_names = [c["name"] for c in tr["channels"]]
+    hybrid = {c.document_id: c for c in state.channel_lists.get("hybrid_chunk", [])}
+    rerank_cfg = (recall_cfg or {}).get("rerank") or {}
+    cross_encoder = rerank_cfg.get("enabled") and rerank_cfg.get("stage") == "cross_encoder"
     out = []
     for f in fused[:limit]:
-        b = f.best
+        h = hybrid.get(f.document_id)   # the Stage 1 chunk: its snippet belongs with its own text
+        b = h or f.best
+        d = h.detail if h else {}
+        ranked = set(f.ranks)
         scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
         scores.update({n: 0.0 for n in channel_names})
         if recall_cfg:
@@ -702,6 +750,13 @@ def _search_channels(
             metadata=b.detail.get("metadata") or {},
             bank_id=bank_id,
             document_id=f.document_id,
+            match_kind=match_kind(
+                exact=d.get("exact_rank") is not None or "keyword" in ranked,
+                lexical=d.get("stem_rank") is not None or "bm25" in ranked,
+                semantic=d.get("sem_rank") is not None or bool(ranked & {"dense_chunk", "question"})),
+            relevance_score=float(f.scores["rerank"]) if cross_encoder and "rerank" in f.scores
+            else float(f.score),
+            exact_snippet=d.get("exact_snippet"),
         ))
     return out
 

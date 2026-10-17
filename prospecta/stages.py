@@ -35,6 +35,7 @@ JEV_INPUT_BYTES = 60_000
 JEV_PASSAGE_MAX_BYTES = JEV_INPUT_BYTES - 5_000   # physical: one passage must fit a 60 KB request beside its task text and criteria
 JEV_TIMEOUT_S = 10.0
 JEV_GATE_THRESHOLD = 2.95
+STAGE3_THRESHOLD = 0.70        # stage 3: evidence_sufficient / 3 under this runs one broadened retry
 JEV_MODEL_PREVIOUS = "typesafe/jev-1.13"
 # The decision model (Jev): PROSPECTA_DECISION_MODEL, else its older alias
 # PROSPECTA_JEV_MODEL, else the default; read once at import. A bank's
@@ -121,7 +122,7 @@ def validate_recall_config(cfg: dict) -> None:
         raise ValueError("recall_config must be an object")
     for key in cfg:
         if key not in ("rerank", "gate", "reader", "evidence", "depth",
-                       "link_completeness", "fusion", "models"):
+                       "link_completeness", "fusion", "models", "stage3_sufficiency"):
             raise ValueError(f"unknown recall_config key {key!r}")
     if cfg.get("link_completeness", "all-pairs") not in ("connected", "all-pairs"):
         raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
@@ -135,10 +136,18 @@ def validate_recall_config(cfg: dict) -> None:
                           or fu["floor"] < 1):
         raise ValueError("fusion.floor must be an integer >= 1")
     models = cfg.get("models", {})
-    if not isinstance(models, dict) or set(models) - {"decision_model"}:
-        raise ValueError("models must be an object of decision_model")
+    if not isinstance(models, dict) or set(models) - {"decision_model", "query_writer_model"}:
+        raise ValueError("models must be an object of decision_model/query_writer_model")
+    s3 = cfg.get("stage3_sufficiency", {})
+    if not isinstance(s3, dict) or set(s3) - {"enabled", "threshold"}:
+        raise ValueError("stage3_sufficiency must be an object of enabled/threshold")
+    if not isinstance(s3.get("enabled", False), bool):
+        raise ValueError("stage3_sufficiency.enabled must be true or false")
+    v = s3.get("threshold")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1):
+        raise ValueError("stage3_sufficiency.threshold must be a number in [0, 1]")
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
-    for section, name in ((models, "decision_model"), (rr, "model")):
+    for section, name in ((models, "decision_model"), (models, "query_writer_model"), (rr, "model")):
         v = section.get(name)
         if v is not None and (not isinstance(v, str) or not v):
             raise ValueError(f"{name} must be a non-empty string")
@@ -844,6 +853,67 @@ JEV_SUFFICIENT = 2.5
 JEV_CONTINUE = 1.5
 
 
+def jev_stop_scores(transport, model: str, timeout: float, query: str, text: str,
+                    ids: list[str], purpose: str, calls: list[dict]) -> dict[str, float]:
+    """One System One request: each of the stopping questions `ids` (see _STOP_QUESTIONS)
+    asked as a `score` question (0..3) over the excerpts `text`. Returns {id: score}; any
+    malformed reply raises. The call is recorded in `calls`."""
+    req = {"model": model, "state": {"query": query},
+           "questions": {f"p{n}": {
+               "type": "score",
+               "instructions": {"task": _STOP_QUESTIONS[k], "kind": "note",
+                                "title": k, "text": text},
+               "criteria": ["No", "Barely", "Mostly", "Yes"]}
+               for n, k in enumerate(ids)}}
+    t0 = time.monotonic()
+    rec: dict = {"purpose": purpose, "model": model, "tokens_in": None,
+                 "tokens_out": None, "cost_usd": None, "json_mode": False,
+                 "messages_count": len(ids), "prompt_text": json.dumps(req),
+                 "response_text": None, "error": None}
+    try:
+        resp = transport(req, timeout)
+        rec["response_text"] = json.dumps(resp)
+        u = resp.get("usage") or {}
+        rec.update(model=resp.get("model") or model, tokens_in=u.get("input_tokens"),
+                   tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
+        answers = resp.get("answers")
+        if not isinstance(answers, dict) or set(answers) != {f"p{n}" for n in range(len(ids))}:
+            raise ValueError("answers are not exactly the asked ids")
+        val: dict[str, float] = {}
+        for n, k in enumerate(ids):
+            a = answers[f"p{n}"]
+            v = a.get("score") if isinstance(a, dict) else None
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v) or not 0 <= v <= 3:
+                raise ValueError("answer does not score every question in 0..3")
+            val[k] = float(v)
+        return val
+    except Exception as exc:
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+        calls.append(rec)
+
+
+class JevSufficiency:
+    """Stage 3 of docs/postgres-hybrid.md: does the evidence found suffice to answer
+    the question? The decision model answers the stopping question `evidence_sufficient`
+    (System One `score`, 0..3) over the excerpts; the verdict is that score / 3 (0..1).
+    `Memory.ask` compares it with `recall_config.stage3_sufficiency.threshold` (0.70)
+    and runs one broadened retrieval when it falls short. Raises on any provider or
+    reply error; the caller records it and answers anyway."""
+    name = "stage3_sufficiency"
+
+    def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
+                 timeout: float = JEV_TIMEOUT_S):
+        self.transport, self.model, self.timeout = transport, model, timeout
+
+    def score(self, query: str, excerpts: str, calls: list[dict]) -> float:
+        return jev_stop_scores(self.transport, self.model, self.timeout, query, excerpts,
+                               ["evidence_sufficient"], self.name, calls)["evidence_sufficient"] / 3
+
+
 class JevReader:
     """Optional reader in place of the Sonnet reader (design 8.7): Jev's
     stopping questions on the top excerpts, as System One `score` questions
@@ -865,42 +935,8 @@ class JevReader:
              calls: list[dict]) -> tuple[bool, list[str]]:
         text = "\n\n".join(f"[{i}] {it.header}\n{it.evidence}"
                            for i, it in enumerate(items, start=1))
-        ids = list(_STOP_QUESTIONS)
-        req = {"model": self.model, "state": {"query": query},
-               "questions": {f"p{n}": {
-                   "type": "score",
-                   "instructions": {"task": _STOP_QUESTIONS[k], "kind": "note",
-                                    "title": k, "text": text},
-                   "criteria": ["No", "Barely", "Mostly", "Yes"]}
-                   for n, k in enumerate(ids)}}
-        t0 = time.monotonic()
-        rec: dict = {"purpose": "jev_reader", "model": self.model, "tokens_in": None,
-                     "tokens_out": None, "cost_usd": None, "json_mode": False,
-                     "messages_count": len(ids), "prompt_text": json.dumps(req),
-                     "response_text": None, "error": None}
-        try:
-            resp = self.transport(req, self.timeout)
-            rec["response_text"] = json.dumps(resp)
-            u = resp.get("usage") or {}
-            rec.update(model=resp.get("model") or self.model, tokens_in=u.get("input_tokens"),
-                       tokens_out=u.get("output_tokens"), cost_usd=u.get("cost"))
-            answers = resp.get("answers")
-            if not isinstance(answers, dict) or set(answers) != {f"p{n}" for n in range(len(ids))}:
-                raise ValueError("answers are not exactly the asked ids")
-            val: dict[str, float] = {}
-            for n, k in enumerate(ids):
-                a = answers[f"p{n}"]
-                v = a.get("score") if isinstance(a, dict) else None
-                if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                        or not math.isfinite(v) or not 0 <= v <= 3:
-                    raise ValueError("answer does not score every question in 0..3")
-                val[k] = float(v)
-        except Exception as exc:
-            rec["error"] = f"{type(exc).__name__}: {exc}"
-            raise
-        finally:
-            rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
-            calls.append(rec)
+        val = jev_stop_scores(self.transport, self.model, self.timeout, query, text,
+                              list(_STOP_QUESTIONS), "jev_reader", calls)
         if val["evidence_sufficient"] >= JEV_SUFFICIENT or not items:
             return True, []
         if max(val["continue_useful"], val["missing_evidence"]) >= JEV_CONTINUE:

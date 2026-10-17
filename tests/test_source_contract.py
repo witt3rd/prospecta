@@ -183,7 +183,8 @@ def test_service_lookup_filters_and_shape(env):
     assert [r["question"] for r in out["results"]] == ["what do gardens need", "how do rockets fly"]
     for r in out["results"]:
         assert {x["record_id"] for x in r["results"]} == {"1", "2"}
-        assert all(set(x) == {"kind", "record_id", "revision", "score"} for x in r["results"])
+        assert all(set(x) == {"kind", "record_id", "revision", "score", "created_on", "match_kind",
+                              "exact_snippet", "relevance_score"} for x in r["results"])
         assert r["results"] == sorted(r["results"], key=lambda x: -x["score"])
     only_b = svc.lookup({"questions": ["what do gardens need"], "audience_key": "team-b"})
     assert {x["record_id"] for x in only_b["results"][0]["results"]} == {"2"}
