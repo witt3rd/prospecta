@@ -31,7 +31,7 @@ def _all(conn, sql, params=()):
 def test_retain_persists_generated_index_text(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     mem._llm.canned = "q1\nq2\nq3"  # type: ignore[attr-defined]
-    mem.retain("body", source="t1")
+    mem.retain("body", source="t1", generate_questions=True)
     with psycopg.connect(mem.database_url) as conn:
         row = _one(
             conn,
@@ -122,7 +122,7 @@ def test_recall_no_synth_leaves_synthesis_null(populated_corpus):
 def test_llm_calls_persists_prompt_and_response_by_default(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     mem._llm.canned = "q1"  # type: ignore[attr-defined]
-    mem.retain("body", source="t1")
+    mem.retain("body", source="t1", generate_questions=True)
     with psycopg.connect(mem.database_url) as conn:
         rows = _all(
             conn,
@@ -157,7 +157,7 @@ def test_llm_calls_text_disabled_when_sink_flag_off(fresh_db, mock_llm):
     )
     mem.create_bank("testbank", embedding_dim=EMBED_DIM)
     mock_llm.canned = "q"
-    mem.retain("body", source="t")
+    mem.retain("body", source="t", generate_questions=True)
     try:
         with psycopg.connect(mem.database_url) as conn:
             row = _one(

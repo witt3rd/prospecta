@@ -93,13 +93,13 @@ def test_retain_caller_supplied_index_text(memory_with_bank_and_mock_llm, mock_l
 
 
 # ---------------------------------------------------------------------------
-# 2. LLM-generated index_text becomes memory_items rows
+# 2. LLM-generated index_text (generate_questions=True) becomes memory_items rows
 # ---------------------------------------------------------------------------
 
 def test_retain_llm_generated_index_text(memory_with_bank_and_mock_llm, mock_llm):
     mem = memory_with_bank_and_mock_llm
     body = "The forge bench was warm. Sparks flew."
-    doc_id = mem.retain(body, source="bench-note")
+    doc_id = mem.retain(body, source="bench-note", generate_questions=True)
 
     assert len(mock_llm.calls) == 1
     rows = _rows_for_document(mem.database_url, doc_id)
@@ -132,6 +132,7 @@ def test_retain_prompt_override(memory_with_bank_and_mock_llm, mock_llm):
     mock_llm.canned = "Q1?\nQ2?"
     doc_id = mem.retain(
         body,
+        generate_questions=True,
         index_text_prompt_override=override,
         source="custom-source",
     )
@@ -256,4 +257,4 @@ def test_retain_raises_when_llm_returns_empty(memory_with_bank_and_mock_llm, moc
     mem = memory_with_bank_and_mock_llm
     mock_llm.canned = "   \n   \n"  # only whitespace
     with pytest.raises(IndexTextGenerationError):
-        mem.retain("body", source="src")
+        mem.retain("body", source="src", generate_questions=True)

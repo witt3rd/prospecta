@@ -397,6 +397,10 @@ def _write_parsed_docs(
                     "tags": list(parsed.tags or []),
                     "update_mode": "append",
                     "llm_generated": False,
+                    "kind": "chunk",
+                    "ordinal": c.chunk_index,
+                    "char_start": c.start_char,
+                    "char_end": c.end_char,
                 })
             upsert_memory_items(
                 conn,

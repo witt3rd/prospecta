@@ -143,7 +143,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--index-text",
         action="append",
         default=None,
-        help="Override LLM index_text generation (repeat for multi)",
+        help="Question string to index instead of the note's chunks (repeat for multi)",
     )
 
     # ---- import ---------------------------------------------------------

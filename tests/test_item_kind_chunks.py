@@ -340,6 +340,8 @@ def test_build_items_header_uses_note_date_and_person(memory_with_bank, fresh_db
     doc = memory_with_bank.retain(FM_NOTE, index_text=["q"], source="n.md")
     undated = memory_with_bank.retain("plain note", index_text=["q2"], source="2022-01-09-x.md")
     with psycopg.connect(fresh_db) as conn:
+        # a row from before retain stamped created_on: the filename date still dates it
+        conn.execute("UPDATE documents SET created_on = NULL WHERE id = %s", (undated,))
         items = build_items(conn, [FusedDoc(document_id=doc, source="n.md", score=1.0, best=None),
                                    FusedDoc(document_id=undated, source="2022-01-09-x.md", score=1.0, best=None)])
     assert "date: 2024-03-05" in items[0].header and "person: Greg" in items[0].header

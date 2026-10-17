@@ -198,7 +198,8 @@ def test_retain_fills_filter_columns_from_frontmatter(mem):
     r = rows(mem.database_url)
     assert r["a1.md"] == [dt.date(2024, 3, 5), "Alice", "journal"]
     assert r["b1.md"] == [dt.date(2024, 3, 20), "Bob Stone", None]
-    assert r["n1.md"] == [None, None, None]
+    assert r["n1.md"][1:] == [None, None]
+    assert r["n1.md"][0] is not None   # an undated note is stamped at retain
 
 
 def test_retain_metadata_kwarg_wins_and_replace_refreshes(mem):

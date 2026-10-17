@@ -110,14 +110,15 @@ def _run_cell(
         tracer=tracer,
     )
     mem.create_bank(bank, embedding_dim=embed.dim)
-    # Index via retain() per file so the write-side spine fires through
-    # _retain.generate_index_text (not _index.py's chunk path, which is
-    # classical RAG regardless). _retain is the bilateral write-side.
+    # Index via retain(generate_questions=True) per file so the write-side
+    # spine fires through _retain.generate_index_text (not _index.py's chunk
+    # path, which is classical RAG regardless). _retain is the bilateral
+    # write-side.
     for f in sorted(CORPUS_DIR.iterdir()):
         if f.suffix != ".md":
             continue
         body = f.read_text(encoding="utf-8")
-        mem.retain(body, source=f.name)
+        mem.retain(body, source=f.name, generate_questions=True)
     result = mem.recall_synth(QUERY, limit=20)
 
     def teardown():

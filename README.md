@@ -53,7 +53,7 @@ prospecta search "Kelly birthday"
 
 ### Offline / keyless retain
 
-The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. To run the write path with **no API key** — local sentence-transformers embeddings — pair it with `--index-text` (which skips the LLM `index_text` generation, per P4):
+The CLI embedder is selectable via `PROSPECTA_EMBEDDER`. `retain` makes no LLM call by default (it indexes the note as chunks), so the write path needs **no API key** with local sentence-transformers embeddings:
 
 ```bash
 pip install 'prospecta[embedder]'
@@ -68,6 +68,8 @@ prospecta retain "Kelly was born March 4th 1990" \
 `PROSPECTA_EMBEDDER` accepts `default`/`litellm` (the LiteLLM multi-provider default) or `sentence-transformers`/`st` (offline). `PROSPECTA_EMBED_MODEL` selects the model id (sentence-transformers default `all-MiniLM-L6-v2`).
 
 **One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. With `OPENROUTER_API_KEY` set the CLI also builds the Sonnet-5.5 reranker/synth LLMs, Jev and the linker (`PROSPECTA_JEV=off`, `PROSPECTA_LINKER=off` opt out).
+
+**Note dates:** every retained note gets `documents.created_on`: its own date (frontmatter `created` / `created_on` / `date`, or the `metadata=` kwarg), else today's date in the zone named by `PROSPECTA_TIMEZONE` (an IANA name such as `America/Los_Angeles`; UTC when unset).
 
 **BM25 index files:** persisted only under `PROSPECTA_BM25_DIR`, else `$PROSPECTA_DATA_DIR/bm25`; with neither set the index stays in memory (nothing is written under `~/.cache`). A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality — a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
@@ -92,7 +94,8 @@ m = Memory(
     llm=make_default_llm(),          # or your own (messages, *, json_mode) -> str
 )
 
-# Write side: LLM generates the anticipated questions
+# Write side: the note is indexed as chunks, no LLM call
+# (generate_questions=True asks the LLM for anticipated questions instead)
 document_id = m.retain(
     "Kelly was born March 4th 1990. Her birthday party in 2026 was epic.",
     source="kelly.md",
@@ -123,7 +126,7 @@ print(res.synthesis, res.citations)
 
 ### Caller-supplied index_text — the spine override
 
-When the caller knows the right anticipated questions (or has refined them via a tighter prompt elsewhere), pass them directly. The library uses them verbatim and skips the LLM call. **Caller wins on every override.**
+When the caller knows the right anticipated questions (or has refined them via a tighter prompt elsewhere), pass them directly. The library uses them verbatim, as the note's question items instead of its chunks (`child_chunks=True` writes both). **Caller wins on every override.**
 
 ```python
 m.retain(
