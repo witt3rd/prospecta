@@ -3,10 +3,8 @@ Memory Note Parser
 
 Parses markdown notes with YAML frontmatter.
 
-The `index_text` frontmatter key is preserved (not stripped) — it is half
-the bilateral spine on the write side: callers stamp `index_text` to steer
-what gets embedded for recall, and that key must round-trip through
-`parse_note` into the returned mapping.
+Frontmatter keys other than `tags` / `created` / `title` round-trip through
+`parse_note` into the returned mapping (`relationships`).
 
 Ported from animus (animus/memory/parser.py + animus/shared/parsing.py).
 Stripped `from animus.shared import parse_frontmatter` — inlined here so
@@ -41,8 +39,7 @@ class ParsedNote:
 
     Mirrors the animus `Note` shape for the fields the parser populates.
     The `relationships` field carries all frontmatter keys that aren't
-    `tags`/`created`/`title` — including `index_text`, which is load-bearing
-    for the bilateral spine.
+    `tags`/`created`/`title`.
     """
 
     id: str
@@ -137,9 +134,7 @@ def parse_note(file_path: Path) -> Optional[ParsedNote]:
             except ValueError:
                 pass
 
-    # Extract additional frontmatter fields as relationships.
-    # These are used for metadata filtering and — load-bearing —
-    # carry the `index_text` key on the write-side bilateral spine.
+    # Extract additional frontmatter fields as relationships (metadata filtering).
     standard_keys = {"tags", "created", "title"}
     extra_fields = {k: v for k, v in parsed.frontmatter.items() if k not in standard_keys}
 

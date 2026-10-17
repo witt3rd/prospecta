@@ -1,7 +1,6 @@
 """Centralized SQL for prospecta operations.
 
-All SQL lives here; psycopg-3 parameterized form. Extended by future
-tasks (T9 vertical slice, T11 retain, T12 recall_synth, etc.).
+All SQL lives here; psycopg-3 parameterized form.
 """
 from __future__ import annotations
 
@@ -14,13 +13,13 @@ from prospecta.db.exact_tsv import COLUMN as EXACT_TSV_COLUMN
 # ---------------------------------------------------------------------------
 
 # The one place a bank's config is written at creation (prospecta/bank_defaults.py): a new
-# bank runs hybrid_chunk + cross_encoder with linking off. ON CONFLICT DO NOTHING: a bank
-# that exists is never touched. The columns' own DEFAULTs ('[]', '{}', '{}') stay legacy.
+# bank runs hybrid_chunk + cross_encoder. ON CONFLICT DO NOTHING: a bank that exists is never
+# touched. link_config is not written: nothing reads it (the column stays in the schema).
 INSERT_BANK = """
     INSERT INTO banks (bank_id, embedding_dim, embedding_model_id, mission, retain_mission,
-                       channel_config, recall_config, link_config)
+                       channel_config, recall_config)
     VALUES (%(bank_id)s, %(embedding_dim)s, %(embedding_model_id)s, %(mission)s, %(retain_mission)s,
-            %(channel_config)s::jsonb, %(recall_config)s::jsonb, %(link_config)s::jsonb)
+            %(channel_config)s::jsonb, %(recall_config)s::jsonb)
     ON CONFLICT (bank_id) DO NOTHING
     RETURNING bank_id, embedding_dim
 """
@@ -42,22 +41,6 @@ SELECT_BANK_STATS = """
     WHERE b.bank_id = %(bank_id)s
 """
 
-# Per-bank HNSW partial index (docs/schema.md, "memory_items").
-# Index name MUST be: memory_items_embedding_<safe_bank_id>_idx
-# bank_id is interpolated as identifier (not parameterized) since CREATE INDEX
-# doesn't accept parameters for index names. Caller MUST validate bank_id is
-# a safe identifier before formatting.
-# Note: Postgres requires the WHERE clause of a partial index to use literal
-# values (parameters yield "could not determine data type"). bank_id is
-# inlined here as a SQL string literal; the caller MUST validate it first via
-# validate_bank_id().
-HNSW_INDEX_TEMPLATE = """
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
-    ON memory_items USING hnsw ((embedding::vector({embedding_dim})) vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64)
-    WHERE bank_id = '{bank_id_literal}'
-"""
-
 # Validate bank_id is safe for use in identifier position.
 # Allowed: ASCII letters, digits, underscores, hyphens. Length 1-63.
 _BANK_ID_PATTERN = _re.compile(r"^[a-zA-Z0-9_-]{1,63}$")
@@ -70,21 +53,11 @@ def validate_bank_id(bank_id: str) -> None:
         )
 
 
-def hnsw_index_name(bank_id: str) -> str:
-    """Construct the canonical per-bank HNSW index name.
-
-    Format: memory_items_embedding_<bank_id>_idx
-    Hyphens in bank_id are converted to underscores for SQL identifier safety.
-    """
-    validate_bank_id(bank_id)
-    safe = bank_id.replace("-", "_")
-    return f"memory_items_embedding_{safe}_idx"
-
-
-# Per-bank, per-kind partial HNSW indexes (design 8.3): the predicate repeats
-# bank_id and kind literally so the planner can use them, and a kind-filtered
-# scan is not starved by the other kind sharing one index.
-KIND_INDEX_KINDS = ("question", "chunk")
+# The per-bank partial HNSW index over the chunk items (docs/schema.md): the predicate repeats
+# bank_id and kind literally so that Stage 1's semantic retriever, which spells both, can use it.
+# (A bank created before the question items and the bank-wide index were removed may hold two more
+# indexes that nothing reads; they are left alone.)
+KIND_INDEX_KINDS = ("chunk",)
 
 HNSW_KIND_INDEX_TEMPLATE = """
     CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
@@ -116,7 +89,7 @@ def hnsw_kind_index_name(bank_id: str, kind: str) -> str:
 
 
 def ensure_kind_hnsw_indexes(conn, bank_id: str, embedding_dim: int) -> None:
-    """Create both per-kind partial HNSW indexes. `conn` MUST be autocommit."""
+    """Create the bank's partial HNSW index over its chunk items. `conn` MUST be autocommit."""
     validate_bank_id(bank_id)
     for kind in KIND_INDEX_KINDS:
         sql = HNSW_KIND_INDEX_TEMPLATE.format(
@@ -280,7 +253,7 @@ def upsert_memory_items(
                     "tags": list(it.get("tags") or []),
                     "update_mode": it.get("update_mode", "append"),
                     "llm_gen": bool(it.get("llm_generated", False)),
-                    "kind": it.get("kind", "question"),
+                    "kind": it.get("kind", "chunk"),
                     "ordinal": it.get("ordinal"),
                     "char_start": it.get("char_start"),
                     "char_end": it.get("char_end"),
@@ -295,19 +268,17 @@ def append_retain_event(
     bank_id: str,
     document_id: str | None,
     items_count: int,
-    index_text_caller_supplied: bool,
     duration_ms: int,
-    raw_llm_response: str | None = None,
     error: str | None = None,
-    index_text_generated: list[str] | None = None,
 ) -> None:
     """INSERT a row into retain_events.
 
     Schema invariants (docs/schema.md, migration 0003):
-      - bank_id, items_count, index_text_caller_supplied, duration_ms are NOT NULL.
+      - bank_id, items_count, index_text_caller_supplied, duration_ms are NOT NULL;
+        index_text_caller_supplied stays in the table (a row written when a note could carry
+        question strings) and is False here: a note is written as chunks only.
       - document_id is NULL-able (deletion sets it NULL via ON DELETE SET NULL).
-      - index_text_generated is the verbatim LLM-authored list (NULL when caller
-        supplied index_text or pre-0003).
+      - raw_llm_response and index_text_generated stay NULL: no model is called at write time.
       - created_at defaults to now().
     """
     with conn.cursor() as cur:
@@ -315,24 +286,16 @@ def append_retain_event(
             """
             INSERT INTO retain_events
                 (bank_id, document_id, items_count,
-                 index_text_caller_supplied, duration_ms,
-                 raw_llm_response, error, index_text_generated)
+                 index_text_caller_supplied, duration_ms, error)
             VALUES
-                (%(bank_id)s, %(doc)s, %(items_count)s,
-                 %(caller_supplied)s, %(duration_ms)s,
-                 %(raw)s, %(error)s, %(idx_gen)s)
+                (%(bank_id)s, %(doc)s, %(items_count)s, FALSE, %(duration_ms)s, %(error)s)
             """,
             {
                 "bank_id": bank_id,
                 "doc": document_id,
                 "items_count": int(items_count),
-                "caller_supplied": bool(index_text_caller_supplied),
                 "duration_ms": int(duration_ms),
-                "raw": raw_llm_response,
                 "error": error,
-                "idx_gen": list(index_text_generated)
-                if index_text_generated is not None
-                else None,
             },
         )
 
@@ -352,7 +315,6 @@ def append_recall_event(
     channels: list[dict] | None = None,
     fusion: dict | None = None,
     rerank: dict | None = None,
-    hops: dict | None = None,
     candidates: list[dict] | None = None,
     cost_usd: float | None = None,
     tokens_in: int | None = None,
@@ -363,8 +325,8 @@ def append_recall_event(
 ) -> int:
     """INSERT a row into recall_events (and its recall_event_candidates).
 
-    plan/channels/fusion/rerank/hops and candidates (migration 0007) are
-    written by channel-pipeline recalls; legacy recalls leave them NULL.
+    plan/channels/fusion/rerank and candidates (migration 0007) are written by every recall
+    (rows written before them, and the `hops` column, are NULL).
     Returns the new recall_events.id.
 
     Schema invariants (docs/schema.md, migration 0003):
@@ -373,7 +335,7 @@ def append_recall_event(
       - results (JSONB): {source, document_id, rank, scores, content_preview}[]
         — inspection record (200-char preview per element). Full content stays
         in memory_items. NULL on pre-0003 rows.
-      - synthesis (TEXT): RAG synthesis output; NULL for plain recall().
+      - synthesis (TEXT): NULL on every row written now (rows of a removed synthesis keep theirs).
       - created_at defaults to now().
     """
     import json as _json
@@ -382,14 +344,14 @@ def append_recall_event(
             """
             INSERT INTO recall_events
                 (bank_id, queries, mode, n_results, duration_ms, trace,
-                 results, synthesis, plan, channels, fusion, rerank, hops,
+                 results, synthesis, plan, channels, fusion, rerank,
                  cost_usd, tokens_in, tokens_out, n_llm_calls, citations, depth)
             VALUES
                 (%(bank_id)s, %(queries)s::jsonb, %(mode)s,
                  %(n_results)s, %(duration_ms)s, %(trace)s::jsonb,
                  %(results)s::jsonb, %(synthesis)s, %(plan)s::jsonb,
                  %(channels)s::jsonb, %(fusion)s::jsonb, %(rerank)s::jsonb,
-                 %(hops)s::jsonb, %(cost_usd)s, %(tokens_in)s,
+                 %(cost_usd)s, %(tokens_in)s,
                  %(tokens_out)s, %(n_llm_calls)s, %(citations)s::jsonb, %(depth)s)
             RETURNING id
             """,
@@ -406,7 +368,6 @@ def append_recall_event(
                 "channels": _dumps(channels),
                 "fusion": _dumps(fusion),
                 "rerank": _dumps(rerank),
-                "hops": _dumps(hops),
                 "cost_usd": cost_usd,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
@@ -433,54 +394,6 @@ def append_recall_event(
 def _dumps(obj):
     import json as _json
     return _json.dumps(obj) if obj is not None else None
-
-
-def append_formulate_event(
-    conn,
-    *,
-    bank_id: str,
-    message: str,
-    n_queries: int,
-    parse_fallback: bool,
-    raw_response: str | None,
-    error_kind: str | None,
-    duration_ms: int,
-    json_mode_used: bool = True,
-    metadata: dict | None = None,
-) -> None:
-    """INSERT a row into formulate_events.
-
-    Schema invariants (docs/schema.md; migrations 0001 + 0003):
-      - bank_id, message, n_queries_out, json_mode_used, parse_fallback,
-        raw_response, duration_ms are NOT NULL.
-      - error_kind is nullable; ``'malformed_json' | 'schema_mismatch' | NULL``.
-        Persisted via 0003 (was dropped on the floor pre-0003).
-      - created_at defaults to now().
-    """
-    _ = metadata
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO formulate_events
-                (bank_id, message, n_queries_out, json_mode_used,
-                 parse_fallback, raw_response, duration_ms, error_kind)
-            VALUES
-                (%(bank_id)s, %(message)s, %(n_queries)s, %(json_mode_used)s,
-                 %(parse_fallback)s, %(raw_response)s, %(duration_ms)s,
-                 %(error_kind)s)
-            """,
-            {
-                "bank_id": bank_id,
-                "message": message,
-                "n_queries": int(n_queries),
-                "json_mode_used": bool(json_mode_used),
-                "parse_fallback": bool(parse_fallback),
-                # schema column is NOT NULL; coerce None → empty string.
-                "raw_response": raw_response if raw_response is not None else "",
-                "duration_ms": int(duration_ms),
-                "error_kind": error_kind,
-            },
-        )
 
 
 def append_sweep_pass(
@@ -689,260 +602,11 @@ def delete_documents_by_source(
         return cur.rowcount or 0
 
 
-# ---------------------------------------------------------------------------
-# T9 — Retrieval SQL (hybrid / semantic / lexical)
-# ---------------------------------------------------------------------------
-
-# A6: COALESCE on scores → never NULL in returned rows. Three-channel RRF
-# fusion: semantic (cosine over embedding) + lexical_content (ts_rank_cd over
-# content_tsv = index_text / questions) + lexical_body (ts_rank_cd over
-# body_tsv = original_chunk / source body). Three CTEs FULL OUTER JOIN'd;
-# RRF score = sum of three COALESCE'd reciprocals. All score components
-# always-numeric per A6 invariant.
-#
-# The lexical_body channel implements the P14 body-fallback safety net:
-# when LLM-generated index_text drifts hard from query language, body
-# content still rescues the doc via RRF fusion of its ts_rank_cd rank.
-# Lexical channels use websearch_to_tsquery, which requires EVERY query
-# term to match (AND semantics) and ts_rank_cd is cover-density rank, not
-# BM25 (no IDF, no length normalisation). The safety net therefore fires
-# on short queries only; long natural-language questions rarely match.
-HYBRID_SQL = """
-WITH
-  semantic AS (
-    SELECT m.id AS id, m.document_id, m.content, m.original_chunk, d.source,
-           m.metadata, m.tags,
-           1 - (m.embedding <=> %(qe)s::vector) AS sem_score,
-           ROW_NUMBER() OVER (ORDER BY m.embedding <=> %(qe)s::vector) AS sem_rank
-    FROM memory_items m
-    JOIN documents d ON d.id = m.document_id
-    WHERE m.bank_id = %(bank_id)s
-      AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-    ORDER BY m.embedding <=> %(qe)s::vector
-    LIMIT %(per_side)s
-  ),
-  lexical_content AS (
-    SELECT m.id AS id, m.document_id, m.content, m.original_chunk, d.source,
-           m.metadata, m.tags,
-           ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_content_score,
-           ROW_NUMBER() OVER (
-               ORDER BY ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) DESC
-           ) AS lex_content_rank
-    FROM memory_items m
-    JOIN documents d ON d.id = m.document_id
-    WHERE m.bank_id = %(bank_id)s
-      AND m.content_tsv @@ websearch_to_tsquery('english', %(qt)s)
-      AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-    ORDER BY lex_content_score DESC
-    LIMIT %(per_side)s
-  ),
-  lexical_body AS (
-    SELECT m.id AS id, m.document_id, m.content, m.original_chunk, d.source,
-           m.metadata, m.tags,
-           ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_body_score,
-           ROW_NUMBER() OVER (
-               ORDER BY ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) DESC
-           ) AS lex_body_rank
-    FROM memory_items m
-    JOIN documents d ON d.id = m.document_id
-    WHERE m.bank_id = %(bank_id)s
-      AND m.body_tsv @@ websearch_to_tsquery('english', %(qt)s)
-      AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-    ORDER BY lex_body_score DESC
-    LIMIT %(per_side)s
-  ),
-  fused AS (
-    SELECT
-      COALESCE(s.id, lc.id, lb.id) AS id,
-      COALESCE(s.document_id, lc.document_id, lb.document_id) AS document_id,
-      COALESCE(s.content, lc.content, lb.content) AS content,
-      COALESCE(s.original_chunk, lc.original_chunk, lb.original_chunk) AS original_chunk,
-      COALESCE(s.source, lc.source, lb.source) AS source,
-      COALESCE(s.metadata, lc.metadata, lb.metadata) AS metadata,
-      COALESCE(s.tags, lc.tags, lb.tags) AS tags,
-      COALESCE(s.sem_score, 0.0) AS sem_score,
-      COALESCE(lc.lex_content_score, 0.0) AS lex_content_score,
-      COALESCE(lb.lex_body_score, 0.0) AS lex_body_score,
-      (COALESCE(1.0 / (%(rrf_k)s + s.sem_rank), 0.0)
-       + COALESCE(1.0 / (%(rrf_k)s + lc.lex_content_rank), 0.0)
-       + COALESCE(1.0 / (%(rrf_k)s + lb.lex_body_rank), 0.0)) AS rrf_score
-    FROM semantic s
-    FULL OUTER JOIN lexical_content lc ON s.id = lc.id
-    FULL OUTER JOIN lexical_body lb ON COALESCE(s.id, lc.id) = lb.id
-  )
-SELECT id, document_id, content, original_chunk, source, metadata, tags,
-       sem_score, lex_content_score, lex_body_score, rrf_score
-FROM fused
-ORDER BY rrf_score DESC
-LIMIT %(limit)s
-"""
-
-SEMANTIC_SQL = """
-SELECT m.id, m.document_id, m.content, m.original_chunk, d.source,
-       m.metadata, m.tags,
-       1 - (m.embedding <=> %(qe)s::vector) AS sem_score
-FROM memory_items m
-JOIN documents d ON d.id = m.document_id
-WHERE m.bank_id = %(bank_id)s
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-ORDER BY m.embedding <=> %(qe)s::vector
-LIMIT %(limit)s
-"""
-
-LEXICAL_SQL = """
-SELECT m.id, m.document_id, m.content, m.original_chunk, d.source,
-       m.metadata, m.tags,
-       ts_rank_cd(m.content_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_score
-FROM memory_items m
-JOIN documents d ON d.id = m.document_id
-WHERE m.bank_id = %(bank_id)s
-  AND m.content_tsv @@ websearch_to_tsquery('english', %(qt)s)
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-ORDER BY lex_score DESC
-LIMIT %(limit)s
-"""
-
-
 def _meta_param(metadata_filter: dict | None) -> str | None:
     import json as _json
     if metadata_filter is None:
         return None
     return _json.dumps(metadata_filter)
-
-
-def hybrid_search(
-    conn, *, bank_id: str, query_text: str, query_embedding: list[float],
-    limit: int = 10, rrf_k: int = 60,
-    metadata_filter: dict | None = None,
-    per_side: int = 50,
-) -> list[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            HYBRID_SQL,
-            {
-                "bank_id": bank_id,
-                "qe": _vec_literal(query_embedding),
-                "qt": query_text,
-                "limit": int(limit),
-                "rrf_k": int(rrf_k),
-                "meta": _meta_param(metadata_filter),
-                "per_side": int(per_side),
-            },
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def semantic_search(
-    conn, *, bank_id: str, query_embedding: list[float],
-    limit: int = 10, metadata_filter: dict | None = None,
-) -> list[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            SEMANTIC_SQL,
-            {
-                "bank_id": bank_id,
-                "qe": _vec_literal(query_embedding),
-                "limit": int(limit),
-                "meta": _meta_param(metadata_filter),
-            },
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def lexical_search(
-    conn, *, bank_id: str, query_text: str,
-    limit: int = 10, metadata_filter: dict | None = None,
-) -> list[dict]:
-    """Lexical search over content_tsv (the index_text / questions channel).
-
-    Note: mode='lexical' is preserved as content-only per v0.1 option A.
-    The body channel (body_tsv) only fires through mode='hybrid' (RRF fusion).
-    See body_lexical_search() for the parallel helper over body_tsv.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            LEXICAL_SQL,
-            {
-                "bank_id": bank_id,
-                "qt": query_text,
-                "limit": int(limit),
-                "meta": _meta_param(metadata_filter),
-            },
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-BODY_LEXICAL_SQL = """
-SELECT m.id, m.document_id, m.content, m.original_chunk, d.source,
-       m.metadata, m.tags,
-       ts_rank_cd(m.body_tsv, websearch_to_tsquery('english', %(qt)s)) AS lex_body_score
-FROM memory_items m
-JOIN documents d ON d.id = m.document_id
-WHERE m.bank_id = %(bank_id)s
-  AND m.body_tsv @@ websearch_to_tsquery('english', %(qt)s)
-  AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
-  AND (%(meta)s::jsonb->'_allow' IS NULL OR (
-        (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
-        AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
-            (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
-ORDER BY lex_body_score DESC
-LIMIT %(limit)s
-"""
-
-
-def body_lexical_search(
-    conn, *, bank_id: str, query_text: str,
-    limit: int = 10, metadata_filter: dict | None = None,
-) -> list[dict]:
-    """Lexical search over body_tsv (the original_chunk / source body channel).
-
-    Parallel to lexical_search but matches against the body_tsv GENERATED
-    column over original_chunk. Used internally by hybrid_search; not
-    currently surfaced as its own Memory.search mode in v0.1 (the body
-    rescue fires through mode='hybrid' RRF fusion). Exposed here for
-    forward-compat and direct callers.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            BODY_LEXICAL_SQL,
-            {
-                "bank_id": bank_id,
-                "qt": query_text,
-                "limit": int(limit),
-                "meta": _meta_param(metadata_filter),
-            },
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -1233,7 +897,7 @@ def stats(conn, *, bank_id: str | None = None) -> dict:
 
     If bank_id is provided, scopes counts to that bank where applicable.
     Returns a dict with: banks, documents, memory_items, retain_events,
-    recall_events, formulate_events, sweep_passes.
+    recall_events, sweep_passes.
     """
     out: dict = {}
     with conn.cursor() as cur:
@@ -1248,8 +912,6 @@ def stats(conn, *, bank_id: str | None = None) -> dict:
             out["retain_events"] = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM recall_events")
             out["recall_events"] = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM formulate_events")
-            out["formulate_events"] = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM sweep_passes")
             out["sweep_passes"] = cur.fetchone()[0]
         else:
@@ -1263,8 +925,6 @@ def stats(conn, *, bank_id: str | None = None) -> dict:
             out["retain_events"] = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM recall_events WHERE bank_id = %s", (bank_id,))
             out["recall_events"] = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM formulate_events WHERE bank_id = %s", (bank_id,))
-            out["formulate_events"] = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM sweep_passes WHERE bank_id = %s", (bank_id,))
             out["sweep_passes"] = cur.fetchone()[0]
     return out

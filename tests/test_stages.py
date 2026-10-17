@@ -1,18 +1,13 @@
 """Recall stages after fusion: the cross-encoder rerank (Stage 2), the decision model's holder
-(JevScore), the validation of a recall_config. The reranker and Jev are stubs. (The Sonnet and Jev
-rerank, the Jev gate, the reader and its hop and the rerank blend were removed: docs/legacy.md; their
-tests went with them, and tests/test_retired_code.py pins what a bank that still names them does.)"""
+(JevScore), the validation of a recall_config. The reranker and Jev are stubs.
+(tests/test_legacy_removed.py pins what a bank that stored a config of removed stages does.)"""
 from __future__ import annotations
-
-from prospecta._test_helpers import no_cut
 
 import psycopg
 import pytest
 
-from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
 from prospecta.stages import JEV_MODEL, JevScore, validate_recall_config
-from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
 NOTES = {
@@ -25,25 +20,13 @@ NOTES = {
 QUERY = "cat sat"
 
 
-def vec(text):
-    return "[" + ",".join(map(str, stub_embed([text])[0])) + "]"
-
-
 @pytest.fixture
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
-    create_legacy_bank(m, "b", embedding_dim=EMBED_DIM)      # stored {}: no stage until a test sets one
-    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_recall_config({})        # no stage until a test sets one
     for src, text in NOTES.items():
-        m.retain(text, source=src, index_text=text)
-    with psycopg.connect(fresh_db) as conn:
-        for src, text in NOTES.items():
-            conn.execute(
-                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
-                " embedding, kind, ordinal, char_start, char_end) "
-                "SELECT 'b', d.id, %s, %s, %s::vector, 'chunk', 0, 0, %s FROM documents d "
-                "WHERE d.source = %s", (text, text, vec(text), len(text), src))
-        conn.commit()
+        m.retain(text, source=src)
     yield m
     m.close()
 
@@ -130,7 +113,8 @@ def test_validate_recall_config():
     validate_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     validate_recall_config({"rerank": {"enabled": False}})
     for bad in ({"nope": 1}, {"rerank": {"stage": "x"}}, {"rerank": {"pool": 30}},
-                {"rerank": {"enabled": True, "stage": "cross_encoder", "min_rel_score": 2}}, []):
+                {"rerank": {"enabled": True, "stage": "cross_encoder", "min_rel_score": 2}}, [],
+                {"gate": {"enabled": True}}, {"fusion": {"method": "rrf"}}, {"evidence": {}}):
         with pytest.raises(ValueError):
             validate_recall_config(bad)
 

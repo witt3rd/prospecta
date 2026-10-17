@@ -7,7 +7,6 @@ from prospecta._types import (
     EmbedCallable,
     LLMCallable,
     Query,
-    RAGResult,
     RecalledMemory,
     Tracer,
 )
@@ -40,24 +39,6 @@ def test_recalled_memory_full_construction():
     )
     assert rm.content.startswith("What")
     assert rm.scores["rrf"] == 0.85
-
-
-def test_rag_result_construction():
-    q = Query(text="q")
-    rm = RecalledMemory(
-        content="c", original_chunk="o", source="s", score=0.1,
-        scores={"semantic": 0.1, "lexical": 0.0, "rrf": 0.1},
-        metadata={}, bank_id="b", document_id="d",
-    )
-    result = RAGResult(
-        synthesis="the synthesis",
-        sources=[rm],
-        queries=[q],
-        queries_to_results={"q": [rm]},
-    )
-    assert result.synthesis == "the synthesis"
-    assert len(result.sources) == 1
-    assert result.queries_to_results["q"][0].content == "c"
 
 
 def test_llm_callable_protocol():

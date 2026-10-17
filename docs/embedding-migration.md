@@ -1,11 +1,11 @@
-# Embedding dimension migration (384 → 1,536): runbook
+# Re-embedding a bank: runbook
 
-A bank's `embedding_dim` is fixed, so changing it means a **new bank**,
-`<bank>-v2`. The old bank is only read, never modified; the old 384-d path
-keeps serving until you switch the callers' bank id.
+A bank's `embedding_dim` is fixed, so a change of embedder (another model, another width) means
+a **new bank**, `<bank>-v2`: the notes are re-chunked and embedded again into it. The source
+bank is only read, never modified; it keeps serving until you switch the callers' bank id.
 
-**Never run this against a live database before a verified dump, and rehearse
-on a restored scratch copy first.**
+**Never run this against a live database before a verified dump, and rehearse on a restored
+scratch copy first.**
 
 ## 1. Dump and verify
 
@@ -33,17 +33,18 @@ counts. Only then repeat on live, in a window with writers paused.
 prospecta --database-url "$DATABASE_URL" migrate-bank --source-bank forge
 # defaults: target forge-v2, 1536 dims, model id openai/text-embedding-3-large@1536,
 #           embedder litellm openai/text-embedding-3-large cut to 1536, batches of 128
+# another embedder: --embed-model, --embedding-dim, --embedding-model-id, --target-bank
 ```
 
 This creates `<bank>-v2` (`embedding_dim=1536`,
-`embedding_model_id=openai/text-embedding-3-large@1536`, plus its HNSW
-indexes) and, per source document, in one transaction: copies the document
-(recording `migrated_from_document_id` in `document_metadata`), inserts its
-`kind='chunk'` items (≤1,000 chars at paragraph boundaries, small overlap) and
-re-embeds each existing `kind='question'` item's text (no LLM call). The target is a new bank,
-so it gets the new-bank defaults (`channel_config = [hybrid_chunk]`, a `cross_encoder` rerank,
-linking off): the questions it carries are stored but `hybrid_chunk` reads chunks only. The source
-bank is not modified, config included.
+`embedding_model_id=openai/text-embedding-3-large@1536`, plus its HNSW index) and, per
+source document, in one transaction: copies the document (recording
+`migrated_from_document_id` in `document_metadata`) and inserts its `kind='chunk'` items
+(<=1,000 chars at paragraph boundaries, small overlap), embedded by the new embedder. The
+target holds **chunks only**, whatever kinds of item the source holds: a source bank's other
+items (the question items of an old bank) are not copied, because nothing reads them. The target
+is a new bank, so it gets the new-bank defaults (`channel_config = [hybrid_chunk]`, a
+`cross_encoder` rerank). The source bank is not modified, config included.
 
 **Resumable by document id.** A source document is done when the target holds a
 document carrying its id; re-running the same command skips those. Embedder
@@ -58,16 +59,16 @@ Cost: roughly $0.3 for ~3k documents, ~$7 for ~71k (design 8.4).
 ## 4. Shadow reads
 
 ```python
-Memory(database_url=url, bank_id="forge", embed=embed384,
-       shadow_bank_id="forge-v2", shadow_embed=embed1536)
+Memory(database_url=url, bank_id="forge", embed=embed_old,
+       shadow_bank_id="forge-v2", shadow_embed=embed_new)
 ```
 
 Every `recall()` then also queries the new bank; callers still receive only
 the old bank's results. Both runs are stored in `recall_events` (one row per
 bank, same `trace->'shadow'->>'id'`, `role` old/new, plus both result sets
 mapped to original document ids and their `jaccard` overlap). A shadow failure
-is recorded in the trace and never fails the recall. Compare on the logged
-queries (`recall_synth` is not shadowed). The single-event behaviour is
+(an embedder error, a failing Stage 1) is recorded in the trace and never fails
+the recall. Compare on the logged queries. The single-event behaviour is
 unchanged when no shadow bank is set.
 
 ## 5. Cut over and rollback

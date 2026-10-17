@@ -1,11 +1,9 @@
-"""Internal index module — directory walk, parse, chunk, embed, write.
+"""Internal index module — directory walk, parse, chunk, embed, write, and search.
 
-T9 vertical slice: classical RAG over Postgres. NO LLM-generated index_text
-yet (spine ships T11/T13). For now, memory_items.content == chunk text,
-which lets the lexical CTE work and seeds the slice end-to-end.
+A file is written as kind='chunk' items (content == original_chunk == the chunk text), with no model
+call. search() is Mode 2A: Stage 1 (the bank's hybrid_chunk channel) then Stage 2.
 
-Public Memory methods (index_directory, search, remove_documents) delegate
-here. The retain() method stays a stub in memory.py for T11 to flesh out.
+Public Memory methods (index_directory, index_single_file, search, remove_documents) delegate here.
 """
 from __future__ import annotations
 
@@ -14,28 +12,19 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Literal, Protocol
+from typing import TYPE_CHECKING, Iterator, Protocol
 
-from prospecta._chunker import chunk_paragraphs, chunk_text
+from prospecta._chunker import chunk_text
 from prospecta.cited import document_citations, match_kind
 from prospecta._scorecut import check_depth, resolve_depth
 from prospecta.stages import StageDeps, read_recall_config, run_stages
-from prospecta.channels.extract import DEFAULT_EXTRACT_MODEL
-from prospecta.channels.meta import DEFAULT_PROMOTE, DEFAULT_PROMOTE_WEIGHT
-from prospecta.channels import (
-    QueryPlan, RecallState, extract_filters, promote_scope, read_channel_config,
-    run_channels, scope_members,
-)
+from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_channels
 from prospecta._ignore import should_ignore
 from prospecta._filters import filter_fields
 from prospecta._parser import parse_frontmatter
 from prospecta._types import IndexStats, RecalledMemory
 from prospecta.db.queries import (
     delete_documents_by_source,
-    delete_memory_items_for_document,
-    hybrid_search,
-    lexical_search,
-    semantic_search,
     update_document_source,
     upsert_document,
     upsert_memory_items,
@@ -54,7 +43,6 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ParsedDocument:
     original_text: str
-    index_text: str | list[str] | None = None
     metadata: dict | None = None
     tags: list[str] | None = None
 
@@ -70,9 +58,8 @@ class ParserPlugin(Protocol):
 # ---------------------------------------------------------------------------
 
 class _MarkdownParser:
-    """Bundled markdown parser. Honors `index_text:` frontmatter (T10 will
-    use this on the spine write path; here we record it in metadata for
-    forward compatibility but still index the body as chunks)."""
+    """Bundled markdown parser: the body is chunked; frontmatter gives the note's tags, date,
+    person and kind."""
 
     file_patterns = ["*.md", "*.markdown"]
 
@@ -92,9 +79,6 @@ class _MarkdownParser:
                 t = [s.strip() for s in t.split(",")]
             if isinstance(t, list):
                 metadata["frontmatter_tags"] = [str(x) for x in t]
-        if "index_text" in fm:
-            # Forward-compatible: record presence; spine consumes in T10.
-            metadata["has_caller_index_text"] = True
         # Filter fields (documents.created_on / person / source_kind, 0005)
         for k, v in filter_fields(fm).items():
             if v is not None:
@@ -103,7 +87,6 @@ class _MarkdownParser:
         tags = metadata.get("frontmatter_tags", []) or []
         yield ParsedDocument(
             original_text=parsed.body if parsed.body else content,
-            index_text=fm.get("index_text"),
             metadata=metadata,
             tags=tags,
         )
@@ -298,71 +281,7 @@ def _write_parsed_docs(
                 statuses.append("new")
             document_ids.append(str(doc_id))
 
-            # T10: frontmatter `index_text:` override (P4 — caller wins).
-            override = parsed.index_text
-            if override is not None:
-                if isinstance(override, str):
-                    override_texts = [override]
-                elif isinstance(override, list):
-                    override_texts = [str(x) for x in override]
-                else:
-                    override_texts = [str(override)]
-                vectors = memory._embed(override_texts)
-                if len(vectors) != len(override_texts):
-                    raise RuntimeError(
-                        f"embed() returned {len(vectors)} vectors "
-                        f"for {len(override_texts)} inputs"
-                    )
-                items = []
-                for text, vec in zip(override_texts, vectors):
-                    items.append({
-                        "content": text,
-                        "original_chunk": text,
-                        "embedding": list(vec),
-                        "metadata": {
-                            **(parsed.metadata or {}),
-                            "index_text_caller_supplied": True,
-                        },
-                        "tags": list(parsed.tags or []),
-                        "update_mode": "append",
-                        "llm_generated": False,
-                    })
-                # The body must not be invisible to dense_chunk / hybrid_chunk: also
-                # write it as child chunks (kind='chunk', frontmatter-free).
-                if parsed.original_text.strip():
-                    body_chunks = list(chunk_paragraphs(
-                        parsed.original_text, chunk_size, min(chunk_overlap, chunk_size // 2)))
-                    chunk_vectors = memory._embed([c.content for c in body_chunks]) if body_chunks else []
-                    if len(chunk_vectors) != len(body_chunks):
-                        raise RuntimeError(
-                            f"embed() returned {len(chunk_vectors)} vectors "
-                            f"for {len(body_chunks)} chunks"
-                        )
-                    for c, vec in zip(body_chunks, chunk_vectors):
-                        items.append({
-                            "content": c.content,
-                            "original_chunk": c.content,
-                            "embedding": list(vec),
-                            "metadata": {**(parsed.metadata or {})},
-                            "tags": list(parsed.tags or []),
-                            "update_mode": "append",
-                            "llm_generated": False,
-                            "kind": "chunk",
-                            "ordinal": c.ordinal,
-                            "char_start": c.char_start,
-                            "char_end": c.char_end,
-                        })
-                upsert_memory_items(
-                    conn,
-                    bank_id=bank_id,
-                    document_id=doc_id,
-                    items=items,
-                )
-                total_items_added += len(items)
-                conn.commit()
-                continue
-
-            # Chunk + embed (no override path)
+            # Chunk + embed
             if parsed.original_text.strip():
                 chunks = list(
                     chunk_text(
@@ -554,7 +473,6 @@ def _search(
     memory: "Memory",
     text: str,
     *,
-    mode: Literal["hybrid", "semantic", "lexical"] = "hybrid",
     limit: int = 10,
     metadata_filter: dict | None = None,
     rrf_k: int = 60,
@@ -566,90 +484,28 @@ def _search(
     reranker_model: str | None = None,
     decision_model: str | None = None,
 ) -> list[RecalledMemory]:
-    """`date_from` / `date_to` (the note's date, inclusive) and `excluded_sources` (the
-    anti-echo list of documents.source values) are Stage 1 filters of the hybrid_chunk
-    channel; asking for them where it does not run is an error, never silently ignored.
-    `reranker_model` / `decision_model` override, for this call, the Memory's, the bank's
-    recall_config and the environment's choice of the stage 2 / Jev model."""
+    """Stage 1 (the bank's hybrid_chunk channel: an unset or empty channel_config is its defaults)
+    then Stage 2. `date_from` / `date_to` (the note's date, inclusive) and `excluded_sources` (the
+    anti-echo list of documents.source values) are Stage 1 filters. `reranker_model` /
+    `decision_model` override, for this call, the Memory's, the bank's recall_config and the
+    environment's choice of the stage 2 / Jev model."""
     check_depth(depth)
-    if mode not in ("hybrid", "semantic", "lexical"):
-        raise ValueError(f"Invalid mode: {mode!r}")
-    if mode in ("hybrid", "semantic") and memory._embed is None:
+    if memory._embed is None:
         raise RuntimeError(
-            "Memory.search requires an `embed` callable for "
-            f"mode={mode!r}; construct Memory(embed=...)"
+            "Memory.search requires an `embed` callable; construct Memory(embed=...)"
         )
     bank_id = memory._default_bank_id
-    stage1_filters = {"date_from": date_from, "date_to": date_to,
-                      "excluded_sources": excluded_sources}
-    wants_stage1 = any(v is not None for v in stage1_filters.values())
-    stage1_error = ("date_from, date_to and excluded_sources need the hybrid_chunk channel "
-                    "in the bank's channel_config")
-
-    if mode == "hybrid":
-        with memory._pool.connection() as conn:
-            channel_config = read_channel_config(conn, bank_id)
-        if channel_config:
-            if wants_stage1 and not any(e.get("name") == "hybrid_chunk" and e.get("enabled", True)
-                                        for e in channel_config):
-                raise ValueError(stage1_error)
-            return _search_channels(
-                memory, text, bank_id, channel_config, limit=limit,
-                metadata_filter=metadata_filter, rrf_k=rrf_k, trace=_trace,
-                depth=depth, stage1_filters=stage1_filters,
-                reranker_model=reranker_model, decision_model=decision_model,
-            )
-        if wants_stage1:
-            raise ValueError(stage1_error)
-        qvec = memory._embed([text])[0]
-        with memory._pool.connection() as conn:
-            rows = hybrid_search(
-                conn,
-                bank_id=bank_id,
-                query_text=text,
-                query_embedding=list(qvec),
-                limit=limit,
-                rrf_k=rrf_k,
-                metadata_filter=metadata_filter,
-            )
-        return [_row_to_recalled(r, bank_id, mode="hybrid") for r in rows]
-
-    if wants_stage1:
-        raise ValueError(stage1_error)
-    if mode == "semantic":
-        qvec = memory._embed([text])[0]
-        with memory._pool.connection() as conn:
-            rows = semantic_search(
-                conn,
-                bank_id=bank_id,
-                query_embedding=list(qvec),
-                limit=limit,
-                metadata_filter=metadata_filter,
-            )
-        out = []
-        for r in rows:
-            sem = float(r.get("sem_score") or 0.0)
-            out.append(_make_recalled(
-                r, bank_id, sem_score=sem, lex_score=0.0, rrf=sem,
-            ))
-        return out
-
-    # lexical
     with memory._pool.connection() as conn:
-        rows = lexical_search(
-            conn,
-            bank_id=bank_id,
-            query_text=text,
-            limit=limit,
-            metadata_filter=metadata_filter,
-        )
-    out = []
-    for r in rows:
-        lex = float(r.get("lex_score") or 0.0)
-        out.append(_make_recalled(
-            r, bank_id, sem_score=0.0, lex_score=lex, rrf=lex,
-        ))
-    return out
+        channel_config = read_channel_config(conn, bank_id)
+        conn.rollback()
+    return _search_channels(
+        memory, text, bank_id, channel_config, limit=limit,
+        metadata_filter=metadata_filter, rrf_k=rrf_k, trace=_trace,
+        depth=depth,
+        stage1_filters={"date_from": date_from, "date_to": date_to,
+                        "excluded_sources": excluded_sources},
+        reranker_model=reranker_model, decision_model=decision_model,
+    )
 
 
 def _search_channels(
@@ -659,35 +515,17 @@ def _search_channels(
     stage1_filters: dict | None = None, reranker_model: str | None = None,
     decision_model: str | None = None,
 ) -> list[RecalledMemory]:
-    """Hybrid recall through the bank's configured channels (banks.channel_config).
+    """Recall through the bank's channel (banks.channel_config, resolved by read_channel_config).
     `recall_cfg` overrides the bank's stage config ({} = no stages); None reads it."""
-    meta_cfg = next((e for e in config if e.get("name") == "meta" and e.get("enabled", True)), None)
     plan = QueryPlan(text=text)
-    extract_calls: list[dict] = []
     with memory._pool.connection() as conn:
-        if meta_cfg is not None:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT person FROM documents "
-                    "WHERE bank_id = %s AND person IS NOT NULL ORDER BY person",
-                    (bank_id,),
-                )
-                vocab = [r[0] for r in cur.fetchall()]
-            conn.rollback()
-            plan = QueryPlan(text=text, filters=extract_filters(
-                text, llm=memory._llm, people_vocab=vocab, now=plan.now,
-                model=(meta_cfg.get("params") or {}).get("extract_model") or DEFAULT_EXTRACT_MODEL,
-                calls=extract_calls,
-            ))
         state = RecallState(
             conn=conn, bank_id=bank_id, embed=memory._embed,
             metadata_filter=metadata_filter, **(stage1_filters or {}),
         )
         if recall_cfg is None:
             recall_cfg = read_recall_config(conn, bank_id)
-        fused, tr = run_channels(
-            state, plan, config, k=rrf_k, fusion=(recall_cfg or {}).get("fusion"),
-        )
+        fused, tr = run_channels(state, plan, config, k=rrf_k)
         if recall_cfg:
             fused, st = run_stages(
                 state, text, fused, recall_cfg,
@@ -702,19 +540,6 @@ def _search_channels(
                       accounting={k: st[k] for k in
                                   ("n_llm_calls", "tokens_in", "tokens_out", "cost_usd")})
         tr["depth"] = resolve_depth(depth, recall_cfg)
-        if extract_calls:
-            # The general llm's filter extraction counts in the recall's cost.
-            from prospecta.stages import totals
-            tr["calls"] = extract_calls + list(tr.get("calls") or [])
-            tr["accounting"] = totals(tr["calls"])
-    if meta_cfg is not None and (meta_cfg.get("params") or {}).get("promote", DEFAULT_PROMOTE):
-        # Scope promotion (design 8.5): hard filter with a small complete set
-        # moves every member to the front; the filter never excludes.
-        members = scope_members(plan, state.channel_lists.get("meta", []))
-        if members:
-            fused = promote_scope(fused, members, float(
-                (meta_cfg.get("params") or {}).get("promote_weight", DEFAULT_PROMOTE_WEIGHT)))
-            tr["fusion"]["scope_promoted"] = [m.document_id for m in members]
     if trace is not None:
         trace.append(tr)
     return recalled_from_fused(
@@ -723,7 +548,7 @@ def _search_channels(
 
 def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names: list[str],
                         recall_cfg: dict | None) -> list[RecalledMemory]:
-    """The fused documents as RecalledMemory, in order. `channel_lists` is what the channels
+    """The fused documents as RecalledMemory, in order. `channel_lists` is what the channel
     returned (the hybrid_chunk chunk carries the snippet that belongs with its own text);
     `channel_names` are the channels that ran; `recall_cfg` says whether stages ran (scores
     gain rerank) and whether the cross-encoder graded (relevance_score)."""
@@ -735,13 +560,10 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
         h = hybrid.get(f.document_id)   # the Stage 1 chunk: its snippet belongs with its own text
         b = h or f.best
         d = h.detail if h else {}
-        ranked = set(f.ranks)
-        scores = {"semantic": 0.0, "lexical": 0.0, "lexical_body": 0.0}
-        scores.update({n: 0.0 for n in channel_names})
+        scores = {n: 0.0 for n in channel_names}
         if recall_cfg:
             scores.update(rerank=0.0)
         scores.update({n: float(v) for n, v in f.scores.items()})
-        scores["semantic"] = float(f.scores.get("dense_chunk", 0.0))
         scores["rrf"] = float(f.score)
         out.append(RecalledMemory(
             content=b.detail.get("content") or b.evidence or "",
@@ -755,7 +577,7 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
             match_kind=match_kind(
                 exact=d.get("exact_rank") is not None,
                 lexical=d.get("stem_rank") is not None,
-                semantic=d.get("sem_rank") is not None or "dense_chunk" in ranked,
+                semantic=d.get("sem_rank") is not None,
                 date=d.get("date_rank") is not None),
             relevance_score=float(f.scores["rerank"]) if cross_encoder and "rerank" in f.scores
             else float(f.score),
@@ -763,48 +585,3 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
             item_id=b.item_id,
         ))
     return out
-
-
-
-
-def _row_to_recalled(row: dict, bank_id: str, *, mode: str) -> RecalledMemory:
-    sem = float(row.get("sem_score") or 0.0)
-    # Hybrid SQL returns lex_content_score + lex_body_score (T19 three-channel).
-    # Single-mode (semantic/lexical) helpers return lex_score / sem_score only.
-    lex_c = float(
-        row.get("lex_content_score")
-        or row.get("lex_score")
-        or 0.0
-    )
-    lex_b = float(row.get("lex_body_score") or 0.0)
-    rrf = float(row.get("rrf_score") or 0.0)
-    return _make_recalled(
-        row, bank_id,
-        sem_score=sem, lex_score=lex_c, lex_body_score=lex_b, rrf=rrf,
-    )
-
-
-def _make_recalled(
-    row: dict, bank_id: str,
-    *, sem_score: float, lex_score: float, lex_body_score: float = 0.0,
-    rrf: float,
-) -> RecalledMemory:
-    # Per option γ (T19): preserve `lexical` as lexical_content alias for
-    # backward compatibility. New key `lexical_body` exposes the body channel
-    # additively. All four keys always-numeric per A6 invariant.
-    scores = {
-        "semantic": float(sem_score),
-        "lexical": float(lex_score),
-        "lexical_body": float(lex_body_score),
-        "rrf": float(rrf),
-    }
-    return RecalledMemory(
-        content=row["content"],
-        original_chunk=row["original_chunk"],
-        source=row.get("source") or "",
-        score=float(rrf),
-        scores=scores,
-        metadata=row.get("metadata") or {},
-        bank_id=bank_id,
-        document_id=str(row["document_id"]),
-    )

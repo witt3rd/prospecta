@@ -218,10 +218,8 @@ def test_http_round_trip_and_auth(env):
 
 # ---- allowed-audience filter -------------------------------------------------
 
-from prospecta.channels.base import Filters, QueryPlan, RecallState  # noqa: E402
+from prospecta.channels.base import QueryPlan, RecallState  # noqa: E402
 from prospecta.channels.hybrid import HybridChunks  # noqa: E402
-from prospecta.channels.meta import MetadataScope  # noqa: E402
-from prospecta.channels.semantic import DenseChunks  # noqa: E402
 
 GARDEN = "Gardens need water and sun to grow."
 
@@ -234,10 +232,10 @@ def _ids(url, rid):
 def _channel_docs(mem, text, allow):
     """Document ids each channel offers as candidates for `text`."""
     flt = {"_allow": allow} if allow is not None else None
-    plan = QueryPlan(text=text, filters=Filters(people=["ann"]))
+    plan = QueryPlan(text=text)
     out = {}
     with mem._pool.connection() as conn:
-        for ch in (DenseChunks(), HybridChunks(), MetadataScope()):
+        for ch in (HybridChunks(),):
             st = RecallState(conn=conn, bank_id="b", embed=stub_embed, metadata_filter=flt)
             out[ch.name] = {c.document_id for c in ch.retrieve(plan, st)}
         conn.rollback()
@@ -253,24 +251,24 @@ def test_allowed_audience_excludes_record_from_every_channel(env):
     d1, d2, d3 = _ids(url, "1"), _ids(url, "2"), _ids(url, "3")
     # Sanity: with no filter the other audiences are candidates, in every channel.
     base = _channel_docs(mem, GARDEN, None)
-    for name in ("dense_chunk", "hybrid_chunk", "meta"):
+    for name in ("hybrid_chunk",):
         assert base[name], name
     assert (d2 | d3) & set().union(*base.values())
     # Restricted to team-a: nothing else, in any channel.
     got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a"]})
     for name, docs in got.items():
         assert not (docs & (d2 | d3)), name
-    assert got["dense_chunk"] == d1
+    assert got["hybrid_chunk"] == d1
     # The empty audience key is visible only when listed.
     got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a", ""]})
-    assert got["dense_chunk"] == d1 | d3
+    assert got["hybrid_chunk"] == d1 | d3
     assert not any(docs & d2 for docs in got.values())
     # An empty list allows nothing; projects filter the same way.
     assert all(not docs for docs in _channel_docs(mem, GARDEN, {"audience_key": []}).values())
     _note(url, 4, body=GARDEN + " Other project.", proj="p9", aud="team-a")
     ix.index_record("note", "4")
     got = _channel_docs(mem, GARDEN, {"audience_key": ["team-a"], "project": ["p1"]})
-    assert not (got["dense_chunk"] & _ids(url, "4"))
+    assert not (got["hybrid_chunk"] & _ids(url, "4"))
 
 
 def test_allowed_audience_never_reaches_a_result_or_follow_up(env):
@@ -546,11 +544,8 @@ def test_concurrent_reindex_matches_sequential(env):
 # ------------------------------------------------------------------ explain
 
 def _channel_env(env):
-    from prospecta.channels.registry import DEFAULT_CHANNEL_CONFIG
     url, mem, ix = env
-    cfg = [dict(c) for c in DEFAULT_CHANNEL_CONFIG if c["name"] == "dense_chunk"]
-    cfg.append({"name": "hybrid_chunk", "enabled": True, "weight": 1, "params": {}})
-    mem.set_channel_config(cfg)
+    mem.set_channel_config([{"name": "hybrid_chunk", "enabled": True, "weight": 1, "params": {}}])
     _note(url, 1, body="Gardens need water and sun.")
     ix.reindex_kind("note")
     return Service(mem, ix)
@@ -568,32 +563,36 @@ def test_explain_absent_response_is_byte_identical(env):
     assert "channels_run" not in json.loads(plain)["results"][0]
 
 
-def test_explain_hit_found_by_two_channels_shows_both(env):
+def test_explain_hit_shows_the_channel_that_found_it(env):
     svc = _channel_env(env)
     out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
-    assert sorted(out["channels_run"]) == ["dense_chunk", "hybrid_chunk"]
+    assert out["channels_run"] == ["hybrid_chunk"]
     assert out["channels_failed"] == []
     hit = out["results"][0]
-    assert {c["channel"] for c in hit["channels"]} == {"dense_chunk", "hybrid_chunk"}
-    w = {c["channel"]: c["weight"] for c in hit["channels"]}
-    assert w == {"dense_chunk": 4.0, "hybrid_chunk": 1.0}
+    assert [c["channel"] for c in hit["channels"]] == ["hybrid_chunk"]
+    assert hit["channels"][0]["weight"] == 1.0
     assert all(c["rank"] == 1 and isinstance(c["score"], float) for c in hit["channels"])
 
 
-def test_explain_failed_and_skipped_channels_listed(env, monkeypatch):
-    from prospecta.channels import semantic
+def test_explain_failed_and_ignored_channels_listed(env, monkeypatch):
+    from prospecta.channels import hybrid
     svc = _channel_env(env)
-    cfg = [{"name": "dense_chunk", "enabled": True, "weight": 4},
-           {"name": "hybrid_chunk", "enabled": True, "weight": 1},
-           {"name": "meta", "enabled": False, "weight": 1}]
-    env[1].set_channel_config(cfg)
-    monkeypatch.setattr(semantic.DenseChunks, "_sql", "SELECT broken FROM nowhere")
+    # a stored config naming channels that no longer exist beside hybrid_chunk: they are ignored and listed
+    import psycopg as _pg
+    with _pg.connect(env[0]) as c:
+        c.execute("UPDATE prospecta_shared.banks SET channel_config = %s::jsonb WHERE bank_id = 'b'",
+                  (json.dumps([{"name": "hybrid_chunk", "weight": 1}, {"name": "meta", "weight": 1},
+                               {"name": "dense_chunk", "enabled": False, "weight": 1}]),))
+        c.commit()
+    monkeypatch.setattr(hybrid, "stage1_search",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     out = svc.lookup({"questions": ["what do gardens need"], "explain": True})["results"][0]
-    assert out["channels_run"] == ["hybrid_chunk"]
+    assert out["channels_run"] == []
     failed = {f["channel"]: f["reason"] for f in out["channels_failed"]}
-    assert failed["dense_chunk"].startswith("failed:")
-    assert failed["meta"].startswith("skipped:") and "disabled" in failed["meta"]
-    assert [c["channel"] for c in out["results"][0]["channels"]] == ["hybrid_chunk"]
+    assert failed["hybrid_chunk"].startswith("failed:") and "boom" in failed["hybrid_chunk"]
+    assert failed["meta"].startswith("skipped:") and "ignored" in failed["meta"]
+    assert failed["dense_chunk"].startswith("skipped:") and "ignored" in failed["dense_chunk"]
+    assert out["results"] == []
 
 
 def test_explain_must_be_boolean(env):

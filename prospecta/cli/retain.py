@@ -1,4 +1,4 @@
-"""`prospecta retain CONTENT` — write a document via the spine."""
+"""`prospecta retain CONTENT` — write a note as chunks."""
 from __future__ import annotations
 
 import sys
@@ -23,8 +23,6 @@ def cmd_retain(args) -> int:
     if args.tags:
         tags = [t.strip() for t in args.tags.split(",") if t.strip()]
 
-    index_text = args.index_text  # already a list[str] | None from action="append"
-
     try:
         memory = _common.make_memory(args)
     except SystemExit as e:
@@ -33,7 +31,6 @@ def cmd_retain(args) -> int:
     try:
         document_id = memory.retain(
             content,
-            index_text=index_text,
             source=args.source,
             path=args.path,
             tags=tags,

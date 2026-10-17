@@ -42,37 +42,19 @@ def test_index_directory_end_to_end(memory_with_bank, tmp_path):
     assert all(r.original_chunk for r in results)
 
 
-def test_search_modes_return_distinct_shapes(memory_with_bank, tmp_path):
-    _write_corpus(tmp_path)
-    memory_with_bank.index_directory(tmp_path)
-
-    sem = memory_with_bank.search("kelly birthday", limit=5, mode="semantic")
-    lex = memory_with_bank.search("kelly birthday", limit=5, mode="lexical")
-    hyb = memory_with_bank.search("kelly birthday", limit=5, mode="hybrid")
-
-    assert all(isinstance(r, RecalledMemory) for r in sem)
-    assert all(isinstance(r, RecalledMemory) for r in lex)
-    assert all(isinstance(r, RecalledMemory) for r in hyb)
-
-
 def test_scores_never_null(memory_with_bank, tmp_path):
-    """A6: scores dict is always populated with all four numeric keys.
-
-    Three-channel RRF (T19): semantic, lexical (=content), lexical_body, rrf.
-    All four keys always present and numeric across all three modes.
-    """
+    """The scores dict is always populated and numeric: Stage 1's channel score and the fused score
+    (and Stage 2's, when a stage is configured)."""
     _write_corpus(tmp_path)
     memory_with_bank.index_directory(tmp_path)
 
-    for mode in ("hybrid", "semantic", "lexical"):
-        results = memory_with_bank.search("birthday", limit=5, mode=mode)
-        for r in results:
-            assert set(r.scores.keys()) >= {
-                "semantic", "lexical", "lexical_body", "rrf",
-            }
-            for k, v in r.scores.items():
-                assert v is not None
-                assert isinstance(v, (int, float))
+    results = memory_with_bank.search("birthday", limit=5)
+    assert results
+    for r in results:
+        assert set(r.scores.keys()) >= {"hybrid_chunk", "rrf"}
+        for k, v in r.scores.items():
+            assert v is not None
+            assert isinstance(v, (int, float))
 
 
 def test_metadata_filter_scoping(memory_with_bank, tmp_path):
@@ -84,10 +66,10 @@ def test_metadata_filter_scoping(memory_with_bank, tmp_path):
     # column-level; test the JSONB containment path by writing custom metadata.
     # We instead exercise it via a tags-bearing frontmatter file: parser puts
     # tags into metadata as a JSON array.
-    results_all = memory_with_bank.search("the", limit=20, mode="lexical")
+    results_all = memory_with_bank.search("the", limit=20)
     # tag-filtered: only kelly + forge frontmatter files carry the tags key
     results_filtered = memory_with_bank.search(
-        "the", limit=20, mode="lexical",
+        "the", limit=20,
         metadata_filter={"frontmatter_tags": ["kelly"]},
     )
     # Even if filter doesn't match (since exact JSONB containment is strict),

@@ -38,7 +38,6 @@ def test_retain_then_recall_keeps_provenance_and_timestamps(
     before = _db_now(mem.database_url)
     doc_id = mem.retain(
         body,
-        index_text="when does the anvil sing",
         source="roundtrip-note",
         tags=["forge", "dawn"],
         metadata={"origin": "unit-test"},
@@ -50,7 +49,7 @@ def test_retain_then_recall_keeps_provenance_and_timestamps(
     hit = next(r for r in results if r.document_id == doc_id)
     assert hit.source == "roundtrip-note"
     assert hit.original_chunk == body
-    assert hit.content == "when does the anvil sing"
+    assert hit.content == body
     assert hit.bank_id == "test"
     assert hit.metadata.get("origin") == "unit-test"
 
@@ -66,26 +65,24 @@ def test_retain_then_recall_keeps_provenance_and_timestamps(
     assert _doc_times(mem.database_url, doc_id)[:2] == (created, updated)
 
 
-def test_retain_then_search_lexical_and_semantic(memory_with_bank_and_mock_llm):
+def test_retain_then_search_finds_it_by_its_words_and_its_meaning(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     doc_id = mem.retain(
         "Cookie runs DJ Babycakes from the kitchen.",
-        index_text="who is DJ Babycakes",
         source="cookie",
     )
-    for mode in ("lexical", "semantic", "hybrid"):
-        res = mem.search("DJ Babycakes", mode=mode, limit=5)
-        assert any(r.document_id == doc_id for r in res), mode
-        hit = next(r for r in res if r.document_id == doc_id)
-        assert hit.source == "cookie"
-        assert hit.original_chunk == "Cookie runs DJ Babycakes from the kitchen."
+    res = mem.search("DJ Babycakes", limit=5)
+    hit = next(r for r in res if r.document_id == doc_id)
+    assert hit.source == "cookie"
+    assert hit.original_chunk == "Cookie runs DJ Babycakes from the kitchen."
+    assert hit.match_kind == "exact+semantic"                 # the exact words and the vector both found it
 
 
 def test_retain_replace_on_same_content_and_source_keeps_one_document(memory_with_bank_and_mock_llm):
     # Replace semantics (docs/schema.md, "Re-retain") key on content_hash + source.
     mem = memory_with_bank_and_mock_llm
-    first = mem.retain("body about basalt", index_text="basalt", source="s1")
-    second = mem.retain("body about basalt", index_text="basalt", source="s1")
+    first = mem.retain("body about basalt", source="s1")
+    second = mem.retain("body about basalt", source="s1")
     assert first == second
     res = mem.recall(["basalt"], limit=5)
     assert [r.original_chunk for r in res].count("body about basalt") == 1

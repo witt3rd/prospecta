@@ -7,22 +7,16 @@ Replace-on-source-match (docs/schema.md, "Re-retain"):
   - New content_hash → INSERT new documents row.
 
 A note is indexed as its own chunks: kind='chunk' items whose content and
-original_chunk are the chunk text, with no model call. Question items exist only
-when the caller supplies `index_text` (the model-written questions of the old
-`generate_questions` option were removed: docs/legacy.md).
+original_chunk are the chunk text, with no model call.
 
 P-principles enforced here:
-  P1 — question items (the caller's own) hold question-shaped index_text strings;
-       the full body lives in documents.original_text.
   P3 — zero provider imports; uses the memory.embed callable.
-  P4 — caller-supplied index_text is written as given.
   P5 — original content preserved verbatim in documents.original_text.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
-import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,23 +43,17 @@ def retain(
     memory: "Memory",
     content: str,
     *,
-    index_text: str | list[str] | None = None,
     source: str | None = None,
     path: Path | str | None = None,
     tags: list[str] | None = None,
     metadata: dict | None = None,
     update_mode: str = "append",
-    child_chunks: bool = False,
 ) -> str:
     """Write a note. Returns document_id (str UUID).
 
     Default: the note is written as kind='chunk' items of at most 1,000 chars
     at paragraph boundaries (small overlap), each carrying the parent
     document_id and its ordinal / char offsets, and no model is called.
-
-    index_text: caller-supplied question strings, written as the note's
-    question items instead of the chunks (add child_chunks=True for both).
-    child_chunks: also write the chunk items next to the question items.
 
     documents.created_on is always stamped: the note's own date (frontmatter
     or metadata) else today's date in PROSPECTA_TIMEZONE (UTC when unset).
@@ -107,26 +95,6 @@ def retain(
 
     tags_list = list(tags or [])
     extra_metadata = dict(metadata or {})
-
-    # ------------------------------------------------------------------
-    # Resolve index_text (P4: caller wins). No question strings at all is the
-    # default: the note is indexed as its chunks only.
-    # ------------------------------------------------------------------
-    caller_supplied = index_text is not None
-    index_text_list: list[str] = []
-    if index_text is not None:
-        if isinstance(index_text, str):
-            index_text_list = [index_text]
-        elif isinstance(index_text, list):
-            index_text_list = [str(x) for x in index_text]
-        else:
-            raise TypeError(
-                f"index_text must be str | list[str] | None, got {type(index_text).__name__}"
-            )
-        # Strip/dedupe.
-        index_text_list = _dedupe_strip(index_text_list)
-        if not index_text_list:
-            raise ValueError("index_text resolved to empty list after stripping")
 
     # ------------------------------------------------------------------
     # Re-retain check (docs/schema.md, "Re-retain").
@@ -179,54 +147,28 @@ def retain(
             )
 
         # ------------------------------------------------------------------
-        # Embed + write memory_items.
+        # Embed + write the chunks.
         # ------------------------------------------------------------------
-        vectors = memory._embed(index_text_list) if index_text_list else []
-        if len(vectors) != len(index_text_list):
-            raise RuntimeError(
-                f"embed() returned {len(vectors)} vectors for "
-                f"{len(index_text_list)} inputs"
-            )
-
         body, body_off = _body_and_offset(content)
         chunks = chunk_paragraphs(body, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
-        items = []
-        for text, vec in zip(index_text_list, vectors):
-            items.append({
-                "content": text,
-                # The full note stays in documents.original_text; a question
-                # item carries only its matching chunk (frontmatter-free).
-                "original_chunk": _matching_chunk(text, chunks, body),
-                "embedding": list(vec),
-                "metadata": {
-                    **extra_metadata,
-                    "index_text_caller_supplied": caller_supplied,
-                },
-                "tags": tags_list,
-                "update_mode": update_mode,
-                "llm_generated": False,
-            })
-        if child_chunks or not index_text_list:
-            chunk_vectors = memory._embed([c.content for c in chunks]) if chunks else []
-            if len(chunk_vectors) != len(chunks):
-                raise RuntimeError(
-                    f"embed() returned {len(chunk_vectors)} vectors for "
-                    f"{len(chunks)} chunks"
-                )
-            for c, vec in zip(chunks, chunk_vectors):
-                items.append({
-                    "content": c.content,
-                    "original_chunk": c.content,
-                    "embedding": list(vec),
-                    "metadata": {**extra_metadata},
-                    "tags": tags_list,
-                    "update_mode": update_mode,
-                    "llm_generated": False,
-                    "kind": "chunk",
-                    "ordinal": c.ordinal,
-                    "char_start": c.char_start + body_off,
-                    "char_end": c.char_end + body_off,
-                })
+        vectors = memory._embed([c.content for c in chunks]) if chunks else []
+        if len(vectors) != len(chunks):
+            raise RuntimeError(
+                f"embed() returned {len(vectors)} vectors for {len(chunks)} chunks"
+            )
+        items = [{
+            "content": c.content,
+            "original_chunk": c.content,
+            "embedding": list(vec),
+            "metadata": {**extra_metadata},
+            "tags": tags_list,
+            "update_mode": update_mode,
+            "llm_generated": False,
+            "kind": "chunk",
+            "ordinal": c.ordinal,
+            "char_start": c.char_start + body_off,
+            "char_end": c.char_end + body_off,
+        } for c, vec in zip(chunks, vectors)]
         upsert_memory_items(
             conn,
             bank_id=bank_id,
@@ -244,12 +186,9 @@ def retain(
             "bank_id": bank_id,
             "document_id": document_id,
             "items_count": len(items),
-            "index_text_caller_supplied": caller_supplied,
             "duration_ms": duration_ms,
-            "raw_llm_response": None,
             "error": None,
             "source": resolved_source,
-            "index_text_generated": None,
         })
     except Exception:  # pragma: no cover — tracer must not break retain
         logger.exception("tracer raised; ignoring")
@@ -288,15 +227,6 @@ def _body_and_offset(content: str) -> tuple[str, int]:
         return content, 0
     off = content.find(body)
     return body, max(off, 0)
-
-
-def _matching_chunk(query: str, chunks: list, fallback: str) -> str:
-    """The chunk sharing the most words with the question text."""
-    if not chunks:
-        return fallback
-    words = set(re.findall(r"\w{3,}", query.lower()))
-    best = max(chunks, key=lambda c: len(words & set(re.findall(r"\w{3,}", c.content.lower()))))
-    return best.content
 
 
 def _insert_document(
@@ -365,15 +295,3 @@ def _refresh_document(
                 **filter_fields(metadata, _frontmatter(original_text)),
             },
         )
-
-
-def _dedupe_strip(items: list[str]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for s in items:
-        ss = s.strip()
-        if not ss or ss in seen:
-            continue
-        seen.add(ss)
-        out.append(ss)
-    return out

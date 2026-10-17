@@ -48,25 +48,14 @@ class Query:
 class RecalledMemory:
     """A single retrieved memory_item with full audit trail (P5: no truncation)."""
 
-    content: str            # spine write-side: LLM-anticipated index_text
+    content: str            # the chunk text (the same as original_chunk)
     original_chunk: str     # source text (P5)
     source: str             # documents.source (file path / URL / conv ID)
-    score: float            # RRF score (or single-mode score)
+    score: float            # the fused (RRF) score of Stage 1
     scores: dict[str, float]
-    """Four-key scores dict, always-populated, all numeric (A6 invariant):
-      - "semantic": cosine similarity from HNSW channel (1 - distance).
-        0.0 when result didn't surface via semantic channel.
-      - "lexical": ts_rank_cd over content_tsv (LLM-generated index_text /
-        questions channel). Preserved name for backward compat per v0.1
-        option γ; semantically equivalent to `lexical_content`.
-      - "lexical_body": ts_rank_cd over body_tsv (original_chunk / source
-        body channel). The P14 body-fallback safety net — rescues docs
-        whose LLM-generated index_text drifted from query language.
-        0.0 unless surfaced via mode='hybrid' three-channel fusion.
-      - "rrf": fused Reciprocal Rank Fusion score (semantic +
-        lexical_content + lexical_body in hybrid mode; identical to
-        single-channel score in semantic/lexical modes).
-    """
+    """Always numeric: {"hybrid_chunk": Stage 1's own score, "rrf": the fused score} and, when the
+    bank has stages configured, "rerank": the cross-encoder's 0..1 score (0.0 when it did not grade
+    this note)."""
     metadata: dict[str, Any]
     bank_id: str
     document_id: str
@@ -179,7 +168,7 @@ class AskResult:
 
 @dataclass(frozen=True)
 class IndexStats:
-    """Result of Memory.index_directory(). Sibling to RAGResult shape."""
+    """Result of Memory.index_directory()."""
 
     documents_added: int = 0
     documents_replaced: int = 0
@@ -188,22 +177,6 @@ class IndexStats:
     files_skipped: int = 0
     files_unchanged: int = 0
     errors: int = 0
-
-
-@dataclass(frozen=True)
-class RAGResult:
-    """Result of recall_synth. queries_to_results enables per-query trace
-    (A9 fold from prospecta-impl ralplan Round 2).
-    """
-
-    synthesis: str
-    sources: list[RecalledMemory]
-    queries: list[Query]
-    queries_to_results: dict[str, list[RecalledMemory]]
-    # Grounded synthesis only (recall_synth(grounded=True)); empty otherwise.
-    citations: list[dict] = field(default_factory=list)   # [{note, document_id, known}]
-    evidence: list[dict] = field(default_factory=list)    # [{note, document_id, chunks}]
-    synth_call: dict = field(default_factory=dict)        # model, tokens, cost_usd, duration_ms
 
 
 class DocumentSourceConflictError(Exception):
@@ -235,6 +208,6 @@ class DocumentSourceConflictError(Exception):
 Tracer = Callable[[str, dict[str, Any]], None]
 """Observability primitive. Default no-op.
 
-Fires on six named events:
-  retain, recall, formulate_queries, index_single_file, sweep_pass, llm_call
+Fires on five named events:
+  retain, recall, index_single_file, sweep_pass, llm_call
 """

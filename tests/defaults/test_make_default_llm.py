@@ -125,11 +125,11 @@ def test_per_call_model_overrides_bank_model(monkeypatch):
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    from prospecta.channels.extract import _accepts_model
+    from prospecta._llmutil import accepts_model
     from prospecta.defaults import make_default_llm
 
     llm = make_default_llm(model="openai/gpt-4o-mini")
-    assert _accepts_model(llm)
+    assert accepts_model(llm)
     llm(messages=[], model="anthropic/claude-sonnet-5.5")
     llm(messages=[])
     assert [c["model"] for c in calls] == ["anthropic/claude-sonnet-5.5", "openai/gpt-4o-mini"]

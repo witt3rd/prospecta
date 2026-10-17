@@ -17,8 +17,8 @@ Postgres, Neon and Azure Database for PostgreSQL.
   SELECT * FROM pg_available_extensions WHERE name = 'vector';    -- what could be installed
   ```
 
-  A provider that ships an older pgvector can run legacy banks (`docs/legacy.md`) but not a
-  bank on `hybrid_chunk`; `ALTER EXTENSION vector UPDATE;` after the provider offers 0.8.
+  A provider that ships an older pgvector cannot run Prospecta: Stage 1 needs 0.8
+  (`ALTER EXTENSION vector UPDATE;` after the provider offers it).
 - **Python 3.11 or newer**, and an embedder: `pip install 'prospecta[defaults]'` (LiteLLM, any
   provider), `'prospecta[embedder]'` (local sentence-transformers, no API key),
   `'prospecta[embed-openai]'` or `'prospecta[embed-openai-compatible]'`.

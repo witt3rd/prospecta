@@ -1,12 +1,13 @@
-"""Removing the retired recall code does not change what the banks in use return.
+"""What the banks in use return, pinned.
 
-Four fixture banks mirror the live ones (tests/_live_banks.py): `augur-v2` and `forge-v2` run
-`hybrid_chunk` + the cross-encoder, set by hand, and must return the same results after the removal as
-before it; `augur` and `forge` are legacy banks (`channel_config = []`, with the rows of a linker that
-once ran) and must still search by the legacy three-channel path. The expected values in
-tests/fixtures/retrieval_golden.json were recorded from the code BEFORE the removal (main at 67c0706);
-the test compares what the code returns now with them. Real Postgres, the stub embedder, a fake
-reranker and a scripted model.
+Four fixture banks mirror the ones in use (tests/_live_banks.py): `augur-v2` and `forge-v2` run
+`hybrid_chunk` + the cross-encoder, set by hand; `augur` and `forge` are old banks (`channel_config = []`,
+question items beside their chunks, the rows of a linker that once ran): an empty config is the hybrid
+default, so they search through `hybrid_chunk` and never see a question item. The expected values in
+tests/fixtures/retrieval_golden.json were recorded from the code BEFORE the removal of all legacy for the
+two hand-set banks (main at 4e2962d; the only differences are the removed `semantic` / `lexical` /
+`lexical_body` score keys and the calls that were removed) and from the code after it for the two old
+banks. Real Postgres, the stub embedder, a fake reranker and a scripted model.
 
 Regenerate (only when a change is meant to move results): `PROSPECTA_WRITE_GOLDEN=1 pytest
 tests/test_retrieval_golden.py`."""
@@ -58,18 +59,12 @@ def scenario(url: str, bank: str) -> dict:
         out: dict = {}
         qs = QUERIES[corpus]
         out["search"] = {q: snap(mem.search(q, limit=8)) for q in qs}
-        out["search_semantic"] = snap(mem.search(qs[0], mode="semantic", limit=5))
-        out["search_lexical"] = snap(mem.search(qs[3], mode="lexical", limit=5))
         out["recall"] = snap(mem.recall(qs[:3], limit=4))
         out["recall_parallel"] = snap(mem.recall(qs[:3], limit=4, parallel=True))
-        if not legacy:
-            out["search_dates"] = snap(mem.search(qs[0], limit=8, date_from="2026-03-01", date_to="2026-04-30"))
-            out["search_anti_echo"] = snap(mem.search(
-                qs[0], limit=8, excluded_sources=[CORPUS[corpus][0][0], CORPUS[corpus][1][0]]))
-            out["search_deep"] = snap(mem.search(qs[4], limit=8, depth="deep"))
-        else:
-            with pytest.raises(ValueError):          # Stage 1 filters need hybrid_chunk
-                mem.search(qs[0], date_from="2026-03-01")
+        out["search_dates"] = snap(mem.search(qs[0], limit=8, date_from="2026-03-01", date_to="2026-04-30"))
+        out["search_anti_echo"] = snap(mem.search(
+            qs[0], limit=8, excluded_sources=[CORPUS[corpus][0][0], CORPUS[corpus][1][0]]))
+        out["search_deep"] = snap(mem.search(qs[4], limit=8, depth="deep"))
         out["expand_chat"] = snap_expanded(mem.expand_and_recall(
             "what did we decide about the lamps and the glaze?", "chat", gate=False, record=False, now=TODAY))
         out["expand_task"] = snap_expanded(mem.recall_for_task(
@@ -77,11 +72,6 @@ def scenario(url: str, bank: str) -> dict:
         asked = mem.ask(qs[0], limit=4)
         out["ask"] = {"answer": asked.answer, "citations": asked.citations, "items": snap(asked.items),
                       "sufficient": asked.sufficient, "retried": asked.retried}
-        synth = mem.recall_synth(qs[0], limit=4)
-        out["recall_synth"] = {
-            "synthesis": synth.synthesis, "queries": [q.text for q in synth.queries],
-            "sources": snap(synth.sources),
-            "per_query": {k: snap(v) for k, v in synth.queries_to_results.items()}}
         out["llm_calls"] = list(llm.calls)
         out["rerank_requests"] = rerank.requests
         return out
@@ -95,7 +85,7 @@ def golden() -> dict:
 
 
 @pytest.mark.parametrize("bank", list(LIVE))
-def test_a_live_shaped_bank_returns_what_it_returned_before_the_removal(bank, fresh_db, golden):
+def test_a_live_shaped_bank_returns_what_it_returned(bank, fresh_db, golden):
     got = json.loads(json.dumps(scenario(fresh_db, bank), default=str))   # as it is stored
     if os.environ.get("PROSPECTA_WRITE_GOLDEN"):
         data = json.loads(GOLDEN.read_text()) if GOLDEN.exists() else {}
@@ -107,7 +97,7 @@ def test_a_live_shaped_bank_returns_what_it_returned_before_the_removal(bank, fr
 
 
 def test_the_fixture_banks_are_what_they_claim(fresh_db):
-    """The legacy fixtures hold the rows of a linker that once ran; the hybrid ones are chunk-only."""
+    """The old fixtures hold the rows of a linker that once ran; the hand-set ones are chunk-only."""
     legacy = build_bank(fresh_db, "augur", "augur", legacy=True)
     hybrid = build_bank(fresh_db, "augur-v2", "augur", legacy=False)
     try:

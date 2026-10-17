@@ -16,8 +16,19 @@ Everything not named is the code default below: the model, the floor, `top_n` an
 are not stored, so a changed default (or `PROSPECTA_RERANKER_MODEL`) reaches every bank that
 does not pin its own. Change a bank with `Memory.set_channel_config([...])` and
 `Memory.set_recall_config({...})` (they replace the whole value; `{}` turns every stage off).
-A bank that stored `channel_config = []` is a legacy bank and ignores `recall_config`
-(`docs/legacy.md`).
+
+**One channel, and what a stored config may hold.** `hybrid_chunk` is the only channel, and the
+keys below are the only `recall_config` keys. A **new** config (`set_channel_config`,
+`set_recall_config`) is checked: another channel name or another key raises `ValueError`. A
+**stored** one is never rewritten and never an error: a `channel_config` that is empty, or names
+only channels the library no longer has, runs `hybrid_chunk` with its defaults; an entry that
+names a removed channel (`dense_chunk`, `meta`, `bm25`, `keyword`, `question`, `graph`) is
+ignored beside it and listed in the recall trace's `skipped`; a `recall_config` key the library
+does not read (`gate`, `reader`, `link_completeness`, `fusion`, `evidence`, `rerank.blend`, a
+`rerank.stage` other than `cross_encoder`, ...) is ignored, silently. A bank that stored a rerank
+stage the library does not have therefore keeps the Stage 1 order. (`hybrid_chunk` with
+`"enabled": false` is an explicit choice and stays off: nothing is retrieved, and
+`expand_and_recall` returns an `error`.)
 
 | `recall_config` key | what | page section |
 |---|---|---|
@@ -27,8 +38,6 @@ A bank that stored `channel_config = []` is a legacy bank and ignores `recall_co
 | `stage3_sufficiency` | Stage 3: `enabled`, `threshold` | Stage 3 |
 | `models` | `decision_model`, `query_writer_model` | Models |
 | `depth` | the bank's default rerank-pool cut, `standard` or `deep` | Recall depth |
-| `evidence`, `fusion` | the legacy channel set (`docs/legacy.md`) | `docs/legacy.md` |
-| `gate`, `reader`, `link_completeness`, `rerank.stage` other than `cross_encoder`, `rerank.blend` | **removed**: `set_recall_config` refuses them, and a bank that stored one has it skipped with one warning per process | `docs/legacy.md` |
 
 ## Stage 1: the `hybrid_chunk` channel
 
@@ -46,9 +55,8 @@ integers >= 1:
 
 Per-call filters of `search`, `recall`, `ask`, `expand_and_recall` and `POST /lookup`, pushed into
 all three retrievers: `date_from` / `date_to` (the note's date, inclusive), `excluded_sources`
-(the anti-echo list of `documents.source` values) and `metadata_filter`. They raise `ValueError`
-on a bank whose channel config has no `hybrid_chunk`. Needs pgvector 0.8 or newer
-(`docs/deployment.md`).
+(the anti-echo list of `documents.source` values) and `metadata_filter`; they apply to every bank.
+Needs pgvector 0.8 or newer (`docs/deployment.md`).
 
 ## Stage 2: the cross-encoder
 
@@ -144,9 +152,8 @@ plus `searches`, `fallbacks` and `error`, and takes no `limit`.
 
 Every `RecalledMemory` carries the cited-evidence contract next to `source` and `original_chunk`:
 `created_on` (`YYYY-MM-DD`), `kind` (`documents.source_kind`), `match_kind` (`exact+semantic`,
-`exact`, `lexical`, `semantic`, `date`; from the channels that found the note, `None` for a bank
-on the legacy path; `date` is a note listed only because it lies in a wordless question's date
-window), `relevance_score` (the cross-encoder's 0..1 score when it graded the note, else the
+`exact`, `lexical`, `semantic`, `date`; from the retrievers that found the note; `date` is a note
+listed only because it lies in a wordless question's date window), `relevance_score` (the cross-encoder's 0..1 score when it graded the note, else the
 fused `score`) and `exact_snippet` (`ts_headline` of the matched words, `<<marked>>`, from the
 `hybrid_chunk` channel); Mode 1 adds `found_by`. `prospecta.cited.format_cited_rag_block(items)`
 renders items as the cited, non-instructional block (`[n] source=... | date=... | kind=... |
@@ -198,7 +205,7 @@ else raises `ValueError`; `None` / omitted = not set). Precedence, first that ap
 Where it is accepted: `Memory.recall(queries, ..., depth="deep")`, `Memory.search(text, ...,
 depth="deep")`, `expand_and_recall(..., depth=)`, `ask(..., depth=)`; the CLI
 `prospecta search QUERY --depth {standard,deep}` and `prospecta eval QUESTIONS.md --depth ...`.
-The trace is `recall_events.depth` (migration 0015; NULL on legacy rows).
+The trace is `recall_events.depth` (migration 0015; NULL on rows written before it).
 
 ## Accounting
 

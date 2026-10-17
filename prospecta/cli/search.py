@@ -1,4 +1,4 @@
-"""`prospecta search QUERY` — hybrid retrieval."""
+"""`prospecta search QUERY` — Stage 1 (hybrid_chunk) + Stage 2."""
 from __future__ import annotations
 
 import sys
@@ -15,7 +15,6 @@ def cmd_search(args) -> int:
     try:
         results = memory.search(
             args.query,
-            mode=args.mode,
             limit=args.limit,
             rrf_k=args.rrf_k,
             depth=getattr(args, "depth", None),

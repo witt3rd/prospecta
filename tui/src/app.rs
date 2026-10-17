@@ -427,21 +427,11 @@ impl App {
 
         self.retain_state.status = retain::RetainStatus::Running;
 
-        let index_text: Vec<String> = self
-            .retain_state
-            .index_text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
-
         let args = crate::shell::RetainArgs {
             bank_id,
             content: self.retain_state.content.clone(),
             source: opt(&self.retain_state.source),
             tags: opt(&self.retain_state.tags),
-            index_text,
         };
 
         match crate::shell::retain(&args).await {

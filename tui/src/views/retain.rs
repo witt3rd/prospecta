@@ -1,6 +1,6 @@
 //! Retain form — manual write path via shell-out to `prospecta retain`.
 //!
-//! A modal overlay (opened from the search tab with `R`) with four text
+//! A modal overlay (opened from the search tab with `R`) with three text
 //! fields and a submit action. On submit the app shells out to the Python
 //! CLI; this view renders the honest outcome — the document UUID on success
 //! or the verbatim CLI stderr on failure. It never fabricates success.
@@ -21,7 +21,6 @@ pub enum RetainField {
     Content,
     Source,
     Tags,
-    IndexText,
 }
 
 impl RetainField {
@@ -29,16 +28,14 @@ impl RetainField {
         match self {
             RetainField::Content => RetainField::Source,
             RetainField::Source => RetainField::Tags,
-            RetainField::Tags => RetainField::IndexText,
-            RetainField::IndexText => RetainField::Content,
+            RetainField::Tags => RetainField::Content,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            RetainField::Content => RetainField::IndexText,
+            RetainField::Content => RetainField::Tags,
             RetainField::Source => RetainField::Content,
             RetainField::Tags => RetainField::Source,
-            RetainField::IndexText => RetainField::Tags,
         }
     }
 }
@@ -61,9 +58,6 @@ pub struct RetainState {
     pub content: String,
     pub source: String,
     pub tags: String,
-    /// Single index_text line for v0.1 (the offline-skip-LLM path). Empty =
-    /// let the CLI generate via LLM (needs litellm + a key).
-    pub index_text: String,
     pub field: RetainField,
     pub status: RetainStatus,
 }
@@ -75,7 +69,6 @@ impl RetainState {
             content: String::new(),
             source: String::new(),
             tags: String::new(),
-            index_text: String::new(),
             field: RetainField::Content,
             status: RetainStatus::Idle,
         }
@@ -86,7 +79,6 @@ impl RetainState {
         self.content.clear();
         self.source.clear();
         self.tags.clear();
-        self.index_text.clear();
         self.field = RetainField::Content;
         self.status = RetainStatus::Idle;
     }
@@ -96,7 +88,6 @@ impl RetainState {
             RetainField::Content => &mut self.content,
             RetainField::Source => &mut self.source,
             RetainField::Tags => &mut self.tags,
-            RetainField::IndexText => &mut self.index_text,
         }
     }
 
@@ -127,12 +118,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &RetainState) {
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    // content(5) · source(3) · tags(3) · index_text(3) · status(rest) · hint(1)
+    // content(5) · source(3) · tags(3) · status(rest) · hint(1)
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(3),
@@ -164,22 +154,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &RetainState) {
         state.field == RetainField::Tags,
         false,
     );
-    field_box(
-        frame,
-        rows[3],
-        "index_text (empty → LLM-generated)",
-        &state.index_text,
-        state.field == RetainField::IndexText,
-        false,
-    );
-
-    render_status(frame, rows[4], state);
+    render_status(frame, rows[3], state);
 
     let hint = Line::from(vec![Span::styled(
         " Tab/↑↓ field · Enter newline (content) · Ctrl-S submit · Esc cancel",
         theme::respect_no_color(theme::dim()),
     )]);
-    frame.render_widget(Paragraph::new(hint), rows[5]);
+    frame.render_widget(Paragraph::new(hint), rows[4]);
 }
 
 fn field_box(

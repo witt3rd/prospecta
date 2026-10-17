@@ -316,8 +316,7 @@ def _insert_unit(conn, bank, r, vec):
             # One fact = one whole chunk (kind='chunk'): what hybrid_chunk reads, and what a
             # bank created by this import gets as its Stage 1.
             (bank, doc_id, text, text, lit,
-             json.dumps({"index_text_caller_supplied": True, "hindsight_id": uid,
-                         "fact_type": fact_type}),
+             json.dumps({"hindsight_id": uid, "fact_type": fact_type}),
              tag_list, created, updated, len(text)))
 
 

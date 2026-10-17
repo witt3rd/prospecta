@@ -4,10 +4,9 @@ door (JevScore: the holder of its transport and model; Stage 0's `needs_memory` 
 `evidence_sufficient` question go through it). A stage is off unless banks.recall_config turns
 it on; a failing stage never sinks the recall (the fused order stands and the record says why).
 
-The Sonnet listwise rerank, the Jev rerank, the Jev gate over Sonnet, the reader and its
-second hop, and the rerank blend were removed (docs/legacy.md). A bank that stored a
-recall_config naming them keeps it: recall skips them with one warning per process, and
-`set_recall_config` no longer accepts them."""
+A stored recall_config is read for the keys below only: any other key (the Sonnet / Jev rerank, the gate,
+the reader, the blend, `fusion`, `evidence`, ...) is ignored, silently. `set_recall_config` accepts the
+keys below and refuses the rest."""
 from __future__ import annotations
 
 import copy
@@ -25,10 +24,8 @@ from typing import Any, Callable, Protocol, Sequence
 
 from prospecta._filters import coerce_date
 from prospecta._scorecut import check_depth, estimate_tokens, pool_min_rel, rel_cut, split_batches
-from prospecta._warn import warn_once
 from prospecta.channels.base import RecallState
 from prospecta.channels.fusion import FusedDoc
-from prospecta.channels.fusion import METHODS as FUSION_METHODS
 
 JEV_TIMEOUT_S = 10.0
 STAGE3_THRESHOLD = 0.70        # stage 3: evidence_sufficient / 3 under this runs one broadened retry
@@ -41,17 +38,6 @@ JEV_URL = "https://openrouter.ai/api/v1/systemone"
 logger = logging.getLogger(__name__)
 
 STAGES = ("cross_encoder",)
-# What a stored recall_config may still name and recall now skips (docs/legacy.md): the rerank
-# stages, and the keys of the Jev gate, the reader / hop and the linker.
-RETIRED_STAGES = {
-    "sonnet_listwise": "the Sonnet listwise rerank was removed; use the cross_encoder stage",
-    "jev_score": "the Jev rerank was removed; use the cross_encoder stage",
-}
-RETIRED_RECALL_KEYS = {
-    "gate": "the Jev gate over the Sonnet rerank was removed",
-    "reader": "the reader and its second hop were removed",
-    "link_completeness": "the linker was removed",
-}
 
 # Cross-encoder (Stage 2) defaults; the model and every number is configurable
 # (recall_config.rerank.*, see docs/recall-stages.md).
@@ -79,27 +65,21 @@ def resolve_reranker_model(call: str | None = None, bank: str | None = None) -> 
 
 # --------------------------------------------------------------------- config
 
+RECALL_CONFIG_KEYS = ("rerank", "depth", "models", "stage3_sufficiency", "stage0_gate", "expansion")
+RERANK_KEYS = ("enabled", "stage", "model", "top_n", "timeout_s", "deduplicate_near_copies",
+               "min_score", "min_rel_score")
+
+
 def validate_recall_config(cfg: dict) -> None:
-    """For a NEW config (set_recall_config). A retired key or stage is refused; a STORED config
-    that names one is still read (see warn_retired_recall_config)."""
+    """For a NEW config (set_recall_config): only the keys the stages read (RECALL_CONFIG_KEYS,
+    and under `rerank` RERANK_KEYS). A STORED config is not validated: recall reads the keys it
+    needs and ignores the rest."""
     if not isinstance(cfg, dict):
         raise ValueError("recall_config must be an object")
     for key in cfg:
-        if key in RETIRED_RECALL_KEYS:
-            raise ValueError(f"recall_config key {key!r} was retired ({RETIRED_RECALL_KEYS[key]}); "
-                             "see docs/legacy.md")
-        if key not in ("rerank", "evidence", "depth", "fusion", "models", "stage3_sufficiency",
-                       "stage0_gate", "expansion"):
-            raise ValueError(f"unknown recall_config key {key!r}")
+        if key not in RECALL_CONFIG_KEYS:
+            raise ValueError(f"unknown recall_config key {key!r}; known: {list(RECALL_CONFIG_KEYS)}")
     check_depth(cfg.get("depth"))
-    fu = cfg.get("fusion", {})
-    if not isinstance(fu, dict) or set(fu) - {"method", "floor"}:
-        raise ValueError("fusion must be an object of method/floor")
-    if fu.get("method", "rrf") not in FUSION_METHODS:
-        raise ValueError(f"fusion.method must be one of {FUSION_METHODS}")
-    if "floor" in fu and (isinstance(fu["floor"], bool) or not isinstance(fu["floor"], int)
-                          or fu["floor"] < 1):
-        raise ValueError("fusion.floor must be an integer >= 1")
     models = cfg.get("models", {})
     if not isinstance(models, dict) or set(models) - {"decision_model", "query_writer_model"}:
         raise ValueError("models must be an object of decision_model/query_writer_model")
@@ -138,6 +118,8 @@ def validate_recall_config(cfg: dict) -> None:
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1):
         raise ValueError("expansion.near_copy_cosine must be a number in (0, 1]")
     rr = cfg.get("rerank") or {}
+    if not isinstance(rr, dict) or set(rr) - set(RERANK_KEYS):
+        raise ValueError(f"rerank must be an object of {'/'.join(RERANK_KEYS)}")
     for section, name in ((models, "decision_model"), (models, "query_writer_model"), (rr, "model")):
         v = section.get(name)
         if v is not None and (not isinstance(v, str) or not v):
@@ -151,33 +133,15 @@ def validate_recall_config(cfg: dict) -> None:
     if not isinstance(rr.get("deduplicate_near_copies", True), bool):
         raise ValueError("rerank.deduplicate_near_copies must be true or false")
     stage = rr.get("stage")
-    if stage in RETIRED_STAGES:
-        raise ValueError(f"rerank.stage {stage!r} was retired ({RETIRED_STAGES[stage]}); "
-                         "see docs/legacy.md")
     if stage is not None and stage not in STAGES:
         raise ValueError(f"rerank.stage must be one of {STAGES}")
     if rr.get("enabled") and stage is None:
-        raise ValueError(f"rerank.stage is required when rerank is enabled: one of {STAGES} "
-                         "(its old default, sonnet_listwise, was retired; see docs/legacy.md)")
-    if "blend" in rr:
-        raise ValueError("rerank.blend was retired (it regressed hit@1 and was off everywhere); "
-                         "see docs/legacy.md")
+        raise ValueError(f"rerank.stage is required when rerank is enabled: one of {STAGES}")
     for name in ("min_rel_score", "min_score"):
         v = rr.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
                               or not 0 <= v <= 1):
             raise ValueError(f"{name} must be a number in [0, 1]")
-    for gone in ("pool", "top", "join_top", "max_new", "max_follow_ups"):
-        if gone in rr:
-            raise ValueError(f"{gone!r} was a count and is gone: pools are score-based "
-                             "(rerank min_rel_score, see docs/limits.md)")
-    ev = cfg.get("evidence") or {}
-    m = ev.get("min_rel_score")
-    if m is not None and (isinstance(m, bool) or not isinstance(m, (int, float)) or not 0 <= m <= 1):
-        raise ValueError("evidence.min_rel_score must be a number in [0, 1]")
-    c = ev.get("context_tokens")
-    if c is not None and (isinstance(c, bool) or not isinstance(c, int) or c < 1):
-        raise ValueError("evidence.context_tokens must be an integer >= 1")
 
 
 def read_recall_config(conn, bank_id: str) -> dict:
@@ -185,29 +149,6 @@ def read_recall_config(conn, bank_id: str) -> dict:
         cur.execute("SELECT recall_config FROM banks WHERE bank_id = %s", (bank_id,))
         row = cur.fetchone()
     return dict(row[0]) if row and row[0] else {}
-
-
-def warn_retired_recall_config(cfg: dict) -> None:
-    """A STORED recall_config may name what was removed: recall skips it, saying so once per process."""
-    for key, why in RETIRED_RECALL_KEYS.items():
-        if key in cfg:
-            warn_once(f"recall_config:{key}",
-                      "recall_config names %r, which was retired (%s) and is skipped; see docs/legacy.md",
-                      key, why)
-    rr = cfg.get("rerank") or {}
-    if rr.get("enabled"):
-        stage = rr.get("stage")
-        if stage in RETIRED_STAGES:
-            warn_once(f"recall_config:{stage}",
-                      "recall_config.rerank.stage is %r, which was retired (%s): the Stage 1 order stands; "
-                      "see docs/legacy.md", stage, RETIRED_STAGES[stage])
-        elif stage is None:
-            warn_once("recall_config:default_stage",
-                      "recall_config.rerank names no stage, and its old default 'sonnet_listwise' was "
-                      "retired: the Stage 1 order stands; set rerank.stage to 'cross_encoder' (docs/legacy.md)")
-    if "blend" in rr:
-        warn_once("recall_config:blend",
-                  "recall_config.rerank.blend was retired and is skipped; see docs/legacy.md")
 
 
 # ---------------------------------------------------------------- LLM plumbing
@@ -357,7 +298,7 @@ class JevScore:
     `(request, timeout) -> response`, e.g. openrouter_jev_transport), its model and its timeout.
     Stage 0 (the `needs_memory` gate of Memory.expand_and_recall) and Stage 3 (the
     `evidence_sufficient` question of Memory.ask, JevSufficiency) call it through
-    `Memory(jev=...)`. (Its listwise `score` rerank was removed: docs/legacy.md.)"""
+    `Memory(jev=...)`."""
     name = "jev"
 
     def __init__(self, transport: JevTransport, model: str = JEV_MODEL,
@@ -579,8 +520,8 @@ class CrossEncoderReranker:
 
 def build_reranker(cfg: dict, *, rerank_transport: JevTransport | None = None,
                    reranker_model: str | None = None):
-    """The configured Reranker, or None when reranking is off (or names a retired stage: the
-    Stage 1 order stands, warn_retired_recall_config says so)."""
+    """The configured Reranker, or None when reranking is off or names a stage this library does not
+    have (a stored config only: the Stage 1 order stands)."""
     rr = cfg.get("rerank") or {}
     if not rr.get("enabled") or rr.get("stage") != "cross_encoder":
         return None
@@ -714,7 +655,6 @@ def run_stages(
     {rerank, calls, **totals}. Any failure keeps the fused order and says why."""
     calls: list[dict] = []
     trace: dict = {"rerank": None, "calls": calls, **totals(calls)}
-    warn_retired_recall_config(recall_cfg)
     try:
         return _run_stages(state, query, fused, recall_cfg, deps, calls, trace, depth)
     except Exception as exc:

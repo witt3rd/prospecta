@@ -9,9 +9,9 @@ Prospecta's hybrid search and RAG engine serves two primary operating modes on t
    - **Direct lookup & navigation:** Keyword, boolean (`OR`, `-exclude`), and `"exact phrase"` search with highlighted exact-match snippets (`ts_headline`).
    - **Interactive RAG / Question-Answering:** Natural-language questions answered with grounded synthesis, inline citations (`[n]`, each tied to its `[source | date]` and a verbatim supporting quote).
 
-**A bank gets this pipeline by being created fresh.** `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` (Stage 1), `recall_config = {"rerank": {"enabled": true, "stage": "cross_encoder"}}` (Stage 2) and `link_config = {"links": false, "entities": false}`; nothing else needs configuring. A bank created before that change keeps the config it stored: one that stored `channel_config = []` runs the legacy three-channel recall, not this design (Mode 1 and the Stage 1 filters return an error there).
+**A bank gets this pipeline by being created fresh.** `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]` (Stage 1) and `recall_config = {"rerank": {"enabled": true, "stage": "cross_encoder"}}` (Stage 2); nothing else needs configuring. It is the one design: a bank whose stored `channel_config` is empty runs `hybrid_chunk` with its defaults, and whatever a stored config names that the library no longer has is ignored (`docs/recall-stages.md`).
 
-Across **all** modes, every retrieved or synthesized answer is **RAG with citations**, accompanied by **exact-match snippets** whenever lexical or phrase tokens match. We index **chunks and notes directly** (embeddings + stemmed/exact lexical vectors + metadata) and do not generate model-written question tables at write time (a bank created before the new-bank defaults may still carry them: `docs/legacy.md`).
+Across **all** modes, every retrieved or synthesized answer is **RAG with citations**, accompanied by **exact-match snippets** whenever lexical or phrase tokens match. We index **chunks and notes directly** (embeddings + stemmed/exact lexical vectors + metadata) and generate no model-written questions at write time.
 
 This is the single normative description of the architecture. The reference docs: `docs/schema.md` (tables and indexes), `docs/recall-stages.md` (`recall_config`, the models, the cited-evidence contract), `docs/exact-tsv.md` (the stored exact vector), `docs/limits.md` (every number), `docs/observability.md` (what a recall records).
 
@@ -147,7 +147,7 @@ The design's names map to the shipped ones:
 | `fts_en` | `memory_items.body_tsv`, `to_tsvector('english', original_chunk)`, generated, GIN (migration 0002) |
 | `fts_exact` | `memory_items.exact_tsv`, the `simple` word vector of `original_chunk` plus the pieces of a path split at slashes (`indexed_expression()` in `prospecta/db/exact_tsv.py`), generated, GIN (migration 0020) |
 | `embedding VECTOR(1536)` | `memory_items.embedding` (`vector`, width = the bank's `embedding_dim`; 1536 for the default embedder) |
-| the HNSW index | one partial index **per bank and kind**: `... USING hnsw ((embedding::vector(N)) vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE bank_id = '<bank>' AND kind = 'chunk'` (and `kind = 'question'`, and one on the bank alone); built by `create_bank` |
+| the HNSW index | one partial index **per bank**: `... USING hnsw ((embedding::vector(N)) vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE bank_id = '<bank>' AND kind = 'chunk'`; built by `create_bank` |
 | bank + date pre-filter | `documents (bank_id, created_on)` and `(bank_id, created_at DESC)`, `memory_items (bank_id, kind)` |
 | `session_id`, `title` | not columns: the anti-echo list is a list of `documents.source` values |
 

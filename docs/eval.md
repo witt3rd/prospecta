@@ -7,13 +7,13 @@ scores a bank's recall on a questions file and reports latency and cost per stag
 ## What it measures, and what it does not
 
 It runs each question through the same pipeline as `Memory.search`: the bank's own
-`channel_config` (for a bank created fresh, Stage 1 `hybrid_chunk`) and its `recall_config`
-stages (Stage 2, the cross-encoder). A bank with no channel config (a legacy bank) is scored with
-`prospecta.channels.DEFAULT_CHANNEL_CONFIG` and the report says so.
+`channel_config` (Stage 1 `hybrid_chunk`; an empty one is its defaults) and its `recall_config`
+stages (Stage 2, the cross-encoder).
 
-It does **not** run Mode 1 (`expand_and_recall`, the query writer and the gate) or Mode 2B (`ask`):
-there is no measurement of the automatic recall's expansion or of the cited answer here. `--synth`
-runs the legacy grounded synthesis (`recall_synth(grounded=True)`, `docs/legacy.md`), not `ask`.
+It does **not** run Mode 1 (`expand_and_recall`, the query writer and the gate): there is no
+measurement of the automatic recall's expansion here. `--synth` runs `ask` (Mode 2B) on every
+question and reports whether its citations name a gold note, how often it answered `not in
+memory`, and the latency; `--judge` adds an answer-correct verdict against the `answer:` lines.
 Judging Mode 1 ("did the agent have what it needed") is the `ExpandedRecall` record of
 `docs/postgres-hybrid.md`, section 1, point 10, on real prompts.
 
@@ -35,16 +35,13 @@ The project's `questions.md` format is also read directly: `### Qnnn` blocks wit
 
 `gold` (note names = `documents.source`; folder and `.md` ignored) and the optional second gold
 `gold2` give hit@1, hit@10, MRR and cover@10 each; `answer` is for `--judge` (answer-correct by a
-Sonnet judge, with `--synth`).
+model judge, with `--synth`).
 
-`--ablate` reruns with each live channel off, the rerank stage off if it is enabled, and
-each registered channel the bank lacks on at weight 1; a channel **earns** its weight when
-removing it costs hit@10, hit@1 or MRR >= 0.03 on either gold, or cover@10 >= 0.03 on the
-multi-note questions (a channel not yet run **gains** by the same margin). The channels it tries
-on are the ones that remain (`dense_chunk`, `hybrid_chunk`, `meta`). The report gives latency and cost per stage (each
-channel, each model stage, total), and a channel or stage error is shown in it (`ERROR xN`).
-Nothing is written to the bank (no config change, no `recall_events` rows from the retrieval
-runs); `--synth` runs real `recall_synth(grounded=True)` and so does log those events. Eval never
-changes channel weights: it tells the owner which to set. `--scope-promote/--no-scope-promote`
-forces the legacy scope-promotion switch per run;
-`--depth` sets the rerank pool cut for the run (`docs/recall-stages.md`).
+`--ablate` reruns with Stage 2 (the rerank) off, when the bank has it enabled; the stage
+**earns** its place when removing it costs hit@10, hit@1 or MRR >= 0.03 on either gold, or
+cover@10 >= 0.03 on the multi-note questions. (`hybrid_chunk` is the one channel: there is no
+other to ablate.) The report gives latency and cost per stage (the channel, each model stage,
+total), and a channel or stage error is shown in it (`ERROR xN`). Nothing is written to the bank
+(no config change, no `recall_events` rows from the retrieval runs); `--synth` runs real `ask`
+calls and so does log those events. Eval never changes a bank's config: it tells the owner what
+to set. `--depth` sets the rerank pool cut for the run (`docs/recall-stages.md`).

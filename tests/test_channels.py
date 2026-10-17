@@ -1,21 +1,18 @@
-"""Channel interface, registry, weighted RRF fusion, per-channel trace
-(migrations 0007 + 0008)."""
+"""The channel interface, the registry (`hybrid_chunk` is the one channel), weighted RRF fusion and
+the per-channel trace (migrations 0007 + 0008)."""
 from __future__ import annotations
-
-from prospecta._test_helpers import no_cut
 
 import psycopg
 import pytest
 
 from prospecta.channels import (
-    DEFAULT_CHANNEL_CONFIG,
     Candidate,
     build_channels,
+    effective_channel_config,
     fuse,
     validate_channel_config,
 )
 from prospecta.memory import Memory
-from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 
 
@@ -66,20 +63,30 @@ def test_fuse_document_counts_once_per_channel_at_best_rank():
 
 # -------------------------------------------------------------- registry
 
-def test_registry_builds_enabled_in_order_and_validates():
-    cfg = [{"name": "hybrid_chunk", "enabled": True, "weight": 1},
-           {"name": "dense_chunk", "enabled": False, "weight": 4}]
-    built = build_channels(cfg)
-    assert [c.name for c in built] == ["hybrid_chunk"]
-    assert [c.name for c in build_channels(DEFAULT_CHANNEL_CONFIG)] == ["dense_chunk", "meta"]
-    with pytest.raises(ValueError):
-        validate_channel_config([{"name": "nope"}])
-    with pytest.raises(ValueError):
-        validate_channel_config([{"name": "bm25_none", "weight": 1}])
-    with pytest.raises(ValueError, match="retired"):
-        validate_channel_config([{"name": "bm25", "weight": 1}])     # a removed channel (docs/legacy.md)
-    with pytest.raises(ValueError):
-        validate_channel_config([{"name": "dense_chunk", "weight": -1}])
+def test_registry_builds_the_enabled_channel_and_validates():
+    cfg = [{"name": "hybrid_chunk", "enabled": True, "weight": 1}]
+    assert [c.name for c in build_channels(cfg)] == ["hybrid_chunk"]
+    assert build_channels([{"name": "hybrid_chunk", "enabled": False}]) == []
+    assert build_channels([{"name": "dense_chunk", "weight": 4}, {"name": "meta"}]) == []   # removed: skipped
+    validate_channel_config([])
+    validate_channel_config(cfg)
+    for bad in ([{"name": "nope"}], [{"name": "dense_chunk", "weight": 1}], [{"name": "bm25", "weight": 1}],
+                [{"name": "hybrid_chunk", "weight": -1}], [{"name": "hybrid_chunk"}, {"name": "hybrid_chunk"}],
+                {"name": "hybrid_chunk"}):
+        with pytest.raises(ValueError):
+            validate_channel_config(bad)
+
+
+def test_the_effective_config_adds_the_default_when_no_channel_is_named():
+    default = effective_channel_config([])
+    assert default == [{"name": "hybrid_chunk", "enabled": True, "weight": 1, "params": {}}]
+    mine = [{"name": "hybrid_chunk", "weight": 2, "params": {"fused_limit": 7}}]
+    assert effective_channel_config(mine) == mine
+    gone = [{"name": "dense_chunk", "weight": 4}, {"name": "meta", "weight": 3}]
+    assert effective_channel_config(gone) == default + gone       # the default runs; the rest is ignored
+    off = [{"name": "hybrid_chunk", "enabled": False}]
+    assert effective_channel_config(off) == off                    # an explicit choice stays
+    assert effective_channel_config(None) == default
 
 
 # --------------------------------------------------------- db integration
@@ -87,55 +94,43 @@ def test_registry_builds_enabled_in_order_and_validates():
 @pytest.fixture
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
-    create_legacy_bank(m, "b", embedding_dim=EMBED_DIM)
-    m.retain("The cat sat on the warm mat by the window.", source="cat.md",
-             index_text="where did the cat sit")
-    m.retain("Quarterly revenue grew by twelve percent in Europe.", source="rev.md",
-             index_text="how did revenue grow")
-    # a chunk item for each, as the directory-index path writes them
-    with psycopg.connect(fresh_db) as conn:
-        for src, text in (("cat.md", "cat sat warm mat window"),
-                          ("rev.md", "revenue grew twelve percent europe")):
-            conn.execute(
-                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
-                " embedding, kind, ordinal, char_start, char_end) "
-                "SELECT 'b', d.id, %s, %s, %s::vector, 'chunk', 0, 0, %s FROM documents d "
-                "WHERE d.source = %s",
-                (text, text, "[" + ",".join(map(str, stub_embed([text])[0])) + "]",
-                 len(text), src))
-        conn.commit()
+    m.create_bank("b", embedding_dim=EMBED_DIM)
+    m.set_recall_config({})
+    m.retain("The cat sat on the warm mat by the window.", source="cat.md")
+    m.retain("Quarterly revenue grew by twelve percent in Europe.", source="rev.md")
     yield m
     m.close()
 
 
-def test_a_legacy_bank_stores_an_empty_config_and_recall_stays_legacy(mem):
+def test_a_new_bank_stores_hybrid_chunk_and_an_empty_config_runs_it_too(mem):
     with psycopg.connect(mem.database_url) as conn:
-        assert conn.execute("SELECT channel_config FROM banks WHERE bank_id='b'").fetchone()[0] == []
+        assert [e["name"] for e in conn.execute(
+            "SELECT channel_config FROM banks WHERE bank_id='b'").fetchone()[0]] == ["hybrid_chunk"]
+        conn.execute("UPDATE banks SET channel_config = '[]'::jsonb WHERE bank_id = 'b'")
+        conn.commit()
     res = mem.search("where did the cat sit")
-    assert res and set(res[0].scores) == {"semantic", "lexical", "lexical_body", "rrf"}
+    assert res and set(res[0].scores) == {"hybrid_chunk", "rrf"}
 
 
-def test_channel_recall_fuses_documents_and_scores_per_channel(mem):
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+def test_channel_recall_scores_per_channel_at_document_level(mem):
     res = mem.search("cat sat warm mat window", limit=5)
     assert [r.source for r in res][0] == "cat.md"
     assert len({r.document_id for r in res}) == len(res)  # document level
     top = res[0]
-    assert top.scores["dense_chunk"] > 0
-    assert set(top.scores) >= {"semantic", "lexical", "lexical_body", "rrf", "dense_chunk"}
-    assert top.original_chunk == "cat sat warm mat window"  # best chunk evidence
+    assert top.scores["hybrid_chunk"] > 0
+    assert set(top.scores) == {"hybrid_chunk", "rrf"}
+    assert top.original_chunk == "The cat sat on the warm mat by the window."  # the chunk is the evidence
 
 
 def test_set_channel_config_validates_and_resets(mem):
     with pytest.raises(ValueError):
         mem.set_channel_config([{"name": "bogus"}])
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    mem.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
     mem.set_channel_config([])
-    assert set(mem.search("cat")[0].scores) == {"semantic", "lexical", "lexical_body", "rrf"}
+    assert set(mem.search("cat")[0].scores) == {"hybrid_chunk", "rrf"}
 
 
 def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     mem.recall(["cat sat warm mat window"], limit=5)
     with psycopg.connect(mem.database_url) as conn:
         ev_id, plan, channels, fusion = conn.execute(
@@ -145,106 +140,24 @@ def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
             "SELECT channel, rank, score, document_id, item_id FROM recall_event_candidates "
             "WHERE recall_event_id=%s ORDER BY channel, rank", (ev_id,)).fetchall()
     assert plan["queries"][0]["text"] == "cat sat warm mat window"
-    assert [c["name"] for c in channels] == ["dense_chunk", "meta"]
-    assert all(c["error"] is None and "latency_ms" in c for c in channels)
-    assert all(c["n"] >= 1 for c in channels if c["name"] != "meta")                  # no filter for meta
+    assert [c["name"] for c in channels] == ["hybrid_chunk"]
+    assert all(c["error"] is None and "latency_ms" in c and c["n"] >= 1 for c in channels)
     assert fusion["method"] == "weighted_rrf" and fusion["k"] == 60
-    assert fusion["weights"] == {"dense_chunk": 4.0, "meta": 3.0}
+    assert fusion["weights"] == {"hybrid_chunk": 1.0}
     assert len(fusion["pool"]) == 2
-    by_channel = {c[0] for c in cands}
-    assert by_channel == {"dense_chunk"}  # meta had no filter
-    dense = [c for c in cands if c[0] == "dense_chunk"]
-    assert [c[1] for c in dense] == [1, 2]
-    assert dense[0][2] >= dense[1][2]
+    assert {c[0] for c in cands} == {"hybrid_chunk"}
+    assert [c[1] for c in cands] == [1, 2]
+    assert cands[0][2] >= cands[1][2]
     assert all(c[3] and c[4] for c in cands)
 
 
-def test_legacy_recall_leaves_trace_columns_null(mem):
-    mem.recall(["cat sat"], limit=3)
-    with psycopg.connect(mem.database_url) as conn:
-        row = conn.execute(
-            "SELECT plan, channels, fusion, id FROM recall_events "
-            "WHERE bank_id='b' ORDER BY id DESC LIMIT 1").fetchone()
-        n = conn.execute("SELECT count(*) FROM recall_event_candidates "
-                         "WHERE recall_event_id=%s", (row[3],)).fetchone()[0]
-    assert row[:3] == (None, None, None) and n == 0
-
-
-def test_failing_channel_is_recorded_and_others_still_fuse(mem, monkeypatch):
-    from prospecta.channels import semantic
-    mem.set_channel_config([{"name": "dense_chunk", "weight": 4}, {"name": "hybrid_chunk", "weight": 1}])
-    monkeypatch.setattr(semantic.DenseChunks, "_sql", "SELECT broken FROM nowhere")
+def test_a_failing_channel_is_recorded_and_the_recall_returns_nothing_without_raising(mem, monkeypatch):
+    from prospecta.channels import hybrid
+    monkeypatch.setattr(hybrid, "stage1_search", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     res = mem.recall(["cat sat warm mat window"], limit=5)
     with psycopg.connect(mem.database_url) as conn:
         channels = conn.execute(
             "SELECT channels FROM recall_events WHERE bank_id='b' "
             "ORDER BY id DESC LIMIT 1").fetchone()[0]
-    d = next(c for c in channels if c["name"] == "dense_chunk")
-    assert d["error"] and d["n"] == 0
-    assert next(c for c in channels if c["name"] == "hybrid_chunk")["n"] >= 1 and res
-
-
-# ------------------------------------------ floor-preserving fusion (floor_union)
-
-def _consensus_lists():
-    """Three channels agree on x1..x3; only `kw` holds the answer `gold` (its rank 1)."""
-    agree = ["x1", "x2", "x3", "x4"]
-    lists = {n: [C(d, d, n, i + 1) for i, d in enumerate(agree)] for n in ("a", "b", "c")}
-    lists["kw"] = [C("gold", "gold", "kw", 1)] + [C(d, d, "kw", i + 2) for i, d in enumerate(agree)]
-    return lists
-
-
-def test_rrf_demotes_the_lone_channel_answer_but_floor_union_keeps_it():
-    lists = _consensus_lists()
-    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
-    rrf = [f.document_id for f in fuse(lists, w)]
-    assert rrf.index("gold") >= 4          # the measured defect: buried under the consensus
-    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
-    assert "gold" in out[:4]               # top 3 of every channel: 3 consensus + gold
-    assert set(out) == set(rrf)            # nothing added or dropped, only reordered
-
-
-def test_floor_union_floor_docs_first_then_fused_order():
-    lists = _consensus_lists()
-    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
-    rrf = [f.document_id for f in fuse(lists, w)]
-    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
-    floor = {"x1", "x2", "x3", "gold"}
-    assert set(out[:4]) == floor
-    assert out[:4] == [d for d in rrf if d in floor]   # floor block keeps fused order
-    assert out[4:] == [d for d in rrf if d not in floor]
-
-
-def test_floor_union_ignores_zero_weight_channels_and_floor_zero_is_rrf():
-    lists = _consensus_lists()
-    w = {"a": 1, "b": 1, "c": 1, "kw": 0}
-    out = [f.document_id for f in fuse(lists, w, method="floor_union", floor=3)]
-    assert "gold" not in out
-    w["kw"] = 1
-    assert fuse(lists, w, method="floor_union", floor=0) == fuse(lists, w)
-
-
-def test_fuse_rejects_unknown_method_and_default_is_rrf():
-    with pytest.raises(ValueError):
-        fuse({"a": []}, {"a": 1}, method="nope")
-    lists = _consensus_lists()
-    w = {"a": 1, "b": 1, "c": 1, "kw": 1}
-    assert fuse(lists, w) == fuse(lists, w, method="rrf")
-
-
-def test_recall_config_fusion_setting_validates():
-    from prospecta.stages import validate_recall_config
-    validate_recall_config({"fusion": {"method": "floor_union", "floor": 3}})
-    validate_recall_config({"fusion": {"method": "rrf"}})
-    for bad in ({"method": "x"}, {"floor": 0}, {"floor": True}, {"floor": "3"}, "rrf"):
-        with pytest.raises(ValueError):
-            validate_recall_config({"fusion": bad})
-
-
-def test_floor_union_floor_is_distinct_documents_per_channel():
-    lists = {"a": [C("d1", "i1", "a", 1), C("d1", "i2", "a", 2), C("d2", "i3", "a", 3),
-                   C("d3", "i4", "a", 4), C("m", "i5", "a", 5)],
-             "b": [C("e1", "j1", "b", 1), C("e2", "j2", "b", 2), C("e3", "j3", "b", 3),
-                   C("m", "j4", "b", 4)]}
-    out = [f.document_id for f in fuse(lists, {"a": 1, "b": 1}, method="floor_union", floor=3)]
-    assert out.index("d3") < out.index("m")      # a's third DISTINCT doc is in the floor
+    assert res == []
+    assert channels[0]["name"] == "hybrid_chunk" and "boom" in channels[0]["error"] and channels[0]["n"] == 0

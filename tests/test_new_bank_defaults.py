@@ -1,11 +1,10 @@
 """A bank created fresh runs the hybrid architecture out of the box; an existing bank is left alone.
 
 New banks (Memory.create_bank, hence `prospecta create-bank`, `prospecta init`, the service and
-`migrate-bank`) store channel_config = [hybrid_chunk] (Stage 1), recall_config = a cross_encoder
-rerank (Stage 2) and link_config = {links: false, entities: false}: no manual configuration. (The
-linker itself was removed; the column is still written so an older library never links or extracts
-entities on a new bank.) Existing banks keep exactly what they stored: the defaults live in the INSERT
-of create_bank, never in a migration and never in a column DEFAULT. Invented text, stub models."""
+`migrate-bank`) store channel_config = [hybrid_chunk] (Stage 1) and recall_config = a cross_encoder
+rerank (Stage 2): no manual configuration. link_config is not written (nothing reads it). Existing banks
+keep exactly what they stored: the defaults live in the INSERT of create_bank, never in a migration and
+never in a column DEFAULT. Invented text, stub models."""
 from __future__ import annotations
 
 import argparse
@@ -30,8 +29,8 @@ MIGRATIONS = Path(__file__).resolve().parent.parent / "prospecta" / "db" / "migr
 HYBRID = [{"name": "hybrid_chunk", "enabled": True, "weight": 1, "params": {}}]
 CROSS_ENCODER = {"rerank": {"enabled": True, "stage": "cross_encoder"}}
 
-# The four live banks, as stored before this change: augur and forge are legacy (the column
-# defaults); augur-v2 and forge-v2 were set by hand to hybrid_chunk + cross_encoder.
+# The four banks as they were stored: augur and forge hold the column defaults; augur-v2 and forge-v2
+# were set by hand to hybrid_chunk + cross_encoder.
 HAND_SET_RECALL = {"rerank": {"enabled": True, "stage": "cross_encoder", "model": RERANKER_MODEL,
                               "top_n": 10, "min_score": 0.15, "timeout_s": 2.5,
                               "deduplicate_near_copies": True}}
@@ -87,15 +86,16 @@ class FakeRerank:
 def test_the_default_configs_are_valid():
     validate_channel_config(bank_defaults.NEW_BANK_CHANNEL_CONFIG)
     validate_recall_config(bank_defaults.NEW_BANK_RECALL_CONFIG)
-    assert bank_defaults.NEW_BANK_LINK_CONFIG == {"links": False, "entities": False}
+    assert not hasattr(bank_defaults, "NEW_BANK_LINK_CONFIG")
+    assert set(bank_defaults.new_bank_configs()) == {"channel_config", "recall_config"}
 
 
-def test_a_fresh_bank_stores_hybrid_chunk_cross_encoder_and_no_linking(mem, fresh_db):
+def test_a_fresh_bank_stores_hybrid_chunk_and_cross_encoder_and_no_link_config(mem, fresh_db):
     mem.create_bank("fresh", embedding_dim=EMBED_DIM)
     channel, recall, link = config_of(fresh_db, "fresh")
     assert channel == HYBRID
     assert recall == CROSS_ENCODER
-    assert link == {"links": False, "entities": False}
+    assert link == {}                 # the column default: no code reads or writes link_config
 
 
 def test_the_stage_2_model_of_a_fresh_bank_is_the_default_cross_encoder(mem, fresh_db, monkeypatch):
@@ -171,8 +171,7 @@ def test_create_bank_cli_gives_the_new_defaults(fresh_db, capsys):
     args = argparse.Namespace(database_url=fresh_db, id="cli-bank", embedding_dim=EMBED_DIM,
                               embedding_model_id=None, mission=None, retain_mission=None)
     assert run_create_bank(args) == 0
-    assert config_of(fresh_db, "cli-bank") == (HYBRID, CROSS_ENCODER,
-                                               {"links": False, "entities": False})
+    assert config_of(fresh_db, "cli-bank") == (HYBRID, CROSS_ENCODER, {})
 
 
 def test_init_creates_the_default_bank_with_the_new_defaults(fresh_db):
@@ -180,8 +179,7 @@ def test_init_creates_the_default_bank_with_the_new_defaults(fresh_db):
     args = argparse.Namespace(database_url=fresh_db, no_substrate=True, embedding_dim=EMBED_DIM,
                               substrate_timeout=5)
     assert cmd_init(args) == 0
-    assert config_of(fresh_db, "default") == (HYBRID, CROSS_ENCODER,
-                                              {"links": False, "entities": False})
+    assert config_of(fresh_db, "default") == (HYBRID, CROSS_ENCODER, {})
 
 
 def test_the_service_creates_its_bank_with_the_new_defaults(fresh_db, monkeypatch):
@@ -193,8 +191,7 @@ def test_the_service_creates_its_bank_with_the_new_defaults(fresh_db, monkeypatc
     monkeypatch.setattr(_common, "_resolve_embedder", lambda dim=None: stub_embed)
     svc, _ = service.build_service()
     try:
-        assert config_of(fresh_db, "svc") == (HYBRID, CROSS_ENCODER,
-                                              {"links": False, "entities": False})
+        assert config_of(fresh_db, "svc") == (HYBRID, CROSS_ENCODER, {})
     finally:
         svc.memory.close()
 
@@ -205,8 +202,7 @@ def test_the_migrate_bank_target_is_a_new_bank(fresh_db):
     try:
         insert_stored_bank(fresh_db, "old", [], {}, {})
         migrate_bank(m, "old", target_bank="old-v2", embed=stub_embed, embedding_dim=EMBED_DIM)
-        assert config_of(fresh_db, "old-v2") == (HYBRID, CROSS_ENCODER,
-                                                 {"links": False, "entities": False})
+        assert config_of(fresh_db, "old-v2") == (HYBRID, CROSS_ENCODER, {})
         assert config_of(fresh_db, "old") == ([], {}, {})        # the source is not touched
     finally:
         m.close()
@@ -272,7 +268,7 @@ def test_upgrading_an_install_leaves_its_banks_unchanged(bank_db_at_0019, bank):
 
 def test_no_migration_writes_bank_config_or_changes_its_column_defaults():
     """The guarantee, in the source: a migration may ADD the config columns (0008, 0009, 0019, with
-    the legacy constants as defaults) and nothing else: no UPDATE/DELETE/INSERT of `banks` and no
+    the empty constants as defaults) and nothing else: no UPDATE/DELETE/INSERT of `banks` and no
     SET DEFAULT on a column. The new-bank defaults live in create_bank's INSERT."""
     offenders = []
     for path in sorted(MIGRATIONS.glob("*.sql")):
@@ -286,25 +282,37 @@ def test_no_migration_writes_bank_config_or_changes_its_column_defaults():
     assert offenders == []
 
 
-def test_the_column_defaults_stay_legacy_so_other_writers_get_legacy_banks(fresh_db):
-    """A bank inserted by anything but create_bank (an old library, a restore, raw SQL) is a legacy bank."""
+def test_the_column_defaults_stay_empty_and_an_empty_config_runs_the_hybrid_default(fresh_db):
+    """A bank inserted by anything but create_bank (an older library, a restore, raw SQL) stores `[]` / `{}`
+    and runs the hybrid_chunk defaults with Stage 1's order (no rerank stage is configured)."""
     with psycopg.connect(fresh_db) as c:
         c.execute("INSERT INTO banks (bank_id, embedding_dim) VALUES ('raw', %s)", (EMBED_DIM,))
     assert config_of(fresh_db, "raw") == ([], {}, {})
+    m = Memory(database_url=fresh_db, bank_id="raw", embed=stub_embed)
+    try:
+        m.retain("The harbour lamps get a warm filter.", source="lamps.md")
+        assert [r.source for r in m.search("harbour lamps", date_from="2000-01-01")] == ["lamps.md"]
+    finally:
+        m.close()
 
 
 # ---------------------------------------------------------------- the live banks behave the same
 
 @pytest.fixture
 def live(fresh_db):
-    """Memory on each of the four live-bank fixtures, one note each, reading its own bank."""
+    """Memory on each of the four banks as stored, one note and one chunk each, reading its own bank. The
+    first note is held as a question item only (an old bank's, written raw: nothing writes them now)."""
     mems = {}
     for bank, (channel, recall, link) in LIVE_BANKS.items():
         insert_stored_bank(fresh_db, bank, channel, recall, link)
         m = Memory(database_url=fresh_db, bank_id=bank, embed=stub_embed,
                    rerank_transport=FakeRerank())
-        m.retain("Kelly met Ann on monday near the harbour lamps", source="note.md",
-                 index_text="Who met Ann near the harbour?")            # a question item (legacy)
+        m.retain("Kelly met Ann on monday near the harbour lamps", source="note.md")
+        with psycopg.connect(fresh_db) as c:
+            c.execute("UPDATE memory_items SET kind = 'question', ordinal = NULL, char_start = NULL, "
+                      "char_end = NULL WHERE bank_id = %s AND document_id IN "
+                      "(SELECT id FROM documents WHERE bank_id = %s AND source = 'note.md')", (bank, bank))
+            c.commit()
         m.retain("The harbour lamps get a warm filter.", source="chunk.md")   # a chunk item
         mems[bank] = m
     yield mems
@@ -312,15 +320,12 @@ def live(fresh_db):
         m.close()
 
 
-def test_the_legacy_banks_still_run_the_legacy_path(live):
+def test_the_banks_with_empty_configs_run_hybrid_chunk(live):
     for bank in ("augur", "forge"):
         m = live[bank]
-        # the question item is found by the legacy three-channel recall ...
-        assert "note.md" in [r.source for r in m.search("who met ann near the harbour", limit=3)]
-        # ... and Stage 1 filters are refused there, as before
-        with pytest.raises(ValueError, match="hybrid_chunk"):
-            m.search("harbour", date_from="2024-01-01")
-        assert m.expand_and_recall("harbour lamps", gate=False).error is not None
+        got = m.search("harbour lamps", limit=3, date_from="2000-01-01")     # Stage 1 filters: no error now
+        assert [r.source for r in got] == ["chunk.md"]          # chunks only: the question item is invisible
+        assert m.expand_and_recall("harbour lamps", gate=False).error is None
 
 
 def test_the_hand_set_banks_still_run_hybrid_chunk_and_cross_encoder(live):

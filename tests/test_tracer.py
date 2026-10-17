@@ -82,46 +82,21 @@ def test_tracer_fires_on_retain(memory_with_recording_tracer):
     events = mem._tracer.by_name("retain")
     assert len(events) == 1
     assert events[0]["items_count"] == 1                    # one chunk
-    assert events[0]["index_text_caller_supplied"] is False
+    assert "index_text_caller_supplied" not in events[0] and "raw_llm_response" not in events[0]
     # no model is called to write a note
     assert mem._tracer.by_name("llm_call") == []
 
 
-def test_tracer_fires_on_retain_caller_supplied(memory_with_recording_tracer):
-    mem = memory_with_recording_tracer
-    mem.retain("body", index_text=["q1"], source="t2")
-    ev = mem._tracer.by_name("retain")
-    assert len(ev) == 1
-    assert ev[0]["index_text_caller_supplied"] is True
-    # No LLM call when caller supplied index_text.
-    assert mem._tracer.by_name("llm_call") == []
-
-
-def test_tracer_fires_on_formulate_queries(memory_with_recording_tracer):
-    mem = memory_with_recording_tracer
-    mem._mock_llm.canned = '{"queries":[{"text":"x"}]}'
-    mem.formulate_queries("anything")
-    assert mem._tracer.by_name("formulate_queries")
-    # llm_call also fired
-    assert any(p["purpose"] == "formulate_queries"
-               for p in mem._tracer.by_name("llm_call"))
-
-
-def test_tracer_fires_on_recall_synth(populated_corpus_with_recording_tracer):
+def test_tracer_fires_on_recall_and_ask(populated_corpus_with_recording_tracer):
     mem = populated_corpus_with_recording_tracer
-    mem._mock_llm.set_response(
-        lambda messages, *, json_mode: (
-            '{"queries":[{"text":"kelly"}]}' if json_mode else "synth out"
-        )
-    )
-    mem.recall_synth("about kelly")
-    tracer = mem._tracer
-    assert tracer.by_name("formulate_queries")
-    assert tracer.by_name("recall")
-    # llm_call fires for both formulate + synthesize
-    purposes = {p["purpose"] for p in tracer.by_name("llm_call")}
-    assert "formulate_queries" in purposes
-    assert "synthesize" in purposes
+    mem._mock_llm.set_response(lambda messages, *, json_mode: "an answer [1]")
+    mem.recall(["about kelly"])
+    assert len(mem._tracer.by_name("recall")) == 1 and mem._tracer.by_name("llm_call") == []
+    mem.ask("about kelly")
+    assert len(mem._tracer.by_name("recall")) == 2
+    # llm_call fires for the answer
+    assert {p["purpose"] for p in mem._tracer.by_name("llm_call")} == {"ask_cited"}
+    assert "formulate_queries" not in {e[0] for e in mem._tracer.events}
 
 
 def test_tracer_fires_on_sweep(memory_with_recording_tracer, tmp_corpus):
@@ -136,23 +111,18 @@ def test_tracer_fires_on_sweep(memory_with_recording_tracer, tmp_corpus):
     assert len(per_file) >= 2
 
 
-def test_six_events_fire_end_to_end(memory_with_recording_tracer, tmp_corpus):
-    """Smoke that all six named events fire from real call sites."""
+def test_five_events_fire_end_to_end(memory_with_recording_tracer, tmp_corpus):
+    """Smoke that all five named events fire from real call sites."""
     from prospecta._sweeper import SweeperConfig, run_one_pass
 
     mem = memory_with_recording_tracer
     # retain → fires 'retain' (no model call)
     mem.retain("body content", source="t1")
-    # recall_synth → fires 'formulate_queries' + 'recall' + 'llm_call'
-    mem._mock_llm.set_response(
-        lambda messages, *, json_mode: (
-            '{"queries":[{"text":"x"}]}' if json_mode else "synth out"
-        )
-    )
-    mem.recall_synth("query")
+    # ask → fires 'recall' + 'llm_call'
+    mem._mock_llm.set_response(lambda messages, *, json_mode: "synth out [1]")
+    mem.ask("body")
     # sweep → fires 'sweep_pass' + 'index_single_file' for each file
     run_one_pass(mem, SweeperConfig(corpus_paths=[tmp_corpus]))
 
     seen = {e[0] for e in mem._tracer.events}
-    assert {"retain", "recall", "formulate_queries",
-            "sweep_pass", "index_single_file", "llm_call"} <= seen
+    assert {"retain", "recall", "sweep_pass", "index_single_file", "llm_call"} <= seen

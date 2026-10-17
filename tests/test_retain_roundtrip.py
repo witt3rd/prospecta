@@ -1,7 +1,7 @@
-"""T11: write-side bilateral spine via Memory.retain().
+"""The write path through Memory.retain().
 
 Acceptance criteria:
-  - caller-supplied index_text bypasses LLM (P4)
+  - a note is written as chunk items and no model is called
   - retain_events row appended with correct columns
   - replace-on-source-match (docs/schema.md, "Re-retain")
   - DocumentSourceConflictError on hash collision with different source
@@ -64,24 +64,20 @@ def _retain_events(database_url: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 1. Caller-supplied index_text bypasses LLM
+# 1. A note is written as chunks; no model is called
 # ---------------------------------------------------------------------------
 
-def test_retain_caller_supplied_index_text(memory_with_bank_and_mock_llm, mock_llm):
+def test_retain_writes_the_note_as_a_chunk(memory_with_bank_and_mock_llm, mock_llm):
     mem = memory_with_bank_and_mock_llm
     body = "Kelly was born on March 4th, 1990."
-    doc_id = mem.retain(
-        body,
-        index_text="When is Kelly's birthday?",
-        source="kelly-bio",
-    )
+    doc_id = mem.retain(body, source="kelly-bio")
     assert isinstance(doc_id, str)
-    assert mock_llm.calls == []  # LLM NEVER called when override supplied
+    assert mock_llm.calls == []  # a write never calls a model
 
     rows = _rows_for_document(mem.database_url, doc_id)
     assert len(rows) == 1
-    assert rows[0]["content"] == "When is Kelly's birthday?"
-    assert rows[0]["metadata"].get("index_text_caller_supplied") is True
+    assert rows[0]["content"] == body
+    assert "index_text_caller_supplied" not in rows[0]["metadata"]
     assert rows[0]["llm_generated"] is False
     # P5: body preserved
     assert rows[0]["original_chunk"] == body
@@ -96,14 +92,15 @@ def test_retain_caller_supplied_index_text(memory_with_bank_and_mock_llm, mock_l
 
 def test_retain_appends_retain_event(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    doc_id = mem.retain("payload", index_text="q?", source="s1")
+    doc_id = mem.retain("payload", source="s1")
     events = _retain_events(mem.database_url)
     assert len(events) == 1
     e = events[0]
     assert e["bank_id"] == "test"
     assert str(e["document_id"]) == doc_id
     assert e["items_count"] == 1
-    assert e["index_text_caller_supplied"] is True
+    assert e["index_text_caller_supplied"] is False       # the column stays; no question strings are written
+    assert e["raw_llm_response"] is None
     assert isinstance(e["duration_ms"], int)
     assert e["duration_ms"] >= 0
     assert e["error"] is None
@@ -117,15 +114,15 @@ def test_retain_appends_retain_event(memory_with_bank_and_mock_llm):
 def test_reretain_same_source_replaces(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     body = "stable content"
-    doc_id_1 = mem.retain(body, index_text=["a?", "b?"], source="same-src")
-    doc_id_2 = mem.retain(body, index_text=["c?", "d?", "e?"], source="same-src")
+    doc_id_1 = mem.retain(body, source="same-src", tags=["a"])
+    doc_id_2 = mem.retain(body, source="same-src", tags=["b"])
     # Same content_hash + same source → same document_id, replaced items.
     assert doc_id_1 == doc_id_2
     assert _count_documents(mem.database_url) == 1
 
     rows = _rows_for_document(mem.database_url, doc_id_2)
-    contents = sorted(r["content"] for r in rows)
-    assert contents == ["c?", "d?", "e?"]
+    assert [r["content"] for r in rows] == [body]
+    assert _document_row(mem.database_url, doc_id_2)["tags"] == ["b"]
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +132,9 @@ def test_reretain_same_source_replaces(memory_with_bank_and_mock_llm):
 def test_reretain_different_source_raises(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     body = "same body"
-    mem.retain(body, index_text="q?", source="src-A")
+    mem.retain(body, source="src-A")
     with pytest.raises(DocumentSourceConflictError) as ei:
-        mem.retain(body, index_text="q?", source="src-B")
+        mem.retain(body, source="src-B")
     err = ei.value
     assert err.existing_source == "src-A"
     assert err.attempted_source == "src-B"
@@ -146,21 +143,17 @@ def test_reretain_different_source_raises(memory_with_bank_and_mock_llm):
 
 
 # ---------------------------------------------------------------------------
-# 7. list index_text produces multiple rows (T10 parity via retain API)
+# 7. A long note is several chunks
 # ---------------------------------------------------------------------------
 
-def test_retain_list_index_text_produces_multiple_rows(memory_with_bank_and_mock_llm, mock_llm):
+def test_retain_long_note_produces_several_chunks(memory_with_bank_and_mock_llm, mock_llm):
     mem = memory_with_bank_and_mock_llm
-    doc_id = mem.retain(
-        "body",
-        index_text=["q1?", "q2?", "q3?"],
-        source="list-src",
-    )
+    body = "\n\n".join(f"Paragraph {i} " + "word " * 60 for i in range(30))
+    doc_id = mem.retain(body, source="long-src")
     assert mock_llm.calls == []
     rows = _rows_for_document(mem.database_url, doc_id)
-    assert sorted(r["content"] for r in rows) == ["q1?", "q2?", "q3?"]
-    for r in rows:
-        assert r["metadata"].get("index_text_caller_supplied") is True
+    assert len(rows) > 1
+    assert all(len(r["content"]) <= 1000 and r["content"] in body for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +162,7 @@ def test_retain_list_index_text_produces_multiple_rows(memory_with_bank_and_mock
 
 def test_retain_source_default_derived_from_content_hash(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    doc_id = mem.retain("default-source-body", index_text="q?")
+    doc_id = mem.retain("default-source-body")
     doc = _document_row(mem.database_url, doc_id)
     assert doc["source"] is not None
     assert doc["source"].startswith("retain://")
@@ -185,7 +178,6 @@ def test_retain_writes_path_when_supplied(memory_with_bank_and_mock_llm, tmp_pat
     assert not target.exists()
     mem.retain(
         "file content from retain()",
-        index_text="q?",
         path=target,
     )
     assert target.exists()

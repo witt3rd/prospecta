@@ -3,7 +3,7 @@
 ``Memory(shadow_bank_id=..., shadow_embed=...)`` makes every ``recall()``
 also query the shadow (new, e.g. 1536-d) bank with its own embedder. The
 caller still gets only the primary (old bank) results; both runs are stored
-as ``recall_events`` rows (one under each bank_id, mode ``<mode>``) whose
+as ``recall_events`` rows (one under each bank_id) whose
 ``trace`` carries ``{"shadow": {id, role, peer_bank, ...}}`` so they pair up
 and can be compared offline. The shadow path can never fail a recall: an
 error is logged and recorded in the trace instead.
@@ -42,7 +42,6 @@ def run_shadow_recall(
     queries: "list[Query]",
     primary_results: "list[RecalledMemory]",
     *,
-    mode: str,
     limit: int,
     metadata_filter: dict | None,
     rrf_k: int,
@@ -58,6 +57,7 @@ def run_shadow_recall(
     shadow_id = str(uuid.uuid4())
     error = None
     flat: "list[RecalledMemory]" = []
+    shadow_traces: list[dict] = []
     t0 = time.monotonic()
     try:
         shadow_mem = Memory(
@@ -67,12 +67,16 @@ def run_shadow_recall(
         try:
             for q in queries:
                 flat.extend(shadow_mem.search(
-                    q.text, mode=mode, limit=limit,
+                    q.text, limit=limit,
                     metadata_filter=metadata_filter, rrf_k=rrf_k,
-                    depth=depth,
+                    depth=depth, _trace=shadow_traces,
                 ))
         finally:
             shadow_mem.close()
+        # a channel never raises into a recall: its failure is in the trace, and is the shadow's too
+        failed = [c["error"] for t in shadow_traces for c in t["channels"] if c.get("error")]
+        if failed:
+            error = failed[0]
     except Exception as e:  # shadow must never break the real recall
         logger.exception("shadow recall against %s failed", shadow_bank)
         error = f"{type(e).__name__}: {e}"
@@ -96,7 +100,7 @@ def run_shadow_recall(
             memory._tracer("recall", {
                 "bank_id": bank,
                 "queries": texts,
-                "mode": mode,
+                "mode": "hybrid",
                 "n_results": len(results),
                 "duration_ms": ms,
                 "trace": {"shadow": {

@@ -22,10 +22,6 @@ POOL_MIN_REL = 0.15
 # recall); `deep` is for explicit recall and for set / discovery questions.
 DEPTHS = {"standard": POOL_MIN_REL, "deep": 0.05}
 DEFAULT_DEPTH = "standard"
-# Retrieval channels do NOT cut: every candidate goes into fusion, bounded only by the
-# index fetch completing (semantic._scan_everything). `min_rel` stays an explicit per-bank override.
-CHANNEL_MIN_REL = 0.0
-FETCH_PAGE = 64                # rows per fetch (throughput; the fetch doubles until the cut is reached)
 
 
 def check_depth(depth: str | None) -> str | None:
@@ -84,22 +80,3 @@ def split_batches(items: Sequence[T], text_of: Callable[[T], str],
     if cur:
         out.append(cur)
     return out
-
-
-def fetch_until_cut(fetch: Callable[[int], list], score: Callable, rel: float,
-                    page: int = FETCH_PAGE) -> list:
-    """`fetch(n)` returns up to n rows, best first. Grow n (doubling) until the
-    last row falls below rel x the best score or the source is exhausted, then
-    return the qualifying rows. Nothing qualifying is left behind."""
-    n = page
-    while True:
-        rows = fetch(n)
-        if not rows:
-            return []
-        best = score(rows[0])
-        if rel <= 0 or best <= 0:       # no relative basis: the whole source qualifies
-            if len(rows) < n:
-                return rows
-        elif len(rows) < n or score(rows[-1]) < rel * best:
-            return [r for r in rows if score(r) >= rel * best]
-        n *= 2

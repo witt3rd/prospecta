@@ -1,6 +1,6 @@
 """`prospecta eval`: score a bank's recall on a questions file, ablate its
-channels and stages, and report cost and latency per stage, so a channel
-earns its weight (hybrid retrieval design 8.7 / 8.10).
+Stage 2 (the rerank), and report cost and latency per stage, so a stage
+earns its place (hybrid retrieval design 8.7 / 8.10).
 
 questions.md format (one block per question; text before the first `##` is
 ignored). The project's `### Qnnn` blocks with `class:` / `question:` / `gold:`
@@ -19,11 +19,9 @@ optional and only used by the answer-correct judge. Every other line is the
 question text.
 
 Metrics, per gold: hit@1, hit@10, MRR (over the whole ranked pool), cover@10
-(share of the gold notes inside the top 10). An ablation turns one channel or
-stage off; a channel "earns" its weight when the ablation costs hit@10, hit@1
-or MRR 0.03 or more on either gold, or cover@10 0.03 or more on questions with
-two or more gold notes. A channel the bank does not run is tried at weight 1
-and "earns" its place when it gains the same margin.
+(share of the gold notes inside the top 10). The ablation turns Stage 2 off; the
+stage "earns" its place when that costs hit@10, hit@1 or MRR 0.03 or more on
+either gold, or cover@10 0.03 or more on questions with two or more gold notes.
 """
 from __future__ import annotations
 
@@ -36,9 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from prospecta._template import render_prompt
-from prospecta.channels import DEFAULT_CHANNEL_CONFIG
-from prospecta.channels.registry import REGISTRY, RETIRED
-from prospecta._scorecut import CHANNEL_MIN_REL
 from prospecta.stages import parse_json_object, read_recall_config
 
 MARGIN = 0.03
@@ -207,28 +202,9 @@ def summarize(per_question: list[dict]) -> dict:
 # ----------------------------------------------------------------- variants
 
 def ablation_variants(channel_config: list[dict], recall_cfg: dict) -> list[dict]:
-    """The runs to compare with the full config: every live channel off, every
-    enabled stage off, and every registered channel the bank lacks switched on."""
+    """The runs to compare with the full config: Stage 2 (the rerank) off, when it is enabled.
+    (`hybrid_chunk` is the one channel: without it nothing is retrieved.)"""
     variants: list[dict] = []
-    for e in channel_config:
-        if e["name"] in RETIRED:      # skipped by every recall: nothing to ablate
-            continue
-        if e.get("enabled", True) and float(e.get("weight", 1)) > 0:
-            cfg = [dict(x) for x in channel_config]
-            for x in cfg:
-                if x["name"] == e["name"]:
-                    x["enabled"] = False
-            variants.append({"name": f"-{e['name']}", "kind": "channel_off",
-                             "target": e["name"], "channels": cfg, "stages": recall_cfg})
-    live = {e["name"] for e in channel_config if e.get("enabled", True)
-            and float(e.get("weight", 1)) > 0}
-    for name in sorted(REGISTRY):
-        if name in live:
-            continue
-        cfg = [dict(x) for x in channel_config if x["name"] != name]
-        cfg.append({"name": name, "enabled": True, "weight": 1})
-        variants.append({"name": f"+{name}", "kind": "channel_on", "target": name,
-                         "channels": cfg, "stages": recall_cfg})
     if (recall_cfg.get("rerank") or {}).get("enabled"):
         st = copy.deepcopy(recall_cfg)
         st["rerank"]["enabled"] = False
@@ -237,8 +213,8 @@ def ablation_variants(channel_config: list[dict], recall_cfg: dict) -> list[dict
     return variants
 
 
-def verdict(full: dict, variant: dict, kind: str) -> dict:
-    """Does the change cost (ablation) or gain (new channel) at least MARGIN?"""
+def verdict(full: dict, variant: dict, kind: str = "stage_off") -> dict:
+    """Does the ablation cost at least MARGIN?"""
     deltas: dict[str, float] = {}
     for which in ("gold", "gold2"):
         if full[which]["n"] == 0:
@@ -247,7 +223,7 @@ def verdict(full: dict, variant: dict, kind: str) -> dict:
             deltas[f"{which}.{m}"] = variant[which][m] - full[which][m]
     if full.get("multinote_cover10") is not None:
         deltas["multinote.cover10"] = (variant["multinote_cover10"] or 0.0) - full["multinote_cover10"]
-    sign = 1.0 if kind == "channel_on" else -1.0   # ablation: a drop is what counts
+    sign = -1.0                                 # ablation: a drop is what counts
     # cover@10 counts only on the multi-note questions (design 8.7)
     hit = [k for k, d in deltas.items()
            if not (k.endswith(".cover10") and not k.startswith("multinote."))
@@ -280,7 +256,7 @@ def retrieve(memory, query: str, channel_config: list[dict], recall_cfg: dict,
     stages: dict[str, dict] = {}
     t0 = time.monotonic()
     trace: list = []
-    # the production path: filter extraction, channels, the rerank stage, scope promotion
+    # the production path: Stage 1, then the rerank stage
     recalled = _search_channels(
         memory, query, memory.default_bank_id, channel_config, limit=len_all if pool is None else pool,
         metadata_filter=None, rrf_k=rrf_k, trace=trace, recall_cfg=recall_cfg or {},
@@ -344,27 +320,24 @@ def judge_answer(llm, question: str, expected: str, answer: str) -> tuple[bool, 
 
 
 def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> dict:
-    """Grounded recall_synth on every question; with `judge`, answer-correct
-    against `answer:` (questions without one are not judged)."""
-    rows, correct, judged, models = [], 0, 0, []
-    cost = {"synthesis_cost_usd": 0.0, "judge_cost_usd": 0.0}
-    lat = {"recall_synth_ms": 0, "judge_ms": 0}
+    """`ask` (Mode 2B) on every question; with `judge`, answer-correct against `answer:`
+    (questions without one are not judged)."""
+    rows, correct, judged = [], 0, 0
+    cost = {"judge_cost_usd": 0.0}
+    lat = {"ask_ms": 0, "judge_ms": 0}
     for q in questions:
         t0 = time.monotonic()
-        res = memory.recall_synth(q.text, grounded=True)
+        res = memory.ask(q.text)
         ms = int((time.monotonic() - t0) * 1000)
-        lat["recall_synth_ms"] += ms
-        if res.synth_call.get("model") and res.synth_call["model"] not in models:
-            models.append(res.synth_call["model"])
-        cost["synthesis_cost_usd"] += float(res.synth_call.get("cost_usd") or 0.0)
-        row = {"id": q.id, "synthesis": res.synthesis, "latency_ms": ms,
-               "citations": [c["note"] for c in res.citations],
-               "unknown_citations": [c["note"] for c in res.citations if not c["known"]],
-               "cited_gold": bool({_norm(c["note"]) for c in res.citations}
-                                  & {_norm(g) for g in q.gold})}
+        lat["ask_ms"] += ms
+        cited = [c["source"] for c in res.citations if c.get("known")]
+        row = {"id": q.id, "synthesis": res.answer, "latency_ms": ms,
+               "citations": cited,
+               "unknown_citations": [str(c.get("n")) for c in res.citations if not c.get("known")],
+               "cited_gold": bool({_norm(c) for c in cited} & {_norm(g) for g in q.gold})}
         if judge and q.answer:
             ok, call = judge_answer(memory._synth_llm or memory._llm, q.text, q.answer,
-                                    res.synthesis)
+                                    res.answer)
             row["correct"] = ok
             judged += 1
             correct += ok
@@ -377,23 +350,20 @@ def run_synthesis(memory, questions: list[Question], *, judge: bool = False) -> 
     return {
         "n": len(rows), "judged": judged, "answer_correct": correct,
         "synthesis_llm": "synth_llm" if memory._synth_llm else "general llm",
-        "synthesis_models": models or ["unreported"],
         "answer_correct_rate": (correct / judged) if judged else None,
         "cited_gold_rate": sum(r["cited_gold"] for r in rows) / n,
         "not_in_memory": sum(r["synthesis"].strip().lower().startswith("not in memory")
                              for r in rows),
         "false_abstain": abstention_counts(rows)["false_abstain"],
-        **cost, **lat, "mean_recall_synth_ms": lat["recall_synth_ms"] / n,
+        **cost, **lat, "mean_ask_ms": lat["ask_ms"] / n,
         "questions": rows,
     }
 
 
 def run_eval(memory, questions: list[Question], *, ablate: bool = False,
              synth: bool = False, judge: bool = False, pool: int | None = None,
-             scope_promote: bool | None = None, depth: str | None = None) -> dict:
-    """Score the bank as configured; optionally ablate and synthesise.
-    `scope_promote` (None = keep config) forces the scope-promotion re-sort on or
-    off for this run. `depth` ('standard' |
+             depth: str | None = None) -> dict:
+    """Score the bank as configured; optionally ablate Stage 2 and `ask`. `depth` ('standard' |
     'deep'; None = the bank's recall_config.depth, else standard) sets the rerank
     pool cut; the report records the depth used."""
     from prospecta._scorecut import check_depth, pool_min_rel, resolve_depth
@@ -402,20 +372,10 @@ def run_eval(memory, questions: list[Question], *, ablate: bool = False,
         from prospecta.channels import read_channel_config
         channel_config = read_channel_config(conn, memory.default_bank_id)
         recall_cfg = read_recall_config(conn, memory.default_bank_id)
-    if not channel_config:
-        channel_config = copy.deepcopy(DEFAULT_CHANNEL_CONFIG)
-        legacy = True   # the bank has no channel registry; score the measured default
-    else:
-        legacy = False
-    if scope_promote is not None:
-        channel_config = copy.deepcopy(channel_config)
-        for e in channel_config:
-            if e.get("name") == "meta":
-                e["params"] = {**(e.get("params") or {}), "promote": scope_promote}
     report: dict = {
         "bank": memory.default_bank_id, "n_questions": len(questions),
         "channel_config": channel_config, "recall_config": recall_cfg,
-        "legacy_bank_scored_with_defaults": legacy, "margin": MARGIN,
+        "margin": MARGIN,
         "depth": resolve_depth(depth, recall_cfg),
         "rerank_min_rel": pool_min_rel(depth, recall_cfg),
     }
@@ -448,16 +408,10 @@ def _fmt(s: dict) -> str:
 
 def format_report(r: dict) -> str:
     L = [f"bank {r['bank']}: {r['n_questions']} questions"]
-    if r["legacy_bank_scored_with_defaults"]:
-        L.append("(bank has no channel_config: scored with the default channels)")
     for name, s in r["full"]["stages"].items():
         if name.startswith("channel:") and s.get("errors"):
             L.append(f"CHANNEL ERROR {name[8:]} x{s['errors']}: {s['last_error']}")
-    chans = {e["name"]: (e.get("params") or {}).get("min_rel", CHANNEL_MIN_REL)
-             for e in r.get("channel_config") or [] if e["name"] == "dense_chunk"}
-    L.append("cuts: channels " + (", ".join(f"{n} {v}" for n, v in chans.items()) or "none")
-             + f" (0 = no cut); rerank pool >= "
-             f"{r.get('rerank_min_rel')} x best fused score "
+    L.append(f"cut: rerank pool >= {r.get('rerank_min_rel')} x best fused score "
              f"(depth: {r.get('depth', 'standard')})")
     L.append(f"full: {_fmt(r['full']['summary'])}")
     if r["full"]["summary"].get("abstention"):
@@ -470,19 +424,17 @@ def format_report(r: dict) -> str:
         L.append(f"  {name:<28} {s['mean_latency_ms']:8.1f} ms  ${s['cost_usd'] / max(r['n_questions'], 1):.5f}"
                  + (f"  ERROR x{s['errors']}: {s['last_error']}" if s.get("errors") else ""))
     if r.get("ablations"):
-        L.append(f"ablations (a channel earns its weight when removing it costs >= {r['margin']}):")
+        L.append(f"ablations (a stage earns its place when removing it costs >= {r['margin']}):")
         for a in r["ablations"]:
-            tag = ("EARNS" if a["earns"] else "does not earn") if a["kind"] != "channel_on" \
-                else ("GAINS" if a["earns"] else "no gain")
+            tag = "EARNS" if a["earns"] else "does not earn"
             L.append(f"  {a['name']:<18} {_fmt(a['summary'])}  -> {tag}"
                      + (f" ({', '.join(a['because'])})" if a["because"] else ""))
     if r.get("synthesis"):
         s = r["synthesis"]
-        L.append(f"synthesis: {s['n']} answered, cited a gold note {s['cited_gold_rate']:.2f}, "
+        L.append(f"ask: {s['n']} answered, cited a gold note {s['cited_gold_rate']:.2f}, "
                  f"'not in memory' {s['not_in_memory']} (false abstain "
-                 f"{'n/a' if s['false_abstain'] is None else s['false_abstain']}), mean {s['mean_recall_synth_ms']:.0f} ms, "
-                 f"synthesis ${s['synthesis_cost_usd']:.4f} "
-                 f"({s['synthesis_llm']}, model: {', '.join(s['synthesis_models'])})")
+                 f"{'n/a' if s['false_abstain'] is None else s['false_abstain']}), mean {s['mean_ask_ms']:.0f} ms "
+                 f"({s['synthesis_llm']})")
         if s["judged"]:
             L.append(f"  answer-correct {s['answer_correct']}/{s['judged']} "
                      f"({s['answer_correct_rate']:.2f}), judge ${s['judge_cost_usd']:.4f}")

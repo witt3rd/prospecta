@@ -57,21 +57,10 @@ class ApiError(Exception):
         self.status, self.message = status, message
 
 
-LEGACY_CHANNELS = ("semantic", "lexical", "lexical_body")
-
-
-def _explain_query(trace: dict | None, ranked: list[dict]) -> dict:
+def _explain_query(trace: dict, ranked: list[dict]) -> dict:
     """Additive explain fields for one question: channels_run, channels_failed
     (failed or skipped, each with a reason) and, on every ranked hit, `channels`
     (name, rank, raw score, weight applied). Mutates `ranked` to add `channels`."""
-    if trace is None:
-        # Legacy bank (no channel config): fixed three-channel fusion with no
-        # per-channel ranks; the raw per-channel scores of the hit are given.
-        for r in ranked:
-            r["channels"] = [{"channel": n, "rank": None, "score": float(r["_scores"][n]),
-                              "weight": None}
-                             for n in LEGACY_CHANNELS if r["_scores"].get(n)]
-        return {"channels_run": list(LEGACY_CHANNELS), "channels_failed": []}
     weights = {c["name"]: c["weight"] for c in trace["channels"]}
     by_doc: dict[str, dict[str, tuple[int, float]]] = {}
     for c in trace["candidates"]:
@@ -190,7 +179,7 @@ class Service:
             try:
                 hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
                                           **options, **({"_trace": traces} if explain else {}))
-            except ValueError as e:     # e.g. a date filter on a bank without the hybrid_chunk channel
+            except ValueError as e:     # e.g. a depth that is neither standard nor deep
                 raise ApiError(400, str(e)) from None
             best: dict[tuple, dict] = {}
             for h in hits:
@@ -206,13 +195,13 @@ class Service:
                                  "relevance_score": h.relevance_score}
                     if explain:
                         best[key]["_doc"] = h.document_id
-                        best[key]["_scores"] = h.scores
             ranked = sorted(best.values(), key=lambda r: -r["score"])[:limit]
             entry = {"question": q}
             if explain:
-                entry.update(_explain_query(traces[0] if traces else None, ranked))
+                entry.update(_explain_query(traces[0], ranked) if traces
+                             else {"channels_run": [], "channels_failed": []})
                 for r in ranked:
-                    r.pop("_doc"), r.pop("_scores")
+                    r.pop("_doc")
             entry["results"] = ranked
             out.append(entry)
         return {"results": out}

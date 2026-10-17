@@ -11,7 +11,7 @@ import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
-from prospecta.db.queries import HNSW_INDEX_TEMPLATE, ensure_kind_hnsw_indexes, hnsw_index_name
+from prospecta.db.queries import ensure_kind_hnsw_indexes
 
 SYLLABLES = ["ba", "ko", "ri", "tu", "ve", "lan", "mor", "sel", "dun", "fi", "gar", "hu",
              "jo", "kir", "lum", "nex", "or", "pal", "quo", "sta", "tem", "vin", "wex", "zo"]
@@ -83,8 +83,6 @@ def load_bank(url: str, bank: str, *, n_chunks: int, dim: int = 1536, seed: int 
                                 "chunk", i % CHUNKS_PER_DOC])
         conn.execute("SET maintenance_work_mem = '1GB'")
         conn.execute("SET max_parallel_maintenance_workers = 0")   # parallel builds need a big /dev/shm
-        conn.execute(HNSW_INDEX_TEMPLATE.format(
-            index_name=hnsw_index_name(bank), bank_id_literal=bank, embedding_dim=dim))
         ensure_kind_hnsw_indexes(conn, bank, dim)
         conn.execute("ANALYZE memory_items")
         conn.execute("ANALYZE documents")

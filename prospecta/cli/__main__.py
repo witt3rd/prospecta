@@ -70,7 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- migrate-bank (design 8.4) -------------------------------------
     mb = sub.add_parser(
         "migrate-bank",
-        help="Backfill '<bank>-v2' with a new embedding dimension (resumable)",
+        help="Re-embed a bank into '<bank>-v2' with another embedder or dimension (resumable)",
     )
     mb.add_argument("--source-bank", required=True)
     mb.add_argument("--target-bank", default=None, help="default: <source>-v2")
@@ -92,13 +92,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ix.add_argument("--source-prefix", default=None)
 
     # ---- search (T15) ---------------------------------------------------
-    sr = sub.add_parser("search", help="Hybrid retrieval")
+    sr = sub.add_parser("search", help="Search: Stage 1 (hybrid_chunk) + Stage 2")
     sr.add_argument("query")
-    sr.add_argument(
-        "--mode",
-        choices=["hybrid", "semantic", "lexical"],
-        default="hybrid",
-    )
     sr.add_argument("--limit", type=int, default=10)
     sr.add_argument("--rrf-k", type=int, default=60)
     sr.add_argument("--depth", choices=("standard", "deep"), default=None,
@@ -110,33 +105,25 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ---- eval (design 8.10) --------------------------------------------
     ev = sub.add_parser(
-        "eval", help="Score recall on a questions.md file; ablate; cost and latency per stage")
+        "eval", help="Score recall on a questions.md file; ablate Stage 2; cost and latency per stage")
     ev.add_argument("questions", type=Path, help="questions.md (see prospecta.evaluation)")
     ev.add_argument("--ablate", action="store_true",
-                    help="Also run each channel/stage off (and unused channels on)")
+                    help="Also run with Stage 2 (the rerank) off")
     ev.add_argument("--synth", action="store_true",
-                    help="Also run grounded recall_synth on every question")
+                    help="Also run `ask` on every question")
     ev.add_argument("--judge", action="store_true",
                     help="With --synth: judge answers against `answer:` lines (implies --synth)")
     ev.add_argument("--json", action="store_true", help="Emit the full report as JSON")
     ev.add_argument("--depth", choices=("standard", "deep"), default=None,
                     help="Recall depth = rerank pool cut: standard 0.15, deep 0.05 "
                          "(default: the bank's recall_config.depth, else standard)")
-    ev.add_argument("--scope-promote", action=argparse.BooleanOptionalAction, default=None,
-                    help="Force the scope-promotion re-sort on/off for this run (default: config, off)")
 
     # ---- retain (T15) ---------------------------------------------------
-    rt = sub.add_parser("retain", help="Write a document via the spine")
+    rt = sub.add_parser("retain", help="Write a note (chunks, no model call)")
     rt.add_argument("content", help="Body content, or @path/to/file")
     rt.add_argument("--source", default=None)
     rt.add_argument("--path", default=None, type=Path)
     rt.add_argument("--tags", default=None, help="Comma-separated tags")
-    rt.add_argument(
-        "--index-text",
-        action="append",
-        default=None,
-        help="Question string to index instead of the note's chunks (repeat for multi)",
-    )
 
     # ---- import ---------------------------------------------------------
     im = sub.add_parser("import", help="Import memories from another system")

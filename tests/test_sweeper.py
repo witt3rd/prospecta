@@ -54,10 +54,8 @@ def test_sweeper_picks_up_new_file(memory_with_bank_and_mock_llm, tmp_corpus):
         corpus_paths=[tmp_corpus], sweep_interval_seconds=0.1,
     )
     try:
-        # write new file with frontmatter index_text so no LLM is needed.
-        (tmp_corpus / "new.md").write_text(
-            "---\nindex_text: 'kelly birthday'\n---\nbody"
-        )
+        # write a new file: the sweeper indexes it as chunks (no model is called)
+        (tmp_corpus / "new.md").write_text("kelly birthday body")
         deadline = time.time() + 5.0
         found = False
         while time.time() < deadline:
@@ -230,7 +228,6 @@ def test_hot_path_survives_sweeper_error(
     # Hot path still intact.
     doc_id = mem.retain(
         "hot path content",
-        index_text=["hot path probe"],
         source="hot/path",
     )
     assert isinstance(doc_id, str) and doc_id

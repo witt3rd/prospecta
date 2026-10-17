@@ -30,7 +30,7 @@ fn retain_renders_all_fields_and_bank() {
     assert!(s.contains("content"), "content field missing");
     assert!(s.contains("source"), "source field missing");
     assert!(s.contains("tags"), "tags field missing");
-    assert!(s.contains("index_text"), "index_text field missing");
+    assert!(!s.contains("index_text"), "the index_text field is gone");
     assert!(s.contains("Ctrl-S"), "submit hint missing");
 }
 
@@ -79,10 +79,9 @@ fn retain_running_status_banner() {
 fn retain_field_focus_cycles() {
     assert_eq!(RetainField::Content.next(), RetainField::Source);
     assert_eq!(RetainField::Source.next(), RetainField::Tags);
-    assert_eq!(RetainField::Tags.next(), RetainField::IndexText);
-    assert_eq!(RetainField::IndexText.next(), RetainField::Content);
+    assert_eq!(RetainField::Tags.next(), RetainField::Content);
     // prev is the inverse
-    assert_eq!(RetainField::Content.prev(), RetainField::IndexText);
+    assert_eq!(RetainField::Content.prev(), RetainField::Tags);
     assert_eq!(RetainField::Source.prev(), RetainField::Content);
 }
 
