@@ -14,10 +14,11 @@ We already have ~80% of the pieces in place. The goal is to **simplify, unify, a
 | 2 | Native Postgres Stage 1 (`hybrid_chunk`: reserved slots, dual `websearch_to_tsquery`, `ts_headline` snippets) | **done, merged** | #80; the stored exact vector (migration 0020), the plain-question OR and date-only questions in #83 |
 | 3 | Configurable cross-encoder Stage 2 (`stage = cross_encoder`) | **done, merged** | #78 |
 | 4 | Cited-evidence contract, `recall_for_task`, `ask` with the optional Stage 3 gate (library half) | **done, merged** | #81; Mode 1 automatic recall by query expansion (`expand_and_recall`, which replaced the task-facet decomposition) in #85; its design in #84 |
-| 4b | A bank created fresh runs the architecture with no configuration (new-bank defaults); `import hindsight` writes chunk items | **done** (this PR is stacked on it) | #86 |
+| 4b | A bank created fresh runs the architecture with no configuration (new-bank defaults); `import hindsight` writes chunk items | **done, merged** | #86 |
+| 4c | Mode 1 recall fixes: `terms` are only names and identifiers; near-copies collapse by meaning too | **done, merged** | #87 |
 | 5 | Offline verification on `augur-v2` / `forge-v2` | **verified read-only**; no gateway was switched by this repository's changes. The live migration `0020` and any gateway restart happen only with the captain's word (the `docs/exact-tsv.md` runbook) | none (no repository change) |
 | 6 | `rung-memory-prospecta` and Spire follow the contract | **pending** (other repositories) | |
-| 7 | Documentation overhaul in this repository | **in progress** | the docs overhaul PR stacked on #86 |
+| 7 | Documentation overhaul in this repository | **in progress** | #88 |
 
 This file stays until slices 5 and 6 finish; then it is deleted or reduced to a short record of what was done.
 
