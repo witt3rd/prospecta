@@ -78,9 +78,10 @@ def _truthy_off(name: str) -> bool:
 
 
 def _stage_kwargs() -> dict:
-    """rerank_llm, synth_llm, jev and linker for Memory, built when configured:
-    an OPENROUTER_API_KEY configures them (Sonnet 5.5 through the accounted
-    LLM; Jev through OpenRouter's System One door). PROSPECTA_JEV=off and
+    """rerank_llm, synth_llm, rerank_transport, jev and linker for Memory, built
+    when configured: an OPENROUTER_API_KEY configures them (Sonnet 5.5 through
+    the accounted LLM; the cross-encoder through OpenRouter's rerank endpoint;
+    Jev through OpenRouter's System One door). PROSPECTA_JEV=off and
     PROSPECTA_LINKER=off opt out. Without a key none is built."""
     if not os.environ.get("OPENROUTER_API_KEY"):
         return {}
@@ -89,9 +90,10 @@ def _stage_kwargs() -> dict:
         accounted = defaults.make_accounted_llm()
     except (ImportError, AttributeError):
         return {}
-    from prospecta.stages import JevScore, openrouter_jev_transport
+    from prospecta.stages import JevScore, openrouter_jev_transport, openrouter_rerank_transport
     transport = openrouter_jev_transport()
-    kw: dict = {"rerank_llm": accounted, "synth_llm": accounted}
+    kw: dict = {"rerank_llm": accounted, "synth_llm": accounted,
+                "rerank_transport": openrouter_rerank_transport()}
     if not _truthy_off("PROSPECTA_JEV"):
         kw["jev"] = JevScore(transport)
     if not _truthy_off("PROSPECTA_LINKER"):

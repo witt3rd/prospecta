@@ -1,10 +1,12 @@
 """Recall stages after fusion (hybrid retrieval design 8.7 / 8.8): the
-Reranker (SonnetListwise, JevScore, and the Jev gate over Sonnet), the reader
+Reranker (SonnetListwise, JevScore, the Jev gate over Sonnet, and the
+CrossEncoderReranker over OpenRouter /rerank), the reader
 and the agentic second hop. Every stage is off unless banks.recall_config
 turns it on; a failing stage never sinks the recall (the fused order stands
 and the record says why)."""
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import json
@@ -19,7 +21,7 @@ from typing import Any, Callable, Protocol
 
 from prospecta._filters import coerce_date
 from prospecta._scorecut import (HOP_MIN_REL, check_depth, pool_min_rel, POOL_MIN_REL, READER_MIN_REL, rel_cut,
-                                 RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, split_batches)
+                                 RESERVED_TOKENS, SONNET_CONTEXT_TOKENS, CHARS_PER_TOKEN, estimate_tokens, split_batches)
 from prospecta._template import render_prompt
 from prospecta.channels.base import QueryPlan, RecallState
 from prospecta.channels.fusion import FusedDoc
@@ -34,7 +36,11 @@ JEV_PASSAGE_MAX_BYTES = JEV_INPUT_BYTES - 5_000   # physical: one passage must f
 JEV_TIMEOUT_S = 10.0
 JEV_GATE_THRESHOLD = 2.95
 JEV_MODEL_PREVIOUS = "typesafe/jev-1.13"
-JEV_MODEL = os.environ.get("PROSPECTA_JEV_MODEL") or "typesafe/jev-1.14"
+# The decision model (Jev): PROSPECTA_DECISION_MODEL, else its older alias
+# PROSPECTA_JEV_MODEL, else the default; read once at import. A bank's
+# recall_config.models.decision_model and StageDeps.decision_model override it.
+JEV_MODEL = (os.environ.get("PROSPECTA_DECISION_MODEL") or os.environ.get("PROSPECTA_JEV_MODEL")
+             or "typesafe/jev-1.14")
 JEV_URL = "https://openrouter.ai/api/v1/systemone"
 # Copied from spire-venue server/library-rank.ts (CRITERIA, :44-49; the record
 # variant's TASK, :52), as cited in the verified wire-shape note.
@@ -71,7 +77,30 @@ def fit_passage(text: str, label: str) -> str:
 CHEAP_CHANNELS = ("dense_chunk", "bm25", "question")
 SONNET_MODEL = "anthropic/claude-sonnet-5.5"
 
-STAGES = ("sonnet_listwise", "jev_score")
+STAGES = ("sonnet_listwise", "jev_score", "cross_encoder")
+
+# Cross-encoder (Stage 2) defaults; the model and every number is configurable
+# (recall_config.rerank.*, see docs/recall-stages.md).
+RERANKER_MODEL = "qwen/qwen3-reranker-8b"
+RERANK_URL = "https://openrouter.ai/api/v1/rerank"
+RERANK_INSTRUCTION = ("Instruct: Retrieve memory records that directly answer or provide factual "
+                      "background for the query, honoring exact names, dates, and quoted phrases.\n"
+                      "Query: ")
+RERANK_TOP_N = 10
+RERANK_MIN_SCORE = 0.15        # absolute floor on the calibrated relevance score (0..1)
+RERANK_TIMEOUT_S = 2.5
+NEAR_COPY_JACCARD = 0.88       # token Jaccard above which two notes are near-copies
+# qwen3-reranker-8b reads 41K tokens per request. A request carries at most 32K
+# estimated tokens (4 chars/token): the rest is margin for tokenizer variance,
+# the instruction and the query. A larger pool is split into several requests.
+RERANK_BATCH_TOKENS = 32_000
+
+
+def resolve_reranker_model(call: str | None = None, bank: str | None = None) -> str:
+    """The reranker model: per-call, else the bank's recall_config.rerank.model,
+    else PROSPECTA_RERANKER_MODEL, else the default."""
+    return call or bank or os.environ.get("PROSPECTA_RERANKER_MODEL") or RERANKER_MODEL
+
 
 BLEND_DEFAULTS = {"weight_rerank": 0.7, "weight_fused": 0.3, "keep": 3, "within": 10}
 
@@ -92,7 +121,7 @@ def validate_recall_config(cfg: dict) -> None:
         raise ValueError("recall_config must be an object")
     for key in cfg:
         if key not in ("rerank", "gate", "reader", "evidence", "depth",
-                       "link_completeness", "fusion"):
+                       "link_completeness", "fusion", "models"):
             raise ValueError(f"unknown recall_config key {key!r}")
     if cfg.get("link_completeness", "all-pairs") not in ("connected", "all-pairs"):
         raise ValueError("link_completeness must be 'connected' or 'all-pairs'")
@@ -105,7 +134,22 @@ def validate_recall_config(cfg: dict) -> None:
     if "floor" in fu and (isinstance(fu["floor"], bool) or not isinstance(fu["floor"], int)
                           or fu["floor"] < 1):
         raise ValueError("fusion.floor must be an integer >= 1")
+    models = cfg.get("models", {})
+    if not isinstance(models, dict) or set(models) - {"decision_model"}:
+        raise ValueError("models must be an object of decision_model")
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
+    for section, name in ((models, "decision_model"), (rr, "model")):
+        v = section.get(name)
+        if v is not None and (not isinstance(v, str) or not v):
+            raise ValueError(f"{name} must be a non-empty string")
+    v = rr.get("top_n")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+        raise ValueError("rerank.top_n must be an integer >= 1")
+    v = rr.get("timeout_s")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+        raise ValueError("rerank.timeout_s must be a number > 0")
+    if not isinstance(rr.get("deduplicate_near_copies", True), bool):
+        raise ValueError("rerank.deduplicate_near_copies must be true or false")
     if rr.get("stage", "sonnet_listwise") not in STAGES:
         raise ValueError(f"rerank.stage must be one of {STAGES}")
     if gate.get("enabled"):
@@ -129,7 +173,8 @@ def validate_recall_config(cfg: dict) -> None:
             raise ValueError(f"blend.{name} must be an integer >= 1")
     if int(bl.get("keep", BLEND_DEFAULTS["keep"])) > int(bl.get("within", BLEND_DEFAULTS["within"])):
         raise ValueError("blend.keep must be <= blend.within")
-    for section, name in ((rr, "min_rel_score"), (rd, "min_rel_score"), (rd, "hop_min_rel_score")):
+    for section, name in ((rr, "min_rel_score"), (rr, "min_score"), (rd, "min_rel_score"),
+                          (rd, "hop_min_rel_score")):
         v = section.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
                               or not 0 <= v <= 1):
@@ -387,14 +432,11 @@ class SonnetListwise:
 JevTransport = Callable[[dict, float], dict]
 
 
-def openrouter_jev_transport(api_key: str | None = None,
-                             url: str = JEV_URL):
-    """POST to OpenRouter's System One door. The key comes from the argument or
-    OPENROUTER_API_KEY and is never stored."""
+def _openrouter_transport(url: str, api_key: str | None, what: str):
     def transport(request: dict, timeout: float) -> dict:
         key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not key:
-            raise RuntimeError("no OpenRouter key for Jev")
+            raise RuntimeError(f"no OpenRouter key for {what}")
         req = urllib.request.Request(
             url, data=json.dumps(request).encode(),
             headers={"Authorization": f"Bearer {key}",
@@ -402,6 +444,13 @@ def openrouter_jev_transport(api_key: str | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     return transport
+
+
+def openrouter_jev_transport(api_key: str | None = None,
+                             url: str = JEV_URL):
+    """POST to OpenRouter's System One door. The key comes from the argument or
+    OPENROUTER_API_KEY and is never stored."""
+    return _openrouter_transport(url, api_key, "Jev")
 
 
 class JevScore:
@@ -527,6 +576,120 @@ class JevGate:
         return res
 
 
+# ---------------------------------------------------------------- cross-encoder
+
+def openrouter_rerank_transport(api_key: str | None = None, url: str = RERANK_URL):
+    """POST to OpenRouter's rerank endpoint. The key comes from the argument or
+    OPENROUTER_API_KEY and is never stored."""
+    return _openrouter_transport(url, api_key, "rerank")
+
+
+def _words(text: str) -> frozenset[str]:
+    return frozenset(re.findall(r"\w+", text.lower()))
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+class CrossEncoderReranker:
+    """Stage 2 of docs/postgres-hybrid.md: a cross-encoder scores every
+    (query, note) pair through OpenRouter's rerank endpoint (verified shape:
+    POST /api/v1/rerank, body {model, query, documents, top_n}, reply
+    {results:[{index, relevance_score}], usage:{total_tokens, cost}}).
+
+    Every candidate is scored (a pool over RERANK_BATCH_TOKENS goes out as
+    several parallel requests; scores are calibrated, so they merge). Then, in
+    this order: notes under `min_score` are cut; near-copies collapse into the
+    highest-scored one (token Jaccard over the evidence text above
+    NEAR_COPY_JACCARD: no embedding is at hand here and it needs no extra
+    call); the best `top_n` stay. The stage only removes candidates by those
+    cuts and never adds one. Any provider error, timeout, 429/503 or malformed
+    reply raises, and run_reranker keeps the fused order with the reason."""
+    name = "cross_encoder"
+
+    def __init__(self, transport: JevTransport, model: str = RERANKER_MODEL,
+                 top_n: int = RERANK_TOP_N, min_score: float = RERANK_MIN_SCORE,
+                 timeout: float = RERANK_TIMEOUT_S, deduplicate: bool = True):
+        self.transport, self.model, self.top_n = transport, model, top_n
+        self.min_score, self.timeout, self.deduplicate = min_score, timeout, deduplicate
+
+    def _score_batch(self, query: str, batch: list[tuple[int, str]],
+                     calls: list[dict]) -> dict[int, float]:
+        t0 = time.monotonic()
+        # top_n = every document sent: the cuts below need all the scores, and
+        # the provider bills the input tokens either way.
+        req = {"model": self.model, "query": query,
+               "documents": [text for _, text in batch], "top_n": len(batch)}
+        rec = {"purpose": "cross_encoder_rerank", "model": self.model, "tokens_in": None,
+               "tokens_out": None, "cost_usd": None, "json_mode": False,
+               "messages_count": len(batch), "prompt_text": json.dumps(req),
+               "response_text": None, "error": None}
+        try:
+            resp = self.transport(req, self.timeout)
+            rec["response_text"] = json.dumps(resp)
+            if not isinstance(resp, dict):
+                raise ValueError("response is not an object")
+            u = resp.get("usage") or {}
+            rec.update(model=resp.get("model") or self.model,
+                       tokens_in=u.get("total_tokens"), cost_usd=u.get("cost"))
+            results = resp.get("results")
+            if not isinstance(results, list):
+                raise ValueError("response has no results")
+            out: dict[int, float] = {}
+            for r in results:
+                n = r.get("index") if isinstance(r, dict) else None
+                v = r.get("relevance_score") if isinstance(r, dict) else None
+                if (isinstance(n, bool) or not isinstance(n, int) or not 0 <= n < len(batch)
+                        or n in out or isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v)):
+                    raise ValueError("results hold an invalid index or relevance_score")
+                out[n] = float(v)
+            if len(out) != len(batch):
+                raise ValueError("results do not score every candidate")
+            return {batch[n][0]: v for n, v in out.items()}
+        except Exception as exc:
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            calls.append(rec)
+
+    def rerank(self, query: str, items: list[Item], calls: list[dict]) -> Outcome:
+        question = RERANK_INSTRUCTION + query
+        texts = [(i, f"{it.header}\n{it.evidence}") for i, it in enumerate(items)]
+        batches = split_batches(texts, lambda p: p[1],
+                                RERANK_BATCH_TOKENS - estimate_tokens(question))
+        with ThreadPoolExecutor(max_workers=max(1, len(batches))) as ex:
+            parts = list(ex.map(lambda b: self._score_batch(question, b, calls), batches))
+        scores: dict[int, float] = {}
+        for p in parts:
+            scores.update(p)
+        ranked = sorted(scores, key=lambda i: (-scores[i], i))
+        kept = [i for i in ranked if scores[i] >= self.min_score]
+        n_below = len(ranked) - len(kept)
+        collapsed: dict[str, str] = {}
+        if self.deduplicate:
+            words = {i: _words(items[i].evidence) for i in kept}
+            survivors: list[int] = []
+            for i in kept:
+                twin = next((j for j in survivors
+                             if _jaccard(words[i], words[j]) > NEAR_COPY_JACCARD), None)
+                if twin is None:
+                    survivors.append(i)
+                else:
+                    collapsed[items[i].doc.document_id] = items[twin].doc.document_id
+            kept = survivors
+        order = kept[:self.top_n]
+        return Outcome(order=order,
+                       grades={items[i].doc.document_id: scores[i] for i in order},
+                       record={"stage": self.name, "model": self.model, "top_n": self.top_n,
+                               "min_score": self.min_score, "n_below_min_score": n_below,
+                               "collapsed": collapsed, "n_over_top_n": len(kept) - len(order),
+                               "requests": len(batches)})
+
+
 def blend_order(items: list[Item], order: list[int], *, weight_rerank: float,
                 weight_fused: float, floor: bool = False, keep: int = 3,
                 within: int = 10) -> list[int]:
@@ -576,22 +739,36 @@ class BlendedReranker:
         return out
 
 
-def build_reranker(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None):
+def build_reranker(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None,
+                   rerank_transport: JevTransport | None = None,
+                   reranker_model: str | None = None):
     """The configured Reranker (blended with the fused order unless
     rerank.blend.enabled is not true (default off)), or None when reranking is off."""
-    inner = _build_inner(cfg, llm=llm, jev=jev, model=model)
+    inner = _build_inner(cfg, llm=llm, jev=jev, model=model,
+                         rerank_transport=rerank_transport, reranker_model=reranker_model)
     blend = (cfg.get("rerank") or {}).get("blend") or {}
     if inner is None or not blend.get("enabled", False):
         return inner
     return BlendedReranker(inner, blend)
 
 
-def _build_inner(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None):
+def _build_inner(cfg: dict, *, llm, jev: JevScore | None, model: str | None = None,
+                 rerank_transport: JevTransport | None = None,
+                 reranker_model: str | None = None):
     """The configured Reranker, or None when reranking is off."""
     rr = cfg.get("rerank") or {}
     if not rr.get("enabled"):
         return None
     stage = rr.get("stage", "sonnet_listwise")
+    if stage == "cross_encoder":
+        if rerank_transport is None:
+            raise RuntimeError("rerank.stage = cross_encoder needs a rerank transport")
+        return CrossEncoderReranker(
+            rerank_transport, resolve_reranker_model(reranker_model, rr.get("model")),
+            top_n=int(rr.get("top_n", RERANK_TOP_N)),
+            min_score=float(rr.get("min_score", RERANK_MIN_SCORE)),
+            timeout=float(rr.get("timeout_s", RERANK_TIMEOUT_S)),
+            deduplicate=bool(rr.get("deduplicate_near_copies", True)))
     if stage == "jev_score":
         if jev is None:
             raise RuntimeError("rerank.stage = jev_score needs a Jev transport")
@@ -623,6 +800,7 @@ def run_reranker(reranker: Reranker, query: str, items: list[Item],
     except Exception as exc:
         out = None
         rec = {"stage": getattr(reranker, "name", "?"),
+               "model": getattr(reranker, "model", None),
                "fallback_reason": f"fused order stands: {type(exc).__name__}: {exc}",
                "order": [it.doc.document_id for it in items], "grades": {}, "jev": {}}
         ordered = list(items)
@@ -735,6 +913,20 @@ class StageDeps:
     llm: Any = None
     jev: JevScore | None = None
     model: str | None = None
+    rerank_transport: JevTransport | None = None
+    reranker_model: str | None = None      # per-call, beats recall_config.rerank.model
+    decision_model: str | None = None      # per-call, beats recall_config.models.decision_model
+
+
+def _with_decision_model(jev: JevScore | None, call: str | None, bank: str | None):
+    """The Jev to use: a copy on the per-call or bank decision model when one
+    is set (the shared Jev is never mutated), else the Jev as built."""
+    model = call or bank
+    if jev is None or not model:
+        return jev
+    jev = copy.copy(jev)
+    jev.model = model
+    return jev
 
 
 def run_stages(
@@ -756,7 +948,11 @@ def run_stages(
 
 def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls, trace,
                 depth=None):
-    reranker = build_reranker(recall_cfg, llm=deps.llm, jev=deps.jev, model=deps.model)
+    jev = _with_decision_model(deps.jev, deps.decision_model,
+                               (recall_cfg.get("models") or {}).get("decision_model"))
+    reranker = build_reranker(recall_cfg, llm=deps.llm, jev=jev, model=deps.model,
+                              rerank_transport=deps.rerank_transport,
+                              reranker_model=deps.reranker_model)
     reader_cfg = recall_cfg.get("reader") or {}
     if reranker is None and not reader_cfg.get("enabled"):
         trace.update(totals(calls))
@@ -777,9 +973,9 @@ def _run_stages(state, query, fused, channel_config, recall_cfg, deps, k, calls,
         if deps.llm is None and reader_cfg.get("type", "sonnet") != "jev":
             raise RuntimeError("reader needs an llm callable")
         if reader_cfg.get("type", "sonnet") == "jev":
-            if deps.jev is None:
+            if jev is None:
                 raise RuntimeError("reader.type = jev needs a Jev transport")
-            reader = JevReader(deps.jev.transport, deps.jev.model, deps.jev.timeout)
+            reader = JevReader(jev.transport, jev.model, jev.timeout)
         else:
             reader = SonnetReader(deps.llm, deps.model or SONNET_MODEL)
         items, hops = _hop(state, query, items, channel_config, reader_cfg, reranker,

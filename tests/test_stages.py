@@ -277,6 +277,69 @@ def test_jev_requests_are_15_per_call_and_two_for_a_pool_of_30():
         len(r["questions"]) for r in reqs) == 30
 
 
+def cross_encoder_transport(scores, fail=None):
+    """Offline /rerank (documented shape): the score of a document is looked up
+    by the note name in its text."""
+    def transport(req, timeout):
+        if fail:
+            raise fail
+        return {"model": req["model"], "usage": {"total_tokens": 120, "cost": 2.4e-05},
+                "results": [{"index": i, "relevance_score": next(
+                    (v for k, v in scores.items() if k in d), 0.0)}
+                    for i, d in enumerate(req["documents"])]}
+    return transport
+
+
+def test_cross_encoder_stage_through_recall(mem):
+    mem._rerank_transport = cross_encoder_transport({"alpha": 0.9, "bravo": 0.6, "charlie": 0.05})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
+    res = mem.recall([QUERY], limit=5)
+    assert sources(res) == ["alpha.md", "bravo.md"]          # charlie is under the 0.15 floor
+    assert res[0].scores["rerank"] == 0.9
+    rec, = last_event(mem, "rerank")[0]["per_query"]
+    assert rec["stage"] == "cross_encoder" and rec["fallback_reason"] is None
+    assert rec["tokens_in"] == 120 and rec["cost_usd"] == 2.4e-05
+    assert rec["model"] == "qwen/qwen3-reranker-8b"
+
+
+def test_cross_encoder_provider_failure_keeps_the_fused_order(mem):
+    fused = sources(mem.recall([QUERY], limit=5))
+    mem._rerank_transport = cross_encoder_transport({}, fail=TimeoutError("timed out"))
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
+    assert sources(mem.recall([QUERY], limit=5)) == fused
+    rec, = last_event(mem, "rerank")[0]["per_query"]
+    assert rec["fallback_reason"].startswith("fused order stands: TimeoutError")
+
+
+def test_models_are_configurable_per_call_bank_and_env(mem, monkeypatch):
+    seen: list[str] = []
+
+    def transport(req, timeout):
+        seen.append(req["model"])
+        return cross_encoder_transport({"alpha": 0.9})(req, timeout)
+    mem._rerank_transport = transport
+    monkeypatch.setenv("PROSPECTA_RERANKER_MODEL", "env/rr")
+    for cfg_model, call_model in ((None, None), ("bank/rr", None), ("bank/rr", "call/rr")):
+        mem._reranker_model = call_model
+        mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder",
+                                          **({"model": cfg_model} if cfg_model else {})}})
+        mem.recall([QUERY], limit=5)
+    assert seen == ["env/rr", "bank/rr", "call/rr"]
+
+    jev_models: list[str] = []
+
+    def jev(req, timeout):
+        jev_models.append(req["model"])
+        return {"answers": {qid: {"type": "score", "score": 1.0} for qid in req["questions"]}}
+    mem._jev = JevScore(jev)
+    for cfg, call_model in (({}, None), ({"models": {"decision_model": "bank/jev"}}, None),
+                            ({"models": {"decision_model": "bank/jev"}}, "call/jev")):
+        mem._decision_model = call_model
+        mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}, **cfg})
+        mem.recall([QUERY], limit=5)
+    assert jev_models == ["typesafe/jev-1.14", "bank/jev", "call/jev"]
+
+
 def test_reader_sufficient_runs_no_hop(mem):
     llm = StubLLM(reader={"sufficient": True, "follow_ups": ["ignored"]})
     mem._rerank_llm = llm
