@@ -13,6 +13,7 @@ from prospecta._test_helpers import no_cut
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
 from prospecta.stages import LLMResult
+from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
 
@@ -27,7 +28,7 @@ class EntityLLM:
 @pytest.fixture
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
-    m.create_bank("b", embedding_dim=EMBED_DIM)
+    create_legacy_bank(m, "b", embedding_dim=EMBED_DIM)    # link_config {}: links off, entities on
     yield m
     m.close()
 

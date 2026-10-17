@@ -77,6 +77,8 @@ from urllib.parse import urlparse, urlunparse
 import psycopg
 import pytest
 
+from tests._legacy_bank import create_legacy_bank
+
 
 # ---------------------------------------------------------------------------
 # Fixtures (mirror the bilateral test's fresh-DB pattern for isolation)
@@ -166,7 +168,7 @@ def drift_memory(pg_container, bilateral_embed):
         llm=None,  # P4 caller-supplies index_text; no LLM needed.
         embed=bilateral_embed,
     )
-    mem.create_bank(bank, embedding_dim=bilateral_embed.dim)
+    create_legacy_bank(mem, bank, embedding_dim=bilateral_embed.dim)
 
     # Target doc — drifted index_text (declarative, not question-shape).
     mem.retain(
@@ -359,7 +361,7 @@ def body_rescue_memory(pg_container, bilateral_embed):
         llm=None,
         embed=bilateral_embed,
     )
-    mem.create_bank(bank, embedding_dim=bilateral_embed.dim)
+    create_legacy_bank(mem, bank, embedding_dim=bilateral_embed.dim)
 
     # Target: drifted index_text, on-topic body.
     mem.retain(

@@ -13,6 +13,7 @@ import pytest
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
 from prospecta.stages import JEV_CRITERIA, JEV_TASK, JevScore, LLMResult, validate_recall_config
+from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
 NOTES = {
@@ -57,7 +58,7 @@ class StubLLM:
 @pytest.fixture
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=None, embed=stub_embed)
-    m.create_bank("b", embedding_dim=EMBED_DIM)
+    create_legacy_bank(m, "b", embedding_dim=EMBED_DIM)      # stored {}: no stage until a test sets one
     m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     for src, text in NOTES.items():
         m.retain(text, source=src, index_text=text)

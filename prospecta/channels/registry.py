@@ -21,9 +21,11 @@ REGISTRY: dict[str, type] = {
 }
 
 # The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
-# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config; so is
+# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
 # `hybrid_chunk`, the native Postgres Stage 1 (docs/postgres-hybrid.md) that replaces
-# dense_chunk + bm25 + keyword with one reserved-slot query.
+# dense_chunk + bm25 + keyword with one reserved-slot query, is not in this list because it
+# is what a bank created fresh stores (prospecta/bank_defaults.py); this list is the legacy
+# default of banks that stored `[]`.
 # `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
 # optional and off by default (docs/graph-links.md), and a bank with no link rows
 # returns nothing from it. Set its weight per bank when the bank builds links.

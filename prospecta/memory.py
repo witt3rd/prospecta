@@ -6,6 +6,7 @@ index_directory, etc.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -15,6 +16,7 @@ import psycopg
 
 from typing import Literal
 
+from prospecta.bank_defaults import new_bank_configs
 from prospecta._types import (
     AskResult, EmbedCallable, ExpandedRecall, LLMCallable, Query, RAGResult, RecalledMemory,
     TaskBrief, Tracer,
@@ -230,7 +232,13 @@ class Memory:
 
         Idempotent for identical configs (same bank_id + same embedding_dim
         is a no-op). Raises BankConfigConflict if bank exists with different
-        embedding_dim.
+        embedding_dim. A bank that exists is never changed (its stored
+        channel_config / recall_config / link_config stay as they are).
+
+        A bank created here runs the hybrid architecture out of the box
+        (prospecta.bank_defaults): channel_config = [hybrid_chunk] (Stage 1),
+        recall_config = a cross_encoder rerank (Stage 2), link_config = linking and
+        entity extraction off. `set_channel_config([])` makes it a legacy bank.
 
         Also creates the per-bank HNSW partial index for embedding columns.
         """
@@ -260,6 +268,7 @@ class Memory:
                     "embedding_model_id": embedding_model_id,
                     "mission": mission,
                     "retain_mission": retain_mission,
+                    **{k: json.dumps(v) for k, v in new_bank_configs().items()},
                 },
             )
 

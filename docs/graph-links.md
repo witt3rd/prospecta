@@ -12,7 +12,8 @@ query. The next chunk is the chunk order. Materialising them as rows grew the ta
 300 million rows on a 73,000-note bank and about 4 million on a 4,600-note bank, and the library's
 own evaluation measured graph and links moving scores by 0.00 to 0.02.
 
-**Entities stay, with their own setting** (`"entities"`, default true: unchanged). Entity
+**Entities stay, with their own setting** (`"entities"`: a bank that stored `{}` keeps the default,
+true; a bank created fresh stores `{"links": false, "entities": false}`, so it extracts nothing). Entity
 extraction, `memory_entities`, `memory_item_entities`, aliases and the join-based entity lookup
 (GraphExpand's hub path) work whether links are on or not; with links off, no `ENTITY` link rows
 are written. Set `"entities": false` to stop extraction too. With both off the linker does nothing

@@ -55,9 +55,7 @@ it from the Neon console first and use that name in the URL.
 ## Smoke test
 
 ```bash
-prospecta retain "Kelly was born March 4th 1990" \
-  --source kelly.md \
-  --index-text "When was Kelly born?"
+prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 prospecta search "Kelly birthday"
 ```

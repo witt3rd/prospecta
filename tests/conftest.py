@@ -93,11 +93,13 @@ def fresh_db(pg_container):
 
 @pytest.fixture
 def memory_with_bank(fresh_db):
-    """Memory wired with the deterministic stub embedder + a created bank.
+    """Memory wired with the deterministic stub embedder + a created LEGACY bank.
 
-    32-dim bank named 'test'. Stub LLM attached but T9 paths don't call it.
+    32-dim bank named 'test' that stores the legacy config (channel_config [], recall_config {},
+    link_config {}: see tests/_legacy_bank.py). Stub LLM attached but T9 paths don't call it.
     """
     from prospecta.memory import Memory
+    from tests._legacy_bank import create_legacy_bank
     from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 
     mem = Memory(
@@ -106,7 +108,7 @@ def memory_with_bank(fresh_db):
         llm=stub_llm,
         embed=stub_embed,
     )
-    mem.create_bank("test", embedding_dim=EMBED_DIM)
+    create_legacy_bank(mem, "test", embedding_dim=EMBED_DIM)
     yield mem
     mem.close()
 
@@ -146,8 +148,9 @@ def mock_llm():
 
 @pytest.fixture
 def memory_with_bank_and_mock_llm(fresh_db, mock_llm):
-    """Memory wired with stub embedder + mock_llm + a created bank."""
+    """Memory wired with stub embedder + mock_llm + a created LEGACY bank (tests/_legacy_bank.py)."""
     from prospecta.memory import Memory
+    from tests._legacy_bank import create_legacy_bank
     from tests._stub_embedder import EMBED_DIM, stub_embed
 
     mem = Memory(
@@ -156,7 +159,7 @@ def memory_with_bank_and_mock_llm(fresh_db, mock_llm):
         llm=mock_llm,
         embed=stub_embed,
     )
-    mem.create_bank("test", embedding_dim=EMBED_DIM)
+    create_legacy_bank(mem, "test", embedding_dim=EMBED_DIM)
     yield mem
     mem.close()
 

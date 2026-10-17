@@ -13,7 +13,8 @@ def cmd_link_pass(args) -> int:
     except SystemExit as e:
         return int(e.code) if isinstance(e.code, int) else 1
     if getattr(memory, "_linker", None) is None:
-        print("error: link-pass needs the linker (OPENROUTER_API_KEY set, PROSPECTA_LINKER on)",
+        print("error: link-pass needs the linker (OPENROUTER_API_KEY set, and the bank's link_config "
+              "enabling links or entities, or PROSPECTA_LINKER=on)",
               file=sys.stderr)
         return 2
 

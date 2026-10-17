@@ -15,6 +15,7 @@ from prospecta.channels import (
     validate_channel_config,
 )
 from prospecta.memory import Memory
+from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 
 
@@ -84,7 +85,7 @@ def test_registry_builds_enabled_in_order_and_validates():
 @pytest.fixture
 def mem(fresh_db):
     m = Memory(database_url=fresh_db, bank_id="b", llm=stub_llm, embed=stub_embed)
-    m.create_bank("b", embedding_dim=EMBED_DIM)
+    create_legacy_bank(m, "b", embedding_dim=EMBED_DIM)
     m.retain("The cat sat on the warm mat by the window.", source="cat.md",
              index_text="where did the cat sit")
     m.retain("Quarterly revenue grew by twelve percent in Europe.", source="rev.md",
@@ -105,7 +106,7 @@ def mem(fresh_db):
     m.close()
 
 
-def test_default_config_is_empty_and_recall_stays_legacy(mem):
+def test_a_legacy_bank_stores_an_empty_config_and_recall_stays_legacy(mem):
     with psycopg.connect(mem.database_url) as conn:
         assert conn.execute("SELECT channel_config FROM banks WHERE bank_id='b'").fetchone()[0] == []
     res = mem.search("where did the cat sit")
