@@ -89,9 +89,12 @@ def test_the_prompts_the_live_paths_use_stay(prompt):
 
 
 def test_the_legacy_page_is_gone_and_nothing_links_to_it():
-    assert not (REPO / "docs" / "legacy.md").exists()
-    for path in [REPO / "README.md", *(REPO / "docs").glob("*.md"), *ROOT.rglob("*.py"), *ROOT.rglob("*.sql")]:
-        assert "docs/legacy.md" not in path.read_text(encoding="utf-8"), path
+    page = "docs/" + "legacy.md"
+    assert not (REPO / page).exists()
+    # (an applied migration is never edited, so the comment in 0019_link_config.sql that names the page stays)
+    for path in [REPO / "README.md", *(REPO / "docs").glob("*.md"), *ROOT.rglob("*.py"),
+                 *(p for p in ROOT.rglob("*.sql") if "migrations" not in p.parts)]:
+        assert page not in path.read_text(encoding="utf-8"), path
 
 
 def test_memory_has_only_the_surface_the_design_needs():

@@ -1,17 +1,14 @@
-"""`prospecta eval`: questions.md parsing, metrics, ablations, verdicts,
-cost and latency per stage, synthesis + judge. LLM and embedder are stubs."""
+"""`prospecta eval`: questions.md parsing, metrics, the Stage 2 ablation, verdicts,
+cost and latency per stage, `ask` + judge. LLM and embedder are stubs."""
 from __future__ import annotations
-
-from prospecta._test_helpers import no_cut
 
 import json
 from types import SimpleNamespace
 
-import psycopg
 import pytest
 
 from prospecta import evaluation as ev
-from prospecta.channels import DEFAULT_CHANNEL_CONFIG
+from prospecta.channels import effective_channel_config
 from prospecta.memory import Memory
 from prospecta.stages import LLMResult
 from tests._stub_embedder import EMBED_DIM, stub_embed
@@ -39,8 +36,7 @@ NOTES = {
 }
 
 
-def vec(text):
-    return "[" + ",".join(map(str, stub_embed([text])[0])) + "]"
+HYBRID = effective_channel_config([])
 
 
 # ------------------------------------------------------------------ parsing
@@ -84,38 +80,30 @@ def _summary(h1, h10, mrr, cov, multi=None, g2=None):
     return {"gold": g, "gold2": g2 or z, "multinote_cover10": multi, "n": 10, "by_class": {}}
 
 
-def test_verdict_ablation_and_addition_margin():
+def test_verdict_ablation_margin():
     full = _summary(0.8, 0.9, 0.85, 0.9, multi=0.6)
     drop = _summary(0.7, 0.9, 0.85, 0.9, multi=0.6)
-    v = ev.verdict(full, drop, "channel_off")
+    v = ev.verdict(full, drop, "stage_off")
     assert v["earns"] and v["because"] == ["gold.hit1"]
     tiny = _summary(0.78, 0.9, 0.84, 0.9, multi=0.6)
-    assert not ev.verdict(full, tiny, "channel_off")["earns"]
+    assert not ev.verdict(full, tiny, "stage_off")["earns"]
     cov = _summary(0.8, 0.9, 0.85, 0.9, multi=0.5)
-    assert ev.verdict(full, cov, "channel_off")["because"] == ["multinote.cover10"]
+    assert ev.verdict(full, cov, "stage_off")["because"] == ["multinote.cover10"]
     # gold-level cover@10 alone does not count (only the multi-note questions do)
     gcov = _summary(0.8, 0.9, 0.85, 0.7, multi=0.6)
-    assert not ev.verdict(full, gcov, "channel_off")["earns"]
+    assert not ev.verdict(full, gcov, "stage_off")["earns"]
     better = _summary(0.8, 0.95, 0.85, 0.9, multi=0.6)
-    assert ev.verdict(full, better, "channel_on")["earns"]
-    assert not ev.verdict(full, better, "channel_off")["earns"]   # improving is not "earning"
+    assert not ev.verdict(full, better, "stage_off")["earns"]   # improving is not "earning"
 
 
-def test_ablation_variants():
+def test_ablation_variants_are_stage_2_off_and_nothing_else():
     rc = {"rerank": {"enabled": True, "stage": "cross_encoder"}}
-    vs = {v["name"]: v for v in ev.ablation_variants(DEFAULT_CHANNEL_CONFIG, rc)}
-    assert set(vs) == {"-dense_chunk", "-meta", "+hybrid_chunk", "-rerank"}
-    off = [e for e in vs["-meta"]["channels"] if e["name"] == "meta"][0]
-    assert off["enabled"] is False
-    assert [e["name"] for e in DEFAULT_CHANNEL_CONFIG if not e.get("enabled", True)] == []
+    vs = {v["name"]: v for v in ev.ablation_variants(HYBRID, rc)}
+    assert set(vs) == {"-rerank"}
     assert vs["-rerank"]["stages"]["rerank"]["enabled"] is False
     assert rc["rerank"]["enabled"] is True   # the bank's own config is not mutated
-    dark = [dict(e) for e in DEFAULT_CHANNEL_CONFIG]
-    dark[1]["weight"] = 0
-    assert "-meta" not in {v["name"] for v in ev.ablation_variants(dark, {})}
-    assert "+meta" in {v["name"] for v in ev.ablation_variants(dark, {})}
-    stored = DEFAULT_CHANNEL_CONFIG + [{"name": "question", "enabled": True, "weight": 1}]   # a retired channel
-    assert "-question" not in {v["name"] for v in ev.ablation_variants(stored, {})}
+    assert ev.ablation_variants(HYBRID, {}) == []                                   # no stage, nothing to ablate
+    assert ev.ablation_variants(HYBRID, {"rerank": {"enabled": False}}) == []
 
 
 # ------------------------------------------------------------- integration
@@ -130,7 +118,7 @@ class ReversingRerank:
 
 
 class EvalLLM:
-    """Judge: correct iff answer names alpha. Synthesis: cites [alpha.md]."""
+    """Judge: correct iff answer names alpha. `ask`: answers from the first excerpt, [1]."""
 
     def __init__(self):
         self.calls = []
@@ -143,7 +131,7 @@ class EvalLLM:
             return LLMResult(json.dumps({"correct": "alpha" in ans}), cost_usd=0.0005)
         if json_mode:
             return json.dumps({"queries": [{"text": "cat sat"}]})
-        return LLMResult("alpha cat sat [alpha.md]", model="stub-sonnet", cost_usd=0.001)
+        return LLMResult("alpha cat sat [1]", model="stub-sonnet", cost_usd=0.001)
 
 
 @pytest.fixture
@@ -151,24 +139,16 @@ def mem(fresh_db):
     llm = EvalLLM()
     m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed, rerank_transport=ReversingRerank())
     m.create_bank("b", embedding_dim=EMBED_DIM)
-    m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    m.set_recall_config({})        # Stage 1's order, until a test sets a stage
     for src, text in NOTES.items():
-        m.retain(text, source=src, index_text=text)
-    with psycopg.connect(fresh_db) as conn:
-        for src, text in NOTES.items():
-            conn.execute(
-                "INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
-                " embedding, kind, ordinal, char_start, char_end) "
-                "SELECT 'b', d.id, %s, %s, %s::vector, 'chunk', 0, 0, %s FROM documents d "
-                "WHERE d.source = %s", (text, text, vec(text), len(text), src))
-        conn.commit()
+        m.retain(text, source=src)
     yield m
     m.close()
 
 
 def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     qs = ev.parse_questions(QUESTIONS_MD)
-    base, _ = ev.retrieve(mem, qs[0].text, no_cut(DEFAULT_CHANNEL_CONFIG), {})
+    base, _ = ev.retrieve(mem, qs[0].text, HYBRID, {})
     assert base[0] == "alpha.md"
     # the reversing reranker moves the worst fused note to the top: make it the gold
     worst = base[-1]
@@ -178,12 +158,11 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     assert rep["full"]["summary"]["gold"]["hit1"] == 1.0
     stages = rep["full"]["stages"]
     assert stages["stage:cross_encoder_rerank"]["cost_usd"] == pytest.approx(0.002)
-    assert "channel:dense_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
+    assert "channel:hybrid_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
     abl = {a["name"]: a for a in rep["ablations"]}
-    assert set(abl) == {"-dense_chunk", "-meta", "+hybrid_chunk", "-rerank"}
+    assert set(abl) == {"-rerank"}
     assert abl["-rerank"]["summary"]["gold"]["hit1"] == 0.0
     assert abl["-rerank"]["earns"] and "gold.hit1" in abl["-rerank"]["because"]
-    assert abl["+hybrid_chunk"]["kind"] == "channel_on"
     # the run wrote no config to the bank
     assert mem.search(qs[0].text, limit=3)
     text = ev.format_report(rep)
@@ -191,33 +170,20 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     json.loads(ev.report_json(rep))
 
 
-def test_eval_flag_forces_promote(mem, monkeypatch):
-    seen = []
-    monkeypatch.setattr(ev, "run_variant", lambda m, q, ch, rc, pool=None, depth=None: (
-        seen.append((ch, rc)) or {"summary": {}, "stages": {}}))
-    ev.run_eval(mem, [], scope_promote=True)
-    ch, rc = seen[-1]
-    assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [True]
-    ev.run_eval(mem, [], scope_promote=False)
-    ch, rc = seen[-1]
-    assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [False]
-
-
-def test_run_eval_legacy_bank_scored_with_defaults(mem):
+def test_run_eval_scores_a_bank_with_no_channel_config_through_hybrid_chunk(mem):
     mem.set_channel_config([])
     rep = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
-    assert rep["legacy_bank_scored_with_defaults"] is True
-    assert rep["full"]["summary"]["n"] == 2
-    assert "ablations" not in rep and "default channels" in ev.format_report(rep)
+    assert [e["name"] for e in rep["channel_config"]] == ["hybrid_chunk"]
+    assert rep["full"]["summary"]["n"] == 2 and "ablations" not in rep
+    assert "default channels" not in ev.format_report(rep)
 
 
-def test_run_synthesis_with_judge_accounts_cost(mem):
+def test_run_synthesis_runs_ask_and_the_judge_accounts_cost(mem):
     qs = ev.parse_questions(QUESTIONS_MD)
     rep = ev.run_eval(mem, qs, synth=True, judge=True)
     s = rep["synthesis"]
     assert s["n"] == 2 and s["judged"] == 1 and s["answer_correct"] == 1
     assert s["answer_correct_rate"] == 1.0
-    assert s["synthesis_cost_usd"] == pytest.approx(0.002)
     assert s["judge_cost_usd"] == pytest.approx(0.0005)
     assert s["cited_gold_rate"] == 1.0 and s["not_in_memory"] == 0
     assert "answer-correct 1/1" in ev.format_report(rep)
@@ -229,10 +195,11 @@ def test_cli_eval_prints_report_and_json(mem, tmp_path, monkeypatch, capsys):
     qf = tmp_path / "questions.md"
     qf.write_text(QUESTIONS_MD)
     monkeypatch.setattr(_common, "make_memory", lambda args: mem)
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     args = SimpleNamespace(questions=qf, ablate=True, synth=False, judge=False, json=False)
     assert cmd_eval(args) == 0
     out = capsys.readouterr().out
-    assert "full:" in out and "+hybrid_chunk" in out
+    assert "full:" in out and "-rerank" in out
     args.json = True
     assert cmd_eval(args) == 0
     assert json.loads(capsys.readouterr().out)["n_questions"] == 2
@@ -268,10 +235,10 @@ def test_parse_questions_md_qblocks():
 
 
 def test_eval_runs_production_path_and_reports_channel_errors(mem):
-    _, st = ev.retrieve(mem, "what did alpha say", no_cut(DEFAULT_CHANNEL_CONFIG), {})
-    assert "channel:meta" in st
+    _, st = ev.retrieve(mem, "what did alpha say", HYBRID, {})
+    assert "channel:hybrid_chunk" in st
     bad = ev.run_eval(mem, ev.parse_questions(QUESTIONS_MD))
-    bad["full"]["stages"]["channel:dense_chunk"].update(errors=2, last_error="boom: dim")
+    bad["full"]["stages"]["channel:hybrid_chunk"].update(errors=2, last_error="boom: dim")
     assert "ERROR x2: boom: dim" in ev.format_report(bad)
 
 

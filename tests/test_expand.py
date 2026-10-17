@@ -814,12 +814,19 @@ def test_expand_and_recall_never_raises(made):
     assert "embed" in mem.expand_and_recall("harbour lamps", gate=False).error
 
 
-def test_a_bank_without_the_hybrid_channel_is_an_error_result_before_any_model_call(made):
+def test_a_bank_that_disables_the_hybrid_channel_is_an_error_result_before_any_model_call(made):
     writer = FakeWriter([S("harbour lamps")])
     mem = made(llm=writer, rerank=FakeRerank())
-    mem.set_channel_config([{"name": "dense_chunk", "weight": 1}])
+    mem.set_channel_config([{"name": "hybrid_chunk", "enabled": False, "weight": 1}])
     got = mem.expand_and_recall("harbour lamps", gate=False)
-    assert "no hybrid_chunk channel" in got.error and got.block == "" and writer.calls == []
+    assert "disables the hybrid_chunk channel" in got.error and got.block == "" and writer.calls == []
+
+
+def test_a_bank_with_no_channel_config_expands_on_the_hybrid_default(made):
+    mem = made(llm=FakeWriter([S("harbour lamps")]), rerank=FakeRerank())
+    mem.set_channel_config([])
+    got = mem.expand_and_recall("harbour lamps", gate=False)
+    assert got.error is None and got.items
 
 
 def test_every_stage_failing_still_returns(made):

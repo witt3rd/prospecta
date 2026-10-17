@@ -17,7 +17,6 @@ def _count(conn, table: str, bank_id: str) -> int:
 
 def test_postgres_sink_writes_retain_events(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = "q1"  # type: ignore[attr-defined]
     mem.retain("content", source="test")
     with psycopg.connect(mem.database_url) as conn:
         assert _count(conn, "retain_events", "test") == 1
@@ -26,28 +25,10 @@ def test_postgres_sink_writes_retain_events(memory_with_bank_and_mock_llm):
 def test_postgres_sink_writes_recall_events(populated_corpus):
     mem = populated_corpus
     mem._llm.set_response(  # type: ignore[attr-defined]
-        lambda messages, *, json_mode: (
-            '{"queries":[{"text":"q"}]}' if json_mode else "synth"
-        )
-    )
-    mem.recall_synth("query")
+        lambda messages, *, json_mode: "synth [1]")
+    mem.ask("query")
     with psycopg.connect(mem.database_url) as conn:
         assert _count(conn, "recall_events", "test") >= 1
-
-
-def test_postgres_sink_writes_formulate_events(memory_with_bank_and_mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = '{"queries":[{"text":"q"}]}'  # type: ignore[attr-defined]
-    mem.formulate_queries("msg")
-    with psycopg.connect(mem.database_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT parse_fallback FROM formulate_events WHERE bank_id = %s",
-                ("test",),
-            )
-            rows = cur.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] is False
 
 
 def test_postgres_sink_writes_sweep_pass(memory_with_bank_and_mock_llm, tmp_corpus):
@@ -66,8 +47,9 @@ def test_postgres_sink_writes_sweep_pass(memory_with_bank_and_mock_llm, tmp_corp
 
 def test_postgres_sink_writes_llm_call(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = '{"queries":[{"text":"q"}]}'  # type: ignore[attr-defined]
-    mem.formulate_queries("a message")
+    mem.retain("kelly was born in march", source="kelly")
+    mem._llm.canned = "an answer [1]"  # type: ignore[attr-defined]
+    mem.ask("when was kelly born")
     with psycopg.connect(mem.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -75,7 +57,7 @@ def test_postgres_sink_writes_llm_call(memory_with_bank_and_mock_llm):
                 ("test",),
             )
             rows = cur.fetchall()
-            assert any(r[0] == "formulate_queries" for r in rows)
+            assert any(r[0] == "ask_cited" for r in rows)
 
 
 def test_composite_tracer_combines_postgres_sink_and_recording(fresh_db, mock_llm):
@@ -96,7 +78,6 @@ def test_composite_tracer_combines_postgres_sink_and_recording(fresh_db, mock_ll
     mem.create_bank("test", embedding_dim=EMBED_DIM)
     sink = PostgresSink(pool=mem._pool, bank_id="test")
     mem._tracer = CompositeTracer(sink, rec)
-    mock_llm.canned = "q1"
     mem.retain("content", source="t1")
     # Both sides observed the event.
     assert rec.by_name("retain")

@@ -43,7 +43,7 @@ def test_readme_describes_the_architecture():
     from pathlib import Path
     text = Path("README.md").read_text()
     for phrase in ["hybrid_chunk", "cross-encoder", "cited", "expand_and_recall",
-                   "docs/postgres-hybrid.md", "docs/legacy.md"]:
+                   "docs/postgres-hybrid.md"]:
         assert phrase in text, f"README.md no longer mentions {phrase!r}"
 
 

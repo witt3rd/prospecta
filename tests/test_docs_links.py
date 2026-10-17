@@ -38,10 +38,15 @@ def markdown_files() -> list[Path]:
     return [p for p in out if not _skipped(p)]
 
 
+# An applied migration is never edited, so its comments are history: a doc it cites may be gone since.
+MIGRATIONS = ROOT / "prospecta" / "db" / "migrations"
+
+
 def code_files() -> list[Path]:
     out: list[Path] = []
     for pattern in CODE_GLOBS:
-        out.extend(p for p in ROOT.glob(pattern) if p.is_file() and not _skipped(p))
+        out.extend(p for p in ROOT.glob(pattern)
+                   if p.is_file() and not _skipped(p) and MIGRATIONS not in p.parents)
     return sorted(set(out) - {Path(__file__).resolve()})
 
 

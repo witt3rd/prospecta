@@ -11,8 +11,7 @@ import psycopg
 import pytest
 
 from prospecta.channels import (
-    DEFAULT_CHANNEL_CONFIG, QueryPlan, RecallState, build_channels, run_channels,
-    validate_channel_config,
+    REGISTRY, QueryPlan, RecallState, build_channels, run_channels, validate_channel_config,
 )
 from prospecta.db.queries import _stage1_statement, stage1_search
 from prospecta.memory import Memory
@@ -113,11 +112,23 @@ def test_minus_excludes_notes_with_the_word(memory_with_bank):
 
 
 def test_only_chunk_items_are_candidates(memory_with_bank):
-    memory_with_bank.retain("Gardens need rain.", source="q.md",
-                            index_text=["lighthouse lighthouse lighthouse"])
+    """An old bank holds `kind = 'question'` items beside its chunks (written raw: nothing writes them now)."""
+    memory_with_bank.retain("Gardens need rain.", source="q.md")
     memory_with_bank.retain("The lighthouse stands on the cliff.", source="c.md")
+    lit = "[" + ",".join(map(str, stub_embed(["lighthouse lighthouse lighthouse"])[0])) + "]"
+    with psycopg.connect(memory_with_bank.database_url) as conn:
+        conn.execute(
+            "INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding, kind) "
+            "SELECT 'test', d.id, 'lighthouse lighthouse lighthouse', d.original_text, %s::vector, 'question' "
+            "FROM documents d WHERE d.source = 'q.md'", (lit,))
+        conn.commit()
     rows = search(memory_with_bank, "lighthouse")
-    assert {r["source"] for r in rows} == {"c.md"}
+    with psycopg.connect(memory_with_bank.database_url) as conn:
+        kinds = {k for (k,) in conn.execute(
+            "SELECT kind FROM memory_items WHERE id = ANY(%s::uuid[])", ([str(r["id"]) for r in rows],))}
+        question_id = str(conn.execute("SELECT id FROM memory_items WHERE kind = 'question'").fetchone()[0])
+    assert rows and kinds == {"chunk"} and question_id not in {str(r["id"]) for r in rows}
+    assert "c.md" in {r["source"] for r in rows}
 
 
 # --------------------------------------------------------------------------
@@ -289,10 +300,10 @@ def state_for(conn, **kw):
     return RecallState(conn=conn, bank_id="test", embed=stub_embed, **kw)
 
 
-def test_channel_is_registered_and_opt_in():
+def test_channel_is_registered_and_the_only_one():
     validate_channel_config([{"name": "hybrid_chunk", "weight": 1}])
     assert [c.name for c in build_channels([{"name": "hybrid_chunk"}])] == ["hybrid_chunk"]
-    assert "hybrid_chunk" not in [e["name"] for e in DEFAULT_CHANNEL_CONFIG]
+    assert list(REGISTRY) == ["hybrid_chunk"]
 
 
 @pytest.mark.parametrize("params", [{"semantic_limit": 0}, {"exact_limit": -1}, {"fused_limit": 2.5},

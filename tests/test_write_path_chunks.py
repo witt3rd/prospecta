@@ -1,10 +1,9 @@
 """Hybrid plan slice 1: the write path indexes a note's chunks directly.
 
 retain() writes kind='chunk' items (content = original_chunk = the chunk) with
-no model call and stamps documents.created_on on every note (the model-written
-anticipated questions of `generate_questions=True` were removed). The directory
-indexer writes its chunks as kind='chunk' as well. Existing question items and
-an explicit `index_text` keep working (tests/test_retain_roundtrip.py)."""
+no model call and stamps documents.created_on on every note. The directory
+indexer writes its chunks as kind='chunk' as well. (Question items, written by
+a call that was removed, stay in an old bank; tests/test_legacy_removed.py.)"""
 from __future__ import annotations
 
 import datetime as dt
@@ -62,14 +61,12 @@ def test_default_retain_writes_searchable_chunk_items(memory_with_bank):
     assert rows[0][4] == 0 and rows[-1][5] == len(BODY.rstrip())   # the chunks cover the note
 
 
-def test_default_retain_is_found_by_lexical_and_channel_recall(memory_with_bank):
-    from prospecta._test_helpers import no_cut
-    from prospecta.channels import DEFAULT_CHANNEL_CONFIG
+def test_retain_is_found_by_stage_1(memory_with_bank):
     mem = memory_with_bank
     mem.retain(BODY, source="harbour.md")
     mem.retain("Orchids need humid air.", source="orchids.md")
-    assert mem.search("lighthouse", mode="lexical")[0].source == "harbour.md"
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
+    hit = mem.search("lighthouse", limit=1)[0]
+    assert hit.source == "harbour.md" and hit.match_kind == "exact+semantic"
     assert mem.search("harbour lighthouse beacon", limit=1)[0].source == "harbour.md"
 
 
@@ -81,18 +78,6 @@ def test_retain_replace_regenerates_chunks_only(memory_with_bank):
     assert {r[0] for r in rows} == {"chunk"}
     with psycopg.connect(memory_with_bank.database_url) as conn:
         assert conn.execute("SELECT count(*) FROM memory_items").fetchone()[0] == len(rows)
-
-
-# --------------------------------------------------------------------------
-# retain(): index_text still wins
-# --------------------------------------------------------------------------
-
-def test_index_text_wins_and_writes_no_chunks_unless_asked(memory_with_bank_and_mock_llm, mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    doc = mem.retain(BODY, source="harbour.md", index_text=["Where is the lighthouse?"])
-    assert mock_llm.calls == []
-    assert [(r[0], r[1]) for r in _items(mem.database_url, doc)] == [
-        ("question", "Where is the lighthouse?")]
 
 
 # --------------------------------------------------------------------------
@@ -123,15 +108,15 @@ def test_note_date_comes_from_frontmatter_then_metadata_kwarg(memory_with_bank):
     assert str(_created_on(memory_with_bank.database_url, b)) == "2023-01-02"
 
 
-def test_every_write_variant_is_stamped(memory_with_bank_and_mock_llm):
+def test_every_write_is_stamped(memory_with_bank_and_mock_llm, tmp_path):
     mem = memory_with_bank_and_mock_llm
-    docs = [mem.retain("one", source="1", index_text="q?"),
-            mem.retain("two", source="2", index_text="q2?", child_chunks=True),
-            mem.retain("three", source="3", child_chunks=True)]
+    docs = [mem.retain("one", source="1"),
+            mem.retain("two", source="2", tags=["t"], metadata={"created_on": "2023-01-02"}),
+            mem.retain("three", path=tmp_path / "three.md")]
     assert all(_created_on(mem.database_url, d) is not None for d in docs)
 
 
-def test_re_retain_keeps_the_note_date_and_stamps_a_legacy_null(memory_with_bank):
+def test_re_retain_keeps_the_note_date_and_stamps_a_null(memory_with_bank):
     mem = memory_with_bank
     doc = mem.retain("A note retained twice.", source="twice.md")
     with psycopg.connect(mem.database_url) as conn:

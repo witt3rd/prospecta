@@ -93,13 +93,13 @@ def fresh_db(pg_container):
 
 @pytest.fixture
 def memory_with_bank(fresh_db):
-    """Memory wired with the deterministic stub embedder + a created LEGACY bank.
+    """Memory wired with the deterministic stub embedder + a bank created fresh.
 
-    32-dim bank named 'test' that stores the legacy config (channel_config [], recall_config {},
-    link_config {}: see tests/_legacy_bank.py). Stub LLM attached but T9 paths don't call it.
+    32-dim bank named 'test' with the new-bank defaults (channel_config = [hybrid_chunk], a
+    cross_encoder rerank that is not run: the Memory has no rerank transport). Stub LLM attached
+    but the write and search paths don't call it.
     """
     from prospecta.memory import Memory
-    from tests._legacy_bank import create_legacy_bank
     from tests._stub_embedder import EMBED_DIM, stub_embed, stub_llm
 
     mem = Memory(
@@ -108,18 +108,16 @@ def memory_with_bank(fresh_db):
         llm=stub_llm,
         embed=stub_embed,
     )
-    create_legacy_bank(mem, "test", embedding_dim=EMBED_DIM)
+    mem.create_bank("test", embedding_dim=EMBED_DIM)
     yield mem
     mem.close()
 
 
 @pytest.fixture
 def mock_llm():
-    """Deterministic LLM stub for retain/recall tests.
-
-    Conforms to LLMCallable Protocol. Records every call. Default behavior:
-    returns three question-shaped strings (newline-separated). Configure
-    per-test via mock_llm.set_response(callable) or mock_llm.canned = str.
+    """Deterministic LLM stub. Conforms to LLMCallable Protocol and records every call.
+    Default behavior: returns three question-shaped strings (newline-separated).
+    Configure per-test via mock_llm.set_response(callable) or mock_llm.canned = str.
     """
 
     class MockLlm:
@@ -148,9 +146,8 @@ def mock_llm():
 
 @pytest.fixture
 def memory_with_bank_and_mock_llm(fresh_db, mock_llm):
-    """Memory wired with stub embedder + mock_llm + a created LEGACY bank (tests/_legacy_bank.py)."""
+    """Memory wired with stub embedder + mock_llm + a bank created fresh."""
     from prospecta.memory import Memory
-    from tests._legacy_bank import create_legacy_bank
     from tests._stub_embedder import EMBED_DIM, stub_embed
 
     mem = Memory(
@@ -159,54 +156,32 @@ def memory_with_bank_and_mock_llm(fresh_db, mock_llm):
         llm=mock_llm,
         embed=stub_embed,
     )
-    create_legacy_bank(mem, "test", embedding_dim=EMBED_DIM)
+    mem.create_bank("test", embedding_dim=EMBED_DIM)
     yield mem
     mem.close()
 
 
 @pytest.fixture
 def populated_corpus(memory_with_bank_and_mock_llm):
-    """Memory with a small set of retained docs.
-
-    Uses retain() with index_text override so the mock_llm is NOT consumed
-    during seeding (P4 caller-wins). Tests can still inspect mock_llm.calls
-    cleanly after recall_synth fires.
-    """
+    """Memory with a small set of retained docs (no model is called: a write is chunks only)."""
     mem = memory_with_bank_and_mock_llm
     seeds = [
-        (
-            "kelly-bio",
-            "Kelly was born on March 4th, 1990 in San Diego. She loves the beach.",
-            ["When is Kelly's birthday?", "Where was Kelly born?"],
-        ),
-        (
-            "beach-note",
-            "The beach at La Jolla has cliffs and tidepools. Kelly visits often.",
-            ["What is at La Jolla beach?"],
-        ),
-        (
-            "forge-note",
-            "The forge bench stays warm between sessions. Sparks light the dark.",
-            ["What does the forge bench feel like?"],
-        ),
+        ("kelly-bio", "Kelly was born on March 4th, 1990 in San Diego. She loves the beach."),
+        ("beach-note", "The beach at La Jolla has cliffs and tidepools. Kelly visits often."),
+        ("forge-note", "The forge bench stays warm between sessions. Sparks light the dark."),
     ]
-    for source, body, idx in seeds:
-        mem.retain(body, index_text=idx, source=source)
+    for source, body in seeds:
+        mem.retain(body, source=source)
     return mem
 
 
 @pytest.fixture
 def tmp_corpus(tmp_path):
-    """A small markdown corpus with frontmatter `index_text` so indexing
-    does NOT require an LLM. T14 sweeper fixture."""
+    """A small markdown corpus: the sweeper fixture."""
     d = tmp_path / "corpus"
     d.mkdir()
-    (d / "doc1.md").write_text(
-        "---\nindex_text: 'first doc question'\n---\nBody one."
-    )
-    (d / "doc2.md").write_text(
-        "---\nindex_text: 'second doc question'\n---\nBody two."
-    )
+    (d / "doc1.md").write_text("Body one.")
+    (d / "doc2.md").write_text("Body two.")
     return d
 
 
@@ -239,20 +214,14 @@ def memory_with_recording_tracer(fresh_db, mock_llm, recording_tracer):
 
 @pytest.fixture
 def populated_corpus_with_recording_tracer(memory_with_recording_tracer):
-    """memory_with_recording_tracer + small set of retained docs.
-
-    Uses index_text override so the mock_llm is not consumed during seeding.
-    Tests can inspect the tracer's events after recall_synth fires.
-    """
+    """memory_with_recording_tracer + small set of retained docs."""
     mem = memory_with_recording_tracer
     seeds = [
-        ("kelly-bio", "Kelly was born on March 4th, 1990 in San Diego.",
-         ["When is Kelly's birthday?", "Where was Kelly born?"]),
-        ("beach-note", "La Jolla has cliffs and tidepools.",
-         ["What is at La Jolla beach?"]),
+        ("kelly-bio", "Kelly was born on March 4th, 1990 in San Diego."),
+        ("beach-note", "La Jolla has cliffs and tidepools."),
     ]
-    for source, body, idx in seeds:
-        mem.retain(body, index_text=idx, source=source)
+    for source, body in seeds:
+        mem.retain(body, source=source)
     # Clear seeded events so tests assert on the queries-under-test only.
     mem._tracer.clear()
     return mem

@@ -1,5 +1,5 @@
-"""0004_item_kind_parent: migration on a populated table, per-kind HNSW
-indexes, the chunker, and the opt-in child-chunk retain path."""
+"""0004_item_kind_parent: migration on a populated table, the chunk HNSW index,
+the chunker, and the chunk-only retain path."""
 from __future__ import annotations
 
 import psycopg
@@ -81,34 +81,28 @@ def _items(url, bank="test"):
         ).fetchall()
 
 
-def test_retain_default_writes_only_question_items(memory_with_bank, fresh_db):
-    memory_with_bank.retain("Body.\n\nMore body.", index_text=["What body?"], source="s1")
+def test_retain_writes_chunk_items_only(memory_with_bank, fresh_db):
+    memory_with_bank.retain("Body.\n\nMore body.", source="s1")
     rows = _items(fresh_db)
-    assert [r[0] for r in rows] == ["question"]
-    assert rows[0][1:4] == (None, None, None)
+    assert [r[0] for r in rows] == ["chunk"]
+    assert rows[0][1:4] == (0, 0, len("Body.\n\nMore body."))
     assert rows[0][5] == "Body.\n\nMore body."
 
 
-def test_retain_child_chunks_writes_chunks_with_parent(memory_with_bank, fresh_db):
+def test_retain_writes_chunks_with_their_parent(memory_with_bank, fresh_db):
     body = _paras(30, 30)
-    doc = memory_with_bank.retain(
-        body, index_text=["What is P1?", "What is P2?"], source="s2", child_chunks=True
-    )
+    doc = memory_with_bank.retain(body, source="s2")
     rows = _items(fresh_db)
-    chunks = [r for r in rows if r[0] == "chunk"]
-    qs = [r for r in rows if r[0] == "question"]
-    assert len(qs) == 2 and len(chunks) > 1
-    for i, r in enumerate(chunks):
+    assert len(rows) > 1 and {r[0] for r in rows} == {"chunk"}
+    for i, r in enumerate(rows):
         assert r[1] == i and str(r[4]) == doc
         assert len(r[5]) <= 1000 and body[r[2]:r[3]] == r[5]
-    # question items carry a bounded matching chunk, not the whole note
-    assert all(str(r[4]) == doc and len(r[5]) <= 1000 and r[5] in body for r in qs)
 
 
-def test_retain_child_chunks_replace_regenerates(memory_with_bank, fresh_db):
-    memory_with_bank.retain("same", index_text=["q"], source="s3", child_chunks=True)
-    memory_with_bank.retain("same", index_text=["q"], source="s3", child_chunks=True)
-    assert [r[0] for r in _items(fresh_db)] == ["chunk", "question"]
+def test_re_retain_replaces_the_chunks(memory_with_bank, fresh_db):
+    memory_with_bank.retain("same", source="s3")
+    memory_with_bank.retain("same", source="s3")
+    assert [r[0] for r in _items(fresh_db)] == ["chunk"]
 
 
 # --------------------------------------------------------------------------
@@ -159,11 +153,12 @@ def populated_v3(pg_container):
                 "INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding) "
                 "VALUES ('live', %s, %s, 'body', %s::vector)", (doc, f"q{i}", _vec(i)))
         conn.commit()
-    # the old per-bank index exists, as on a live bank
-    from prospecta.db.queries import HNSW_INDEX_TEMPLATE, hnsw_index_name
+    # the old bank-wide index exists, as on a live bank (the library no longer builds it)
     with psycopg.connect(url, autocommit=True) as c:
-        c.execute(HNSW_INDEX_TEMPLATE.format(
-            index_name=hnsw_index_name("live"), bank_id_literal="live", embedding_dim=EMBED_DIM))
+        c.execute(
+            "CREATE INDEX memory_items_embedding_live_idx ON memory_items "
+            f"USING hnsw ((embedding::vector({EMBED_DIM})) vector_cosine_ops) "
+            "WITH (m = 16, ef_construction = 64) WHERE bank_id = 'live'")
     yield url
     with psycopg.connect(base, autocommit=True) as c:
         c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -190,10 +185,10 @@ def test_migration_on_populated_table(populated_v3):
             "SELECT indexname, indexdef FROM pg_indexes WHERE tablename='memory_items'")}
         assert "memory_items_bank_kind_idx" in idx
         assert "memory_items_embedding_live_idx" in idx  # old index kept
-        for kind in ("question", "chunk"):
-            d = idx[hnsw_kind_index_name("live", kind)]
-            assert "hnsw" in d and f"vector({EMBED_DIM})" in d
-            assert "bank_id = 'live'" in d and f"kind = '{kind}'" in d
+        d = idx[hnsw_kind_index_name("live", "chunk")]
+        assert "hnsw" in d and f"vector({EMBED_DIM})" in d
+        assert "bank_id = 'live'" in d and "kind = 'chunk'" in d
+        assert not any(n.endswith("_question_idx") for n in idx)       # nothing reads question items: none built
         valid = c.execute(
             "SELECT bool_and(indisvalid) FROM pg_index WHERE indrelid='memory_items'::regclass"
         ).fetchone()[0]
@@ -226,7 +221,6 @@ def test_finish_0004_runs_after_crash_post_commit(populated_v3):
             "SELECT indexname FROM pg_indexes WHERE tablename='memory_items'")}
     assert "memory_items_bank_kind_idx" in names
     assert hnsw_kind_index_name("live", "chunk") in names
-    assert hnsw_kind_index_name("live", "question") in names
 
 
 def test_invalid_index_is_rebuilt(populated_v3):
@@ -267,22 +261,27 @@ def test_kind_index_name_fits_and_is_unique_for_long_banks():
     a = hnsw_kind_index_name("x" * 63, "chunk")
     b = hnsw_kind_index_name("x" * 62 + "y", "chunk")
     assert len(a) <= 63 and len(b) <= 63 and a != b
-    assert hnsw_kind_index_name("my-bank", "question") == "memory_items_embedding_my_bank_question_idx"
+    assert hnsw_kind_index_name("my-bank", "chunk") == "memory_items_embedding_my_bank_chunk_idx"
+    with pytest.raises(ValueError):
+        hnsw_kind_index_name("my-bank", "question")       # no index is built for question items
 
 
-def test_create_bank_makes_per_kind_indexes(memory_with_bank, fresh_db):
+def test_create_bank_makes_the_chunk_index_only(memory_with_bank, fresh_db):
     with psycopg.connect(fresh_db) as c:
         names = {r[0] for r in c.execute(
-            "SELECT indexname FROM pg_indexes WHERE tablename='memory_items'")}
-    assert hnsw_kind_index_name("test", "chunk") in names
-    assert hnsw_kind_index_name("test", "question") in names
+            "SELECT indexname FROM pg_indexes WHERE tablename='memory_items' AND indexname LIKE 'memory_items_embedding%'")}
+    assert names == {hnsw_kind_index_name("test", "chunk")}
 
 
 def test_chunk_search_uses_partial_index_without_starvation(memory_with_bank, fresh_db):
-    # many question items, few chunk items: a kind filter must still return chunks
+    # an old bank: many question items, few chunk items; a kind filter must still return chunks
     for i in range(40):
-        memory_with_bank.retain(f"note {i} alpha", index_text=[f"question {i}"], source=f"n{i}")
-    memory_with_bank.retain("target chunk text", index_text=["tq"], source="t", child_chunks=True)
+        memory_with_bank.retain(f"note {i} alpha", source=f"n{i}")
+    with psycopg.connect(fresh_db) as c:
+        c.execute("UPDATE memory_items SET kind = 'question', ordinal = NULL, char_start = NULL, char_end = NULL "
+                  "WHERE content LIKE 'note % alpha'")
+        c.commit()
+    memory_with_bank.retain("target chunk text", source="t")
     q = "[" + ",".join(str(x) for x in stub_embed(["target chunk text"])[0]) + "]"
     with psycopg.connect(fresh_db) as c:
         c.execute("SET enable_seqscan = off")
@@ -303,8 +302,7 @@ FM_NOTE = (
 
 
 def test_retain_fills_document_metadata_and_strips_frontmatter(memory_with_bank, fresh_db):
-    doc = memory_with_bank.retain(FM_NOTE, index_text=["What did Greg ship?"],
-                                  source="2024-03-05-standup.md", child_chunks=True)
+    doc = memory_with_bank.retain(FM_NOTE, source="2024-03-05-standup.md")
     with psycopg.connect(fresh_db) as conn:
         meta, created_on, person = conn.execute(
             "SELECT document_metadata, created_on, person FROM documents WHERE id=%s", (doc,)
@@ -337,8 +335,8 @@ def test_prospecta_doc_date_prefers_created_on(fresh_db):
 def test_build_items_header_uses_note_date_and_person(memory_with_bank, fresh_db):
     from prospecta.channels.fusion import FusedDoc
     from prospecta.stages import build_items
-    doc = memory_with_bank.retain(FM_NOTE, index_text=["q"], source="n.md")
-    undated = memory_with_bank.retain("plain note", index_text=["q2"], source="2022-01-09-x.md")
+    doc = memory_with_bank.retain(FM_NOTE, source="n.md")
+    undated = memory_with_bank.retain("plain note", source="2022-01-09-x.md")
     with psycopg.connect(fresh_db) as conn:
         # a row from before retain stamped created_on: the filename date still dates it
         conn.execute("UPDATE documents SET created_on = NULL WHERE id = %s", (undated,))
@@ -348,13 +346,12 @@ def test_build_items_header_uses_note_date_and_person(memory_with_bank, fresh_db
     assert "date: 2022-01-09" in items[1].header
 
 
-def test_index_text_note_also_writes_body_chunks(memory_with_bank, tmp_path, fresh_db):
+def test_an_index_text_frontmatter_key_is_only_frontmatter(memory_with_bank, tmp_path, fresh_db):
     f = tmp_path / "n.md"
     f.write_text('---\nindex_text: "What did Greg ship?"\ncreated: 2024-03-05\n---\n'
                  "# Body\n\nGreg shipped the importer.")
     memory_with_bank.index_directory(tmp_path)
     with psycopg.connect(fresh_db) as conn:
         rows = conn.execute("SELECT kind, original_chunk FROM memory_items ORDER BY kind").fetchall()
-    kinds = [r[0] for r in rows]
-    assert kinds == ["chunk", "question"]
+    assert [r[0] for r in rows] == ["chunk"]
     assert "index_text" not in rows[0][1] and "importer" in rows[0][1]

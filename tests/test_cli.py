@@ -91,7 +91,6 @@ def test_cli_retain(memory_with_bank_and_mock_llm, capsys, monkeypatch):
     from prospecta.cli.__main__ import main
 
     mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = "q1\nq2\nq3"  # type: ignore[attr-defined]
     monkeypatch.setattr(_common, "make_memory", lambda args: mem)
     rc = main(
         ["retain", "long content body", "--source", "test", "--tags", "foo,bar"]
@@ -102,28 +101,14 @@ def test_cli_retain(memory_with_bank_and_mock_llm, capsys, monkeypatch):
     assert len(out) >= 32
 
 
-def test_cli_retain_with_index_text_bypasses_llm(
-    memory_with_bank_and_mock_llm, monkeypatch
-):
+def test_cli_retain_calls_no_model(memory_with_bank_and_mock_llm, monkeypatch):
     from prospecta.cli import _common
     from prospecta.cli.__main__ import main
 
     mem = memory_with_bank_and_mock_llm
     monkeypatch.setattr(_common, "make_memory", lambda args: mem)
-    rc = main(
-        [
-            "retain",
-            "body",
-            "--index-text",
-            "q1",
-            "--index-text",
-            "q2",
-            "--source",
-            "t",
-        ]
-    )
+    rc = main(["retain", "body", "--source", "t"])
     assert rc == 0
-    # P4: caller-supplied index_text bypasses LLM
     assert mem._llm.calls == []  # type: ignore[attr-defined]
 
 
@@ -139,8 +124,6 @@ def test_cli_retain_at_file(memory_with_bank_and_mock_llm, tmp_path, monkeypatch
         [
             "retain",
             f"@{body_file}",
-            "--index-text",
-            "q",
             "--source",
             "disk-test",
         ]

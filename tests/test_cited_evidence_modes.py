@@ -137,15 +137,16 @@ def test_relevance_is_the_cross_encoder_score_and_otherwise_the_fused_score(fres
         plain.close()
 
 
-def test_hits_of_a_bank_without_channels_still_say_where_and_when(fresh_db):
-    legacy = build(fresh_db)
+def test_hits_of_a_bank_without_channels_say_where_and_when_and_why(fresh_db):
+    """No channel config means hybrid_chunk with its defaults: the hits are cited the same way."""
+    bare = build(fresh_db)
     try:
-        legacy.set_channel_config([])
-        h = hit(legacy.search("electric dreams", limit=4), "phrase.md")
+        bare.set_channel_config([])
+        h = hit(bare.search("electric dreams", limit=4), "phrase.md")
         assert (h.created_on, h.kind) == ("2024-04-01", "note") and h.relevance_score == h.score
-        assert h.match_kind is None and h.exact_snippet is None
+        assert h.match_kind == "exact+semantic" and "<<electric>> <<dreams>>" in h.exact_snippet
     finally:
-        legacy.close()
+        bare.close()
 
 
 def test_match_kind_names_why_a_note_matched():
@@ -188,16 +189,17 @@ def test_search_pushes_the_date_window_and_excluded_sources_into_stage_1(mem):
     assert "phrase.md" not in {h.source for h in mem.recall([q], limit=10, excluded_sources=["phrase.md"])}
 
 
-def test_stage_1_filters_need_the_hybrid_channel(fresh_db):
+def test_stage_1_filters_apply_whatever_the_stored_channel_config_names(fresh_db):
+    """A stored config that names a removed channel, or none, runs hybrid_chunk: the filters apply (they
+    used to raise where hybrid_chunk did not run)."""
     other = build(fresh_db)
     try:
-        other.set_channel_config([{"name": "dense_chunk", "weight": 1}])
-        with pytest.raises(ValueError, match="hybrid_chunk"):
-            other.search("crew", excluded_sources=["phrase.md"])
-        other.set_channel_config([])
-        with pytest.raises(ValueError, match="hybrid_chunk"):
-            other.search("crew", date_from="2024-01-01")
-        assert other.search("crew")      # no filter, no problem
+        for stored in ([{"name": "dense_chunk", "weight": 1}], []):
+            with psycopg.connect(fresh_db) as c:
+                c.execute("UPDATE banks SET channel_config = %s::jsonb WHERE bank_id = 'b'", (json.dumps(stored),))
+                c.commit()
+            assert "phrase.md" not in {h.source for h in other.search("crew", excluded_sources=["phrase.md"])}
+            assert other.search("crew", date_from="2024-01-01")
     finally:
         other.close()
 
@@ -259,9 +261,8 @@ def test_lookup_passes_filters_and_models_and_refuses_bad_ones(svc, mem):
         with pytest.raises(ApiError) as e:
             svc.lookup({"questions": ["crew"], **bad})
         assert e.value.status == 400
-    mem.set_channel_config([])
-    with pytest.raises(ApiError, match="hybrid_chunk"):
-        svc.lookup({"questions": ["crew"], "date_from": "2024-01-01"})
+    mem.set_channel_config([])         # the default channel: the filters still apply
+    assert svc.lookup({"questions": ["crew"], "date_from": "2024-01-01"})["results"][0]["results"] is not None
 
 
 # --------------------------------------------------------------------------

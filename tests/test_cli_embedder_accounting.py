@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 
-from prospecta._formulate import formulate_queries
-from prospecta._rag import synthesize
-from prospecta.channels.extract import extract_filters
+from prospecta._llmutil import accepts_model, llm_call_record, llm_text
 from prospecta.cli import _common, health
 from prospecta.stages import LLMResult
 
@@ -71,11 +68,17 @@ def _accounted(text):
 
 
 def test_every_llm_user_accepts_llmresult():
-    qs, out = formulate_queries("hello", llm=_accounted('{"queries":[{"text":"a"}]}'))
-    assert [q.text for q in qs] == ["a"] and not out.parse_fallback
-    assert synthesize("q", [], _accounted("answer"))[0] == "answer"
-    calls: list = []
-    f = extract_filters("what did greg say", llm=_accounted('{"people":["Greg"],"hard":true}'),
-                        people_vocab=["Greg"], now=datetime(2026, 1, 1), calls=calls)
-    assert f.people == ["Greg"] and f.hard
-    assert calls[0]["purpose"] == "extract_filters" and calls[0]["cost_usd"] == 0.5
+    """The query writer, `ask` and the judge read a reply through llm_text / llm_call_record: a bare
+    string or an accounted LLMResult (tests/test_expand.py and tests/test_cited_evidence_modes.py run
+    those callers end to end)."""
+    out = _accounted("answer")([])
+    assert llm_text(out) == "answer" and llm_text("bare") == "bare"
+    rec = llm_call_record(out, purpose="ask_cited")
+    assert rec["cost_usd"] == 0.5 and rec["model"] == "m" and rec["purpose"] == "ask_cited"
+    assert llm_call_record("bare", purpose="p", model="x")["model"] == "x"
+
+
+def test_accepts_model_reads_the_signature():
+    assert accepts_model(lambda messages, *, json_mode=False, model=None: "")
+    assert accepts_model(lambda messages, **kw: "")
+    assert not accepts_model(lambda messages, *, json_mode=False: "")

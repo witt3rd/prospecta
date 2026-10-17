@@ -10,8 +10,9 @@ import pytest
 PROMPTS_DIR = Path(__file__).parent.parent / "prospecta" / "prompts"
 
 PROSPECTA_PROMPTS = [
-    "formulate-queries.md",
-    "rag-synthesize.md",
+    "ask-cited.md",
+    "expand-searches.md",
+    "judge-answer.md",
 ]
 
 # Forbidden references (case-insensitive check)
@@ -56,15 +57,3 @@ def test_prompt_has_no_forbidden_glyphs(prompt_file, glyph):
     assert glyph not in text, (
         f"{prompt_file} contains glyph '{glyph}' — translation incomplete"
     )
-
-
-def test_formulate_queries_specifies_json_mode():
-    text = (PROMPTS_DIR / "formulate-queries.md").read_text()
-    assert "json" in text.lower() or "JSON" in text
-    assert '{"queries"' in text or '"queries":' in text
-
-
-def test_formulate_queries_no_scope_prefixes():
-    text = (PROMPTS_DIR / "formulate-queries.md").read_text()
-    assert "[person]" not in text
-    assert "[general]" not in text

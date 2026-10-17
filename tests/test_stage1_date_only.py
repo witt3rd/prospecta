@@ -135,9 +135,12 @@ def test_other_banks_and_question_items_never_appear(mem, fresh_db):
     other.create_bank("other", embedding_dim=EMBED_DIM)
     try:
         other.retain("A note of another bank.", source="o.md", metadata={"created_on": "2024-03-06"})
-        mem.retain("A model-written question lives next to its chunk.", source="q.md",
-                   index_text="what lives next to its chunk", metadata={"created_on": "2024-03-07"})
+        mem.retain("Nothing about questions lives here.", source="q.md", metadata={"created_on": "2024-03-07"})
         with psycopg.connect(mem.database_url) as conn:
+            conn.execute(          # an old bank's question item (written raw: nothing writes them now)
+                "UPDATE memory_items SET kind = 'question' WHERE document_id IN "
+                "(SELECT id FROM documents WHERE source = 'q.md')")
+            conn.commit()
             kinds = {k for (k,) in conn.execute(
                 "SELECT m.kind FROM memory_items m JOIN documents d ON d.id = m.document_id "
                 "WHERE d.source = 'q.md'")}

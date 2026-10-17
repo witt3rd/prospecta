@@ -60,19 +60,13 @@ def test_search_accepts_depth(mem, cuts):
     assert cuts[-1] == 0.05
 
 
-def test_grounded_set_question_defaults_to_deep(mem, cuts):
+def test_ask_takes_depth(mem, cuts):
     mem._rerank_transport = cross_encoder_transport({"alpha": 0.9})
+    mem._llm = lambda *a, **k: "an answer [1]"
     mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
-    mem._llm = lambda *a, **k: json.dumps({"answer": "x", "citations": []})
-    try:
-        mem.recall_synth(QUERY, grounded=True, scope=["alpha.md", "bravo.md"])
-    except Exception:
-        pass  # the stub reply need not be a valid grounded answer; the recall ran
+    mem.ask(QUERY, depth="deep")
     assert cuts[-1] == 0.05
-    try:
-        mem.recall_synth(QUERY, grounded=True, scope=["alpha.md"], depth="standard")
-    except Exception:
-        pass
+    mem.ask(QUERY)
     assert cuts[-1] == 0.15
 
 

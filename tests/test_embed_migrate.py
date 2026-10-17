@@ -1,4 +1,4 @@
-"""Bank embedding migration (design 8.4): backfill, resume, shadow reads,
+"""Bank re-embedding into '<bank>-v2' (design 8.4): chunk-only backfill, resume, shadow reads,
 and a dump -> restore-into-scratch -> migrate rehearsal. All with stub
 embedders; never a live database."""
 from __future__ import annotations
@@ -30,14 +30,25 @@ def _paras(n, size, tag=""):
 
 @pytest.fixture
 def old_bank(memory_with_bank):
-    """'test' 32-d bank: 5 docs (3 multi-chunk), 2 questions each."""
+    """'test' 32-d bank: 5 docs (3 multi-chunk)."""
     m = memory_with_bank
     bodies = [_paras(1, 10, "a"), _paras(12, 30, "b"), _paras(20, 30, "c"),
               _paras(2, 20, "d"), _paras(15, 30, "e")]
     for i, body in enumerate(bodies):
-        m.retain(body, index_text=[f"What is doc {i}?", f"Who wrote doc {i}?"],
-                 source=f"src{i}")
+        m.retain(body, source=f"src{i}")
     return m
+
+
+def _add_question_items(url, bank):
+    """The question items an old bank holds beside its chunks (written raw: nothing writes them now)."""
+    with psycopg.connect(url) as c:
+        for doc_id, i in c.execute("SELECT id, row_number() OVER (ORDER BY source) FROM documents "
+                                   "WHERE bank_id = %s", (bank,)).fetchall():
+            for q in (f"What is doc {i}?", f"Who wrote doc {i}?"):
+                lit = "[" + ",".join(map(str, stub_embed([q])[0])) + "]"
+                c.execute("INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding, kind) "
+                          "VALUES (%s, %s, %s, 'body', %s::vector, 'question')", (bank, doc_id, q, lit))
+        c.commit()
 
 
 def _snapshot(url, bank):
@@ -57,11 +68,12 @@ def _counts(url, bank):
 
 
 def test_migrate_creates_v2_bank_and_backfills(old_bank, fresh_db):
+    _add_question_items(fresh_db, "test")        # an old bank: its question items are not copied
     before = _snapshot(fresh_db, "test")
     r = migrate_bank(old_bank, "test", embed=embed64, embedding_dim=NEW_DIM,
                      embedding_model_id="openai/text-embedding-3-large@1536")
     assert r.target_bank == "test-v2" and r.remaining == 0
-    assert r.documents_migrated == 5 and r.questions_inserted == 10
+    assert r.documents_migrated == 5 and not hasattr(r, "questions_inserted")
     with psycopg.connect(fresh_db) as c:
         dim, model = c.execute(
             "SELECT embedding_dim, embedding_model_id FROM banks WHERE bank_id='test-v2'"
@@ -76,10 +88,8 @@ def test_migrate_creates_v2_bank_and_backfills(old_bank, fresh_db):
         assert rows and len(rows) == r.chunks_inserted
         for chunk, cs, ce, text, origin, vd in rows:
             assert text[cs:ce] == chunk and len(chunk) <= 1000 and origin and vd == NEW_DIM
-        qrows = c.execute(
-            "SELECT content, llm_generated, vector_dims(embedding) FROM memory_items "
-            "WHERE bank_id='test-v2' AND kind='question'").fetchall()
-        assert len(qrows) == 10 and all(q[2] == NEW_DIM for q in qrows)
+        assert {k for (k,) in c.execute(
+            "SELECT DISTINCT kind FROM memory_items WHERE bank_id='test-v2'")} == {"chunk"}
     # the old bank is untouched, row for row
     assert _snapshot(fresh_db, "test") == before
 
@@ -104,7 +114,7 @@ def test_migrate_crash_midway_then_resume_loses_and_duplicates_nothing(old_bank,
 
     def flaky(texts):
         calls["n"] += 1
-        if calls["n"] == 3:
+        if calls["n"] == 2:
             raise RuntimeError("provider down")
         return embed64(texts)
 
@@ -112,7 +122,7 @@ def test_migrate_crash_midway_then_resume_loses_and_duplicates_nothing(old_bank,
         migrate_bank(old_bank, "test", embed=flaky, embedding_dim=NEW_DIM,
                      batch_size=8, retries=0)
     partial, _ = _counts(fresh_db, "test-v2")
-    assert 0 <= partial < 5
+    assert 0 < partial < 5            # the first group of documents was written, the rest was not
     r = migrate_bank(old_bank, "test", embed=embed64, embedding_dim=NEW_DIM, batch_size=8)
     assert r.remaining == 0
     old_bank.create_bank("clean", embedding_dim=NEW_DIM)
@@ -131,7 +141,7 @@ def test_embed_batches_never_exceed_batch_size(old_bank, batch_size):
     r = migrate_bank(old_bank, "test", embed=rec, embedding_dim=NEW_DIM,
                      batch_size=batch_size)
     assert max(sizes) <= batch_size and r.embed_batches == len(sizes)
-    assert sum(sizes) == r.chunks_inserted + r.questions_inserted
+    assert sum(sizes) == r.chunks_inserted
     assert batch_size == 128 or any(s == batch_size for s in sizes)  # full batches used
 
 
@@ -167,7 +177,7 @@ def test_shadow_recall_stores_old_and_new_events(old_bank, fresh_db):
     m = Memory(database_url=fresh_db, bank_id="test", embed=stub_embed,
                shadow_bank_id="test-v2", shadow_embed=embed64)
     try:
-        res = m.recall(["What is doc 1?"], limit=5, mode="semantic")
+        res = m.recall(["What is doc 1?"], limit=5)
     finally:
         m.close()
     assert res and all(r.bank_id == "test" for r in res)  # caller sees old only
@@ -192,7 +202,7 @@ def test_shadow_failure_never_breaks_recall(old_bank, fresh_db):
     m = Memory(database_url=fresh_db, bank_id="test", embed=stub_embed,
                shadow_bank_id="test-v2", shadow_embed=boom)
     try:
-        res = m.recall(["What is doc 1?"], limit=5, mode="semantic")
+        res = m.recall(["What is doc 1?"], limit=5)
     finally:
         m.close()
     assert res
@@ -204,7 +214,7 @@ def test_shadow_failure_never_breaks_recall(old_bank, fresh_db):
 
 
 def test_no_shadow_by_default_writes_one_event(old_bank, fresh_db):
-    old_bank.recall(["What is doc 1?"], limit=3, mode="semantic")
+    old_bank.recall(["What is doc 1?"], limit=3)
     with psycopg.connect(fresh_db) as c:
         assert c.execute("SELECT count(*) FROM recall_events").fetchone()[0] == 1
 
