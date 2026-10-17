@@ -133,8 +133,8 @@ with the reason and does not stop the others. Repeating a call changes nothing
 once the first has been applied.
 
 References are processed on a bounded pool of worker threads that borrow from the
-service's shared connection pool (chunking, the anticipated-question model call, embedding
-and writes all run in the worker). The size is `PROSPECTA_INDEX_CONCURRENCY`
+service's shared connection pool (chunking, embedding and writes, and the
+anticipated-question model call when enabled, all run in the worker). The size is `PROSPECTA_INDEX_CONCURRENCY`
 (default 8, and never more than the connection pool's size); a request may lower or raise it with `"concurrency"` (1..32, else
 400). Extra references wait in a queue; none is refused. Results are the same as
 a sequential run (same counts, same `unreadable` list in request order, same
@@ -161,8 +161,9 @@ Environment: `DATABASE_URL`, `PROSPECTA_SCHEMA`, `PROSPECTA_SOURCE_SCHEMA`,
 `PROSPECTA_EMBEDDING_DIM`, `PROSPECTA_SERVICE_HOST` (default 127.0.0.1),
 `PROSPECTA_SERVICE_PORT` (8080), `PROSPECTA_SERVICE_TOKEN` (bearer token;
 required to listen on a non-loopback address), and the usual embedder/LLM
-variables. Without an LLM only chunk items are written; with one, anticipated
-questions too. The host decides when to call `/index` (for example after a
+variables. Only chunk items are written (no model call at index time); anticipated
+questions too only when a library caller builds `SourceIndexer(..., generate_questions=True)`
+(needs an LLM). The host decides when to call `/index` (for example after a
 change) and can use `/coverage` to find what to re-send.
 
 ```

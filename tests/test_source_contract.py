@@ -45,7 +45,7 @@ def env(bare_db):  # noqa: F811
                  llm=lambda messages, **k: "What is the first thing?\nWhy does the second thing matter?",
                  schema="prospecta_shared")
     mem.create_bank("b", embedding_dim=EMBED_DIM)
-    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)))
+    ix = SourceIndexer(mem, SourceConfig("host_app", ("records",)), generate_questions=True)
     yield bare_db, mem, ix
     mem.close()
 
@@ -87,6 +87,23 @@ def test_index_is_idempotent_and_keeps_no_text(env):
     # nothing written into the host's schema
     assert _q(url, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                    "WHERE n.nspname='host_app'")[0][0] == 3   # notes, its pkey index, records view
+
+
+def test_index_makes_no_model_call_unless_questions_are_asked_for(env):
+    url, mem, asking = env
+    calls = []
+    mem._llm = lambda messages, **k: calls.append(messages) or "What is the first thing?"
+    plain = SourceIndexer(mem, SourceConfig("host_app", ("records",)))
+    _note(url, 1)
+    assert plain.index_record("note", "1").items >= 1
+    assert calls == [] and {k for k, _ in _items(url, "1")} == {"chunk"}
+    _note(url, 2)
+    asking.index_record("note", "2")
+    kinds = [k for k, _ in _items(url, "2")]
+    assert len(calls) == 1 and kinds.count("question") == 1 and kinds.count("chunk") >= 1
+    mem._llm = None
+    with pytest.raises(ValueError, match="llm"):
+        SourceIndexer(mem, SourceConfig("host_app", ("records",)), generate_questions=True)
 
 
 def test_revision_change_retires_old_items(env):
@@ -449,7 +466,8 @@ def _indexer(url, bank, llm=_slow_llm, concurrency=1):
     mem = Memory(database_url=url, bank_id=bank, embed=stub_embed, llm=llm,
                  schema="prospecta_shared")
     mem.create_bank(bank, embedding_dim=EMBED_DIM)
-    return mem, SourceIndexer(mem, SourceConfig("host_app", ("records",)), concurrency)
+    return mem, SourceIndexer(mem, SourceConfig("host_app", ("records",)), concurrency,
+                              generate_questions=True)
 
 
 def _snapshot(url, bank):

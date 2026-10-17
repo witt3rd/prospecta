@@ -79,7 +79,7 @@ def test_caller_supplied_tracer_overrides_default(memory_with_recording_tracer, 
 def test_tracer_fires_on_retain(memory_with_recording_tracer):
     mem = memory_with_recording_tracer
     mem._mock_llm.canned = "q1\nq2"
-    mem.retain("the body content", source="t1")
+    mem.retain("the body content", source="t1", generate_questions=True)
     events = mem._tracer.by_name("retain")
     assert len(events) == 1
     assert events[0]["items_count"] == 2
@@ -144,7 +144,7 @@ def test_six_events_fire_end_to_end(memory_with_recording_tracer, tmp_corpus):
     mem = memory_with_recording_tracer
     mem._mock_llm.canned = "q1\nq2"
     # retain → fires 'retain' + 'llm_call' (for generate_index_text)
-    mem.retain("body content", source="t1")
+    mem.retain("body content", source="t1", generate_questions=True)
     # recall_synth → fires 'formulate_queries' + 'recall' + 'llm_call'
     mem._mock_llm.set_response(
         lambda messages, *, json_mode: (

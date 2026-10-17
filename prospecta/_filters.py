@@ -3,7 +3,12 @@ derived from parsed frontmatter and/or retain metadata (migration 0005)."""
 from __future__ import annotations
 
 import datetime as _dt
+import logging
+import os
 from typing import Any
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 _DATE_KEYS = ("created_on", "created", "date")
 _KIND_KEYS = ("source_kind", "type")
@@ -21,6 +26,19 @@ def coerce_date(value: Any) -> _dt.date | None:
         except ValueError:
             return None
     return None
+
+
+def today() -> _dt.date:
+    """The current date in the zone named by PROSPECTA_TIMEZONE (an IANA name such
+    as America/Los_Angeles); UTC when it is unset or not a known zone."""
+    name = os.environ.get("PROSPECTA_TIMEZONE")
+    zone = _dt.timezone.utc
+    if name:
+        try:
+            zone = ZoneInfo(name)
+        except (KeyError, ValueError, OSError):
+            logger.warning("PROSPECTA_TIMEZONE=%r is not a known time zone; using UTC", name)
+    return _dt.datetime.now(zone).date()
 
 
 def _text(value: Any) -> str | None:

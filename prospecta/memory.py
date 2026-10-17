@@ -518,9 +518,10 @@ class Memory:
         """Write-side bilateral spine. Returns document_id (str UUID).
 
         See prospecta._retain.retain for full signature and semantics:
+          - the note is indexed as kind='chunk' items, no LLM call
+          - caller-supplied index_text writes those question items instead (P4)
+          - generate_questions=True opts in to LLM-written question items
           - replace-on-source-match (schema.md §6)
-          - caller-supplied index_text bypasses LLM (P4)
-          - prompt_override bypasses default prompt (P4)
           - DocumentSourceConflictError on hash collision with different source
         """
         from prospecta import _retain

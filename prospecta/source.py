@@ -121,10 +121,16 @@ class Coverage:
 class SourceIndexer:
     """Index/remove/coverage over the host views, writing into a Memory's bank."""
 
-    def __init__(self, memory, config: SourceConfig, concurrency: int | None = None):
+    def __init__(self, memory, config: SourceConfig, concurrency: int | None = None,
+                 generate_questions: bool = False):
+        """By default a record is indexed as chunk items only, with no model call;
+        `generate_questions=True` (needs the Memory's `llm`) adds anticipated questions."""
+        if generate_questions and memory._llm is None:
+            raise ValueError("generate_questions=True requires Memory(llm=...)")
         self._m = memory
         self.config = config
         self.concurrency = default_concurrency() if concurrency is None else concurrency
+        self.generate_questions = generate_questions
 
     def _workers(self, concurrency: int | None) -> int:
         n = self.concurrency if concurrency is None else concurrency
@@ -305,7 +311,7 @@ class SourceIndexer:
         meta = ref_metadata(rec)
         items: list[dict] = []
         questions: list[str] = []
-        if body and m._llm is not None:
+        if body and self.generate_questions:
             from prospecta._index_text import generate_index_text
             questions, _p, _r = generate_index_text(
                 body, m._llm, context={"source": f"{rec['kind']}:{rec['record_id']}",

@@ -6,8 +6,13 @@ Replace-on-source-match per schema.md §6:
   - Same content_hash + DIFFERENT source → raise DocumentSourceConflictError.
   - New content_hash → INSERT new documents row.
 
+By default a note is indexed as its own chunks: kind='chunk' items whose
+content and original_chunk are the chunk text, with no model call. Question
+items exist only when the caller supplies `index_text` or asks for generated
+ones (`generate_questions=True`).
+
 P-principles enforced here:
-  P1 — memory_items.content holds question-shaped index_text strings; the
+  P1 — question items (opt-in) hold question-shaped index_text strings; the
        full body lives in documents.original_text.
   P3 — zero provider imports; uses memory.llm and memory.embed callables.
   P4 — caller-supplied index_text bypasses LLM; prompt_override bypasses
@@ -26,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prospecta._chunker import chunk_paragraphs
-from prospecta._filters import filter_fields
+from prospecta._filters import filter_fields, today
 from prospecta._index_text import generate_index_text
 from prospecta._types import DocumentSourceConflictError
 from prospecta.db.queries import (
@@ -49,6 +54,7 @@ def retain(
     content: str,
     *,
     index_text: str | list[str] | None = None,
+    generate_questions: bool = False,
     index_text_prompt_override: str | None = None,
     source: str | None = None,
     path: Path | str | None = None,
@@ -61,10 +67,20 @@ def retain(
 
     See plan-v2.md §3.4 for the canonical signature & semantics.
 
-    child_chunks (default False = unchanged behaviour): additionally write
-    the note as kind='chunk' items of at most 1,000 chars at paragraph
-    boundaries (small overlap), each carrying the parent document_id and its
-    ordinal / char offsets. The question items are written either way.
+    Default: the note is written as kind='chunk' items of at most 1,000 chars
+    at paragraph boundaries (small overlap), each carrying the parent
+    document_id and its ordinal / char offsets, and no model is called.
+
+    index_text: caller-supplied question strings, written as the note's
+    question items instead of the chunks (add child_chunks=True for both).
+    generate_questions (default False): ask the model for anticipated
+    questions and write those as question items instead of the chunks. It
+    needs `llm`, and `index_text_prompt_override` (the prompt template) only
+    applies with it; index_text and generate_questions exclude each other.
+    child_chunks: also write the chunk items next to the question items.
+
+    documents.created_on is always stamped: the note's own date (frontmatter
+    or metadata) else today's date in PROSPECTA_TIMEZONE (UTC when unset).
     """
     if memory._embed is None:
         raise RuntimeError(
@@ -76,6 +92,10 @@ def retain(
 
     if not isinstance(content, str):
         raise TypeError(f"content must be str, got {type(content).__name__}")
+    if index_text is not None and generate_questions:
+        raise ValueError("index_text and generate_questions are mutually exclusive")
+    if index_text_prompt_override is not None and not generate_questions:
+        raise ValueError("index_text_prompt_override applies only with generate_questions=True")
 
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -106,14 +126,15 @@ def retain(
     extra_metadata = dict(metadata or {})
 
     # ------------------------------------------------------------------
-    # Resolve index_text (P4: caller wins).
+    # Resolve index_text (P4: caller wins). No question strings at all is the
+    # default: the note is indexed as its chunks only.
     # ------------------------------------------------------------------
-    caller_supplied: bool
+    caller_supplied = index_text is not None
+    index_text_list: list[str] = []
     raw_llm_response: str | None = None
     rendered_prompt: str | None = None
     index_text_generated: list[str] | None = None
     if index_text is not None:
-        caller_supplied = True
         if isinstance(index_text, str):
             index_text_list = [index_text]
         elif isinstance(index_text, list):
@@ -126,12 +147,11 @@ def retain(
         index_text_list = _dedupe_strip(index_text_list)
         if not index_text_list:
             raise ValueError("index_text resolved to empty list after stripping")
-    else:
-        caller_supplied = False
+    elif generate_questions:
         if memory._llm is None:
             raise RuntimeError(
-                "Memory.retain requires an `llm` callable when index_text is not "
-                "supplied; construct Memory(llm=...) or pass index_text=..."
+                "Memory.retain(generate_questions=True) requires an `llm` callable; "
+                "construct Memory(llm=...)"
             )
         prompt_context: dict = {
             "tags": tags_list,
@@ -214,7 +234,7 @@ def retain(
         # ------------------------------------------------------------------
         # Embed + write memory_items.
         # ------------------------------------------------------------------
-        vectors = memory._embed(index_text_list)
+        vectors = memory._embed(index_text_list) if index_text_list else []
         if len(vectors) != len(index_text_list):
             raise RuntimeError(
                 f"embed() returned {len(vectors)} vectors for "
@@ -239,7 +259,7 @@ def retain(
                 "update_mode": update_mode,
                 "llm_generated": not caller_supplied,
             })
-        if child_chunks:
+        if child_chunks or not index_text_list:
             chunk_vectors = memory._embed([c.content for c in chunks]) if chunks else []
             if len(chunk_vectors) != len(chunks):
                 raise RuntimeError(
@@ -352,7 +372,7 @@ def _insert_document(
                  tags, document_metadata, created_on, person, source_kind)
             VALUES (%(bank_id)s, %(source)s, %(original_text)s, %(content_hash)s,
                     %(tags)s, %(metadata)s::jsonb,
-                    %(created_on)s, %(person)s, %(source_kind)s)
+                    COALESCE(%(created_on)s, %(today)s), %(person)s, %(source_kind)s)
             RETURNING id
             """,
             {
@@ -362,6 +382,7 @@ def _insert_document(
                 "content_hash": content_hash,
                 "tags": list(tags),
                 "metadata": _json.dumps(_doc_metadata(metadata, original_text)),
+                "today": today(),
                 **filter_fields(metadata, _frontmatter(original_text)),
             },
         )
@@ -384,8 +405,8 @@ def _refresh_document(
             SET original_text = %(original_text)s,
                 tags = %(tags)s,
                 document_metadata = %(metadata)s::jsonb,
-                created_on = %(created_on)s, person = %(person)s,
-                source_kind = %(source_kind)s,
+                created_on = COALESCE(%(created_on)s, created_on, %(today)s),
+                person = %(person)s, source_kind = %(source_kind)s,
                 updated_at = now()
             WHERE id = %(id)s
             """,
@@ -394,6 +415,7 @@ def _refresh_document(
                 "original_text": original_text,
                 "tags": list(tags),
                 "metadata": _json.dumps(_doc_metadata(metadata, original_text)),
+                "today": today(),
                 **filter_fields(metadata, _frontmatter(original_text)),
             },
         )

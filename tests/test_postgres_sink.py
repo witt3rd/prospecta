@@ -67,7 +67,7 @@ def test_postgres_sink_writes_sweep_pass(memory_with_bank_and_mock_llm, tmp_corp
 def test_postgres_sink_writes_llm_call(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     mem._llm.canned = "q1"  # type: ignore[attr-defined]
-    mem.retain("content", source="test")
+    mem.retain("content", source="test", generate_questions=True)
     with psycopg.connect(mem.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(
