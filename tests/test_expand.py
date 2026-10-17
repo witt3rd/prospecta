@@ -15,7 +15,6 @@ from datetime import date
 
 import pytest
 
-from prospecta import _expand as ex
 from prospecta._expand import (
     DEFAULT_QUERY_WRITER_MODEL, apply_maximum, exact_query, guard_terms, merge_records, normalize_decision,
     parse_searches, render_writer_prompt, suggest_searches, verbatim_terms,
@@ -454,7 +453,9 @@ def test_a_failing_or_malformed_gate_lets_the_message_through(made):
         got = mem.expand_and_recall("what about the harbour lamps?", decision=Counting(answer))
         assert not got.skipped and got.items and any(f.startswith("gate failed") for f in got.fallbacks)
         assert "error" in got.gate
-    slow = lambda prompt, agent_last: time.sleep(2.5) or 0.0             # past the gate's share of the deadline
+    def slow(prompt, agent_last):                                        # past the gate's share of the deadline
+        time.sleep(2.5)
+        return 0.0
     t = time.monotonic()
     got = mem.expand_and_recall("what about the harbour lamps?", decision=slow, deadline=2.0)
     assert not got.skipped and got.items and time.monotonic() - t < 2.5
@@ -853,9 +854,10 @@ def test_without_stage_2_the_stage_1_order_stands_cut_by_relevance(made):
 
 def test_accounting_sums_the_gate_the_writer_and_every_rerank(made):
     llm = FakeWriter(raw=None, fn=lambda p: [S("bridge lamp relay incident"), S("pontoon survey due date")])
-    wrapped = lambda messages, *, json_mode=False, model=None: LLMResult(
-        text=llm(messages, json_mode=json_mode, model=model), model="writer/m", tokens_in=100, tokens_out=40,
-        cost_usd=0.001)
+
+    def wrapped(messages, *, json_mode=False, model=None):
+        return LLMResult(text=llm(messages, json_mode=json_mode, model=model), model="writer/m",
+                         tokens_in=100, tokens_out=40, cost_usd=0.001)
     mem = made(llm=wrapped, rerank=FakeRerank(), jev=FakeJev(0.9))
     got = mem.expand_and_recall("what happened to the lamps?")
     assert got.accounting == {"n_llm_calls": 4, "tokens_in": 100 + 7 + 2 * 10, "tokens_out": 41,

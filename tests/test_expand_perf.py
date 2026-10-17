@@ -18,12 +18,10 @@ import statistics
 import threading
 import time
 
-import psycopg
 import pytest
 
 from prospecta._tracer import NoOpTracer
 from prospecta.memory import Memory
-from prospecta.stages import JevScore
 from tests._synthetic_bank import load_bank, random_query_vector, vocabulary
 
 N_CHUNKS = int(os.environ.get("PROSPECTA_PERF_CHUNKS") or 0)
