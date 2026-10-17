@@ -1,11 +1,12 @@
 """Fixture banks that mirror the four live banks, for the tests that pin what removing the retired
 recall code must not change (tests/test_retrieval_golden.py, tests/test_retired_code.py).
 
-The four live banks as they were stored: `augur` and `forge` are legacy (channel_config `[]`,
-recall_config `{}`, link_config `{}`: the column defaults) and hold question items (and chunk children) and
-the rows of the retired linker (entities, aliases, links, link state); `augur-v2` and `forge-v2` hold
-chunk items only, with `hybrid_chunk` and a cross_encoder rerank set by hand and link_config `{}`.
-Invented text, the stub embedder, a fake reranker and a scripted model: nothing here is a real note."""
+The four banks as they were stored: `augur` and `forge` are old (channel_config `[]`, recall_config `{}`,
+link_config `{}`: the column defaults) and hold question items beside their chunks and the rows of the linker
+that once ran (entities, aliases, links, link state); `augur-v2` and `forge-v2` hold chunk items only, with
+`hybrid_chunk` and a cross_encoder rerank set by hand and link_config `{}`. The code that wrote the old rows is
+gone, so the fixture writes them raw. Invented text, the stub embedder, a fake reranker and a scripted
+model: nothing here is a real note."""
 from __future__ import annotations
 
 import hashlib
@@ -174,43 +175,55 @@ def make_memory(url: str, bank: str, **kw) -> Memory:
 
 
 def _question(source: str, text: str) -> list[str]:
-    """The anticipated question a model wrote for a note of a legacy bank. One per note, naming its
-    note, and no chunk children: two items of one note would score the same on the body text and
-    Postgres orders equal scores arbitrarily, which a golden file cannot pin."""
+    """The anticipated question a model once wrote for a note of an old bank. One per note, naming its note."""
     stem = re.sub(r"[^a-z0-9]+", " ", source.rsplit("/", 1)[-1].lower())
     words = re.findall(r"[A-Za-z]{6,}", text)[:3]
     return [f"What do we know about {' '.join(w.lower() for w in words)} in {stem}?"]
 
 
+def seed_question_items(url: str, bank: str) -> None:
+    """The `kind = 'question'` items an old bank holds: written raw, as the removed write path wrote them."""
+    with connect(url) as c:
+        docs = c.execute("SELECT id, source, original_text FROM documents WHERE bank_id = %s ORDER BY source",
+                         (bank,)).fetchall()
+        for doc_id, source, text in docs:
+            for question in _question(source, text):
+                vec = embed([question])[0]
+                lit = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                c.execute(
+                    "INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding, metadata, "
+                    "tags, update_mode, llm_generated, kind) VALUES (%s, %s, %s, %s, %s::vector, "
+                    "'{\"index_text_caller_supplied\": false}'::jsonb, '{}', 'append', true, 'question')",
+                    (bank, doc_id, question, text, lit))
+
+
 def build_bank(url: str, bank: str, corpus: str, *, legacy: bool, **memory_kw) -> Memory:
-    """One live-shaped bank. Legacy: question items, config `[]`/`{}`/`{}` and the
-    rows of a linker that once ran. Hybrid: chunk items, hybrid_chunk + cross_encoder set by hand."""
+    """One bank as stored. Old (`legacy=True`): chunks, question items, config `[]`/`{}`/`{}` and the rows of a
+    linker that once ran. Current: chunk items, hybrid_chunk + cross_encoder set by hand."""
     mem = make_memory(url, bank, **memory_kw)
     mem.create_bank(bank, embedding_dim=EMBED_DIM)
     for source, created_on, kind, person, text in CORPUS[corpus]:
         meta = {"created_on": created_on, "source_kind": kind, "project": "atlas"}
         if person:
             meta["person"] = person
-        if legacy:
-            mem.retain(text, source=source, metadata=meta, index_text=_question(source, text))
-        else:
-            mem.retain(text, source=source, metadata=meta)
+        mem.retain(text, source=source, metadata=meta)
     if legacy:
+        seed_question_items(url, bank)
         set_stored_config(url, bank, [], {}, {})
-        seed_retired_rows(url, bank)
+        seed_retired_rows(url, bank, "Mira Okafor" if corpus == "augur" else "Lena Sorokina")
     else:
         set_stored_config(url, bank, HYBRID, HAND_SET_RECALL, {})
     return mem
 
 
-def seed_retired_rows(url: str, bank: str) -> None:
+def seed_retired_rows(url: str, bank: str, person: str = "Mira Okafor") -> None:
     """The rows a bank that once ran the linker holds: entities, aliases, which item mentions which,
     links between items, link state, the pair cache. Written raw (the code that wrote them is gone)."""
     with connect(url) as c:
         docs = c.execute("SELECT id, source, original_text FROM documents WHERE bank_id = %s ORDER BY source",
                          (bank,)).fetchall()
-        ent = c.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) VALUES (%s, 'Mira Okafor', "
-                        "'mira okafor', 'person') RETURNING id", (bank,)).fetchone()[0]
+        ent = c.execute("INSERT INTO memory_entities (bank_id, name, norm, etype) VALUES (%s, %s, %s, 'person') "
+                        "RETURNING id", (bank, person, person.lower())).fetchone()[0]
         c.execute("INSERT INTO memory_entity_aliases (bank_id, norm, alias, entity_id) "
                   "VALUES (%s, 'mo', 'MO', %s)", (bank, ent))
         prev = None
@@ -219,7 +232,7 @@ def seed_retired_rows(url: str, bank: str) -> None:
                 "SELECT id FROM memory_items WHERE document_id = %s ORDER BY created_at, id",
                 (doc_id,)).fetchall()]
             for item in items:
-                if "Mira" in text:
+                if person.split()[0] in text:
                     c.execute("INSERT INTO memory_item_entities (item_id, entity_id) VALUES (%s, %s)", (item, ent))
                 if prev is not None and prev != item:
                     c.execute("INSERT INTO memory_links (bank_id, src, dst, link_type, subtype) "
