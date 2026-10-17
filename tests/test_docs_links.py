@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SKIP_DIRS = {".git", ".venv", "node_modules", "target", "__pycache__", ".pytest_cache", "fixtures"}
-MARKDOWN_ROOTS = ["README.md", "PRINCIPLES.md", "docs", "tui/README.md"]
+MARKDOWN_ROOTS = ["README.md", "PRINCIPLES.md", "AGENTS.md", "docs", "skills", "tui/README.md"]
 CODE_GLOBS = ["prospecta/**/*.py", "prospecta/**/*.sql", "tests/**/*.py", "scripts/*.py",
               "tui/src/**/*.rs", ".env.example", "Dockerfile", "pyproject.toml",
               "docker-compose.yml", ".github/workflows/*.yml"]
@@ -131,9 +131,17 @@ def test_every_doc_is_reachable_from_the_readme():
     frontier = ["README.md"]
     while frontier:
         cur = frontier.pop()
+        linked = set()          # the files a relative link of `cur` resolves to (skills link `references/x.md`)
+        for target in LINK.findall(text[cur]):
+            name = target.partition("#")[0]
+            if name and not re.match(r"[a-z][a-z0-9+.-]*:", name):
+                try:
+                    linked.add((ROOT / cur).parent.joinpath(name).resolve().relative_to(ROOT).as_posix())
+                except ValueError:
+                    pass
         for other in names:
             base = Path(other).name
-            if other not in reached and (other in text[cur] or f"]({base}" in text[cur]
+            if other not in reached and (other in linked or other in text[cur] or f"]({base}" in text[cur]
                                          or f"](./{base}" in text[cur]):
                 reached.add(other)
                 frontier.append(other)
