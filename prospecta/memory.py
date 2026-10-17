@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import psycopg
 
 from typing import Literal
 
-from prospecta._types import EmbedCallable, LLMCallable, Query, RAGResult, RecalledMemory, Tracer
+from prospecta._types import (
+    AskResult, EmbedCallable, LLMCallable, Query, RAGResult, RecalledMemory, TaskRecall, Tracer,
+)
 from prospecta.db.pool import ConnectionPool
 from prospecta.db.schema import check_schema_writable, resolve_schema, scoped_url
 from prospecta.db.queries import (
@@ -540,12 +543,26 @@ class Memory:
         metadata_filter: dict | None = None,
         rrf_k: int = 60,
         depth: "Literal['standard','deep'] | None" = None,
+        date_from: "date | str | None" = None,
+        date_to: "date | str | None" = None,
+        excluded_sources: "list[str] | None" = None,
+        reranker_model: str | None = None,
+        decision_model: str | None = None,
+        parallel: bool = False,
+        _by_query: "list[list[RecalledMemory]] | None" = None,
         _trace: "list[dict] | None" = None,
     ) -> "list[RecalledMemory]":
         """Run retrieval for multiple queries; return FLAT list[RecalledMemory].
 
         `_trace`, when given, receives the per-query channel traces (empty for
-        banks on the legacy path), so a caller can explain the hits.
+        banks on the legacy path), so a caller can explain the hits. `_by_query`
+        receives each query's own results, in query order.
+
+        `date_from` / `date_to` (the note's date, inclusive) and `excluded_sources`
+        (the anti-echo list of documents.source values) are pushed into Stage 1
+        and need the hybrid_chunk channel; `reranker_model` / `decision_model`
+        override the Stage 2 / Jev model for this call (see docs/recall-stages.md).
+        `parallel=True` runs the queries concurrently, each on its own connection.
 
         `depth` ('standard' | 'deep'; None = the bank's recall_config.depth,
         else 'standard') sets the rerank pool cut: 0.15 vs 0.05 x the best fused
@@ -570,17 +587,35 @@ class Memory:
         t_start = _time.monotonic()
         flat: list[RecalledMemory] = []
         traces: list[dict] = []
-        for q in coerced:
-            results = self.search(
+
+        def one(q):
+            own_trace: list[dict] = []
+            return self.search(
                 q.text,
                 mode=mode,
                 limit=limit,
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
-                _trace=traces,
+                _trace=own_trace,
                 depth=depth,
-            )
+                date_from=date_from,
+                date_to=date_to,
+                excluded_sources=excluded_sources,
+                reranker_model=reranker_model,
+                decision_model=decision_model,
+            ), own_trace
+
+        if parallel and len(coerced) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(coerced)) as pool:
+                ran = list(pool.map(one, coerced))
+        else:
+            ran = [one(q) for q in coerced]
+        for results, own_trace in ran:
             flat.extend(results)
+            traces.extend(own_trace)
+        if _by_query is not None:
+            _by_query.extend(results for results, _ in ran)
         duration_ms = int((_time.monotonic() - t_start) * 1000)
         self._emit_stage_calls(traces)
         if _trace is not None:
@@ -612,6 +647,170 @@ class Memory:
             )
 
         return flat
+
+    def _emit_calls(self, calls: "list[dict]") -> None:
+        """One llm_call event per model call record."""
+        self._emit_stage_calls([{"calls": calls}])
+
+    def recall_for_task(
+        self,
+        *,
+        title: str,
+        ask: str,
+        done: str | None = None,
+        project: str | None = None,
+        limit: int = 10,
+        max_facets: int = 4,
+        query_writer_model: str | None = None,
+        depth: "Literal['standard','deep'] | None" = None,
+        date_from: "date | str | None" = None,
+        date_to: "date | str | None" = None,
+        excluded_sources: "list[str] | None" = None,
+        reranker_model: str | None = None,
+        decision_model: str | None = None,
+    ) -> "TaskRecall":
+        """Mode 1B: recall for a non-interactive task (a commission, a wake, a background
+        job). The brief is split into 2 to `max_facets` facet queries by the query-writer
+        model (`query_writer_model`, else recall_config.models.query_writer_model, else
+        PROSPECTA_QUERY_WRITER_MODEL, else the default; without an `llm` the brief's own
+        title / ask / done are the queries), every facet runs Stage 1 + Stage 2 (in
+        parallel), and the notes merge, once each, into one cited block: those of
+        `project` first, notes of other projects labeled with theirs. There is no
+        needs-memory gate: a task always searches. Returns TaskRecall(queries, items, block).
+        """
+        from prospecta.cited import TASK_HEADING, format_cited_rag_block
+        from prospecta._task import decompose_brief, resolve_query_writer_model, scope_first
+        from prospecta.stages import read_recall_config
+
+        for name, value in (("title", title), ("ask", ask)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required (non-empty string)")
+        with self._pool.connection() as conn:
+            bank_models = read_recall_config(conn, self._default_bank_id).get("models") or {}
+            conn.rollback()
+        queries, calls = decompose_brief(
+            title, ask, done, project, llm=self._llm, max_facets=max_facets,
+            model=resolve_query_writer_model(query_writer_model, bank_models.get("query_writer_model")))
+        self._emit_calls(calls)
+        by_query: list[list[RecalledMemory]] = []
+        self.recall(
+            queries, limit=limit, depth=depth, date_from=date_from, date_to=date_to,
+            excluded_sources=excluded_sources, reranker_model=reranker_model,
+            decision_model=decision_model, parallel=True, _by_query=by_query)
+        items = scope_first(_interleave(dict(zip(queries, by_query))), project)[:limit]
+        return TaskRecall(queries=queries, items=items, block=format_cited_rag_block(
+            items, heading=TASK_HEADING, own_project=project))
+
+    def ask(
+        self,
+        question: str,
+        *,
+        limit: int = 8,
+        sufficiency: bool | None = None,
+        sufficiency_threshold: float | None = None,
+        depth: "Literal['standard','deep'] | None" = None,
+        metadata_filter: dict | None = None,
+        date_from: "date | str | None" = None,
+        date_to: "date | str | None" = None,
+        excluded_sources: "list[str] | None" = None,
+        reranker_model: str | None = None,
+        decision_model: str | None = None,
+    ) -> "AskResult":
+        """Mode 2B: interactive RAG. The question runs Stage 1 + Stage 2 (no needs-memory
+        gate: the user asked) and the best `limit` notes go to the synthesis model
+        (`synth_llm`, else `llm`), which answers from them alone and cites [n] for every
+        statement. AskResult.citations ties each [n] to its source, date and the verbatim
+        sentence of the chunk that supports it (plus the exact-match snippet when a lexical
+        retriever fired); `rendered` is the answer followed by its sources.
+
+        Stage 3 (off unless `sufficiency=True` or recall_config.stage3_sufficiency.enabled):
+        the decision model (`decision_model`, else the Memory's, else recall_config.models
+        .decision_model, else PROSPECTA_DECISION_MODEL, else typesafe/jev-1.14; needs
+        Memory(jev=...)) scores whether the evidence suffices; under the threshold
+        (`sufficiency_threshold`, else recall_config.stage3_sufficiency.threshold, else 0.70)
+        ONE broadened retrieval runs (deep rerank pool, twice the limit, the date window
+        dropped; excluded_sources and the metadata filter stay), its notes join the
+        evidence, and the model answers. A failing gate never blocks the answer: it is
+        recorded in AskResult.gate and `sufficient` is None. With no evidence at all the
+        answer is `not in memory` and no model is called.
+        """
+        import time as _time
+
+        from prospecta.cited import build_citations, format_cited_rag_block, render_answer
+        from prospecta._llmutil import llm_call_record, llm_text
+        from prospecta._template import render_prompt
+        from prospecta.stages import STAGE3_THRESHOLD, read_recall_config
+
+        llm = self._synth_llm or self._llm
+        if llm is None:
+            raise RuntimeError(
+                "Memory.ask requires an `llm` callable; construct Memory(llm=...)")
+        with self._pool.connection() as conn:
+            cfg = read_recall_config(conn, self._default_bank_id)
+            conn.rollback()
+        gate_cfg = cfg.get("stage3_sufficiency") or {}
+        bank_decision_model = (cfg.get("models") or {}).get("decision_model")
+        gate_on = gate_cfg.get("enabled", False) if sufficiency is None else sufficiency
+        threshold = next(v for v in (sufficiency_threshold, gate_cfg.get("threshold"),
+                                     STAGE3_THRESHOLD) if v is not None)
+        common = dict(metadata_filter=metadata_filter, reranker_model=reranker_model,
+                      decision_model=decision_model)
+        items = self.recall([question], limit=limit, depth=depth, date_from=date_from,
+                            date_to=date_to, excluded_sources=excluded_sources, **common)
+        gate, sufficient, retried = None, None, False
+        if gate_on and items:
+            gate, sufficient = self._judge_sufficiency(
+                question, items, threshold, decision_model, bank_decision_model)
+            if sufficient is False:
+                retried = True
+                wider = self.recall([question], limit=limit * 2, depth="deep",
+                                    excluded_sources=excluded_sources, **common)
+                seen: set[str] = set()
+                items = [r for r in items + wider
+                         if not (r.document_id in seen or seen.add(r.document_id))]
+                gate, sufficient = self._judge_sufficiency(
+                    question, items, threshold, decision_model, bank_decision_model)
+        if not items:
+            return AskResult(answer="not in memory", citations=[], items=[], sufficient=sufficient,
+                             retried=retried, gate=gate, rendered="not in memory")
+        prompt = render_prompt("ask-cited", {"question": question,
+                                             "evidence": format_cited_rag_block(items, heading=None)})
+        t0 = _time.monotonic()
+        raw = llm(messages=[{"role": "user", "content": prompt}])
+        answer = llm_text(raw).strip()
+        self._emit_calls([{
+            **llm_call_record(raw, purpose="ask_cited"), "json_mode": False, "messages_count": 1,
+            "duration_ms": int((_time.monotonic() - t0) * 1000), "prompt_text": prompt,
+            "response_text": answer, "error": None}])
+        citations = build_citations(answer, items)
+        return AskResult(answer=answer, citations=citations, items=items, sufficient=sufficient,
+                         retried=retried, gate=gate, rendered=render_answer(answer, citations))
+
+    def _judge_sufficiency(self, question: str, items: "list[RecalledMemory]", threshold: float,
+                           call_model: str | None, bank_model: str | None) -> "tuple[dict, bool | None]":
+        """Stage 3 verdict for `items`: ({score, threshold, model} or {error, threshold},
+        sufficient or None when the decision model could not be asked)."""
+        from prospecta.stages import JevSufficiency, _with_decision_model
+        calls: list[dict] = []
+        gate: dict = {"threshold": threshold}
+        sufficient = None
+        try:
+            jev = _with_decision_model(self._jev, call_model or self._decision_model, bank_model)
+            if jev is None:
+                raise RuntimeError("the stage 3 gate needs Memory(jev=...)")
+            excerpts = "\n\n".join(
+                f"[{n}] {it.source} | {it.created_on or 'unknown'}\n{it.original_chunk}"
+                for n, it in enumerate(items, start=1))
+            score = JevSufficiency(jev.transport, jev.model, jev.timeout).score(
+                question, excerpts, calls)
+            gate.update(score=score, model=jev.model)
+            sufficient = score >= threshold
+        except Exception as exc:
+            logger.warning("stage 3 sufficiency gate failed (%s: %s); answering from the "
+                           "evidence found", type(exc).__name__, exc)
+            gate["error"] = f"{type(exc).__name__}: {exc}"
+        self._emit_calls(calls)
+        return gate, sufficient
 
     def formulate_queries(
         self,

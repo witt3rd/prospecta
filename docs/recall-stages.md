@@ -82,14 +82,20 @@ mem.set_recall_config({
   `rerank.min_score` is the absolute floor on the cross-encoder's score; it is not
   `rerank.min_rel_score`, which keeps cutting the rerank *pool* relative to the best fused score.
   The gate needs `sonnet_listwise`, so it does not combine with this stage.
-- **Models** (both configurable, first that applies): the reranker model is the `Memory(reranker_model=)`
-  argument, then `recall_config.rerank.model`, then `PROSPECTA_RERANKER_MODEL`, then
-  `qwen/qwen3-reranker-8b`. The decision model (Jev: `jev_score`, the gate, the Jev reader) is the
+- **Models** (all configurable, first that applies): the reranker model is the per-call
+  `reranker_model=` (`search`, `recall`, `recall_for_task`, `ask`, `/lookup`), then the
+  `Memory(reranker_model=)` argument, then `recall_config.rerank.model`, then
+  `PROSPECTA_RERANKER_MODEL`, then `qwen/qwen3-reranker-8b`. The decision model (Jev: `jev_score`,
+  the gate, the Jev reader, the stage 3 sufficiency gate) is the per-call `decision_model=`, then the
   `Memory(decision_model=)` argument, then `recall_config.models.decision_model`, then
   `PROSPECTA_DECISION_MODEL` (alias `PROSPECTA_JEV_MODEL`, read at import), then `typesafe/jev-1.14`.
+  The query-writer model of `recall_for_task` is the per-call `query_writer_model=`, then
+  `recall_config.models.query_writer_model`, then `PROSPECTA_QUERY_WRITER_MODEL`, then
+  `openrouter/google/gemini-2.5-flash-lite`; it is passed to the `llm` callable as a `model=` hint
+  when the callable accepts one.
 - **Reader and hop**: the reader sees every excerpt graded >= `reader.min_rel_score` x the best and answers sufficient or
   gives one follow-up query per missing fact; these run only the cheap channels (`dense_chunk`,
-  `bm25`, `question`, whichever the bank enables); new notes scoring >= `hop_min_rel_score` x the best of their run join the
+  `bm25`, `question`, `hybrid_chunk`, whichever the bank enables); new notes scoring >= `hop_min_rel_score` x the best of their run join the
   reranked set and the joined set is reranked once. At most one hop; all in `recall_events.hops`.
 - **Accounting**: `recall_events.cost_usd`, `tokens_in`, `tokens_out`,
   `n_llm_calls` sum the recall's model calls; each call also lands in `llm_calls`
@@ -101,6 +107,41 @@ mem.set_recall_config({
 
 The model is `Memory(rerank_llm=..., rerank_model=...)`, falling back to `llm`;
 the intended one is `anthropic/claude-sonnet-5.5` through OpenRouter.
+
+## Cited evidence and the modes of `docs/postgres-hybrid.md`
+
+Every `RecalledMemory` carries the cited-evidence contract next to `source` and `original_chunk`:
+`created_on` (`YYYY-MM-DD`), `kind` (`documents.source_kind`), `match_kind` (`exact+semantic`,
+`exact`, `lexical`, `semantic`; from the channels that found the note, `None` for a bank on the
+legacy path), `relevance_score` (the cross-encoder's 0..1 score when `rerank.stage` is
+`cross_encoder` and graded the note, else the fused `score`) and `exact_snippet` (`ts_headline`
+of the matched words, `<<marked>>`, from the `hybrid_chunk` channel). `prospecta.cited.format_cited_rag_block(items)`
+renders items as the cited, non-instructional block (`[n] source=... | date=... | kind=... | match=...`, an
+`Exact match snippet:` line when one fired, then the full chunk).
+
+- **Mode 2A, search** (`Memory.search`, `recall`, `POST /lookup`): Stage 1 + Stage 2, no stage 0 gate. Per-call
+  `date_from`, `date_to` (the note's date, inclusive) and `excluded_sources` (the anti-echo list) are pushed into the
+  `hybrid_chunk` channel's three retrievers and raise `ValueError` where that channel does not run.
+- **Mode 1B, task recall** (`Memory.recall_for_task(title=, ask=, done=, project=)`): the brief is split into 2 to
+  4 facet queries by the query-writer model (quoted strings of the brief stay verbatim; without a model the
+  brief's own title / ask / done are the queries), each facet runs Stage 1 + Stage 2 in parallel, and the notes
+  merge, once each, into `TaskRecall(queries, items, block)`: the `project`'s notes first, notes of other
+  projects after them and labeled. There is no needs-memory gate: a task always searches.
+- **Mode 2B, ask** (`Memory.ask(question)`): Stage 1 + Stage 2, then the synthesis model answers from the top
+  notes alone and cites `[n]` per statement. `AskResult.citations` ties each `[n]` to its source, date and the
+  verbatim sentence of the chunk that supports it; `rendered` appends them as `[n] [source | date] "snippet"`.
+  With no evidence the answer is `not in memory` and no model is called.
+
+### Stage 3: the sufficiency gate
+
+Off by default. `recall_config.stage3_sufficiency = {"enabled": true, "threshold": 0.70}` (or
+`ask(sufficiency=True, sufficiency_threshold=...)`): the decision model answers the System One
+`evidence_sufficient` score question (0..3, the stopping question of the Jev reader) over the excerpts; the verdict
+is that score / 3. Under the threshold ONE broadened retrieval runs (rerank pool at `deep`, twice the limit, the
+date window dropped; `excluded_sources` and the metadata filter stay), its notes join the evidence, and the
+verdict is taken again; the model answers either way. A gate that fails (no `Memory(jev=)`, provider
+error) never blocks the answer: `AskResult.gate` holds the error and `sufficient` is `None`. The wire
+shape is the verified `score` request above; the plan's `noul` / alpha decisions endpoint is not specified in the repo.
 
 ## Recall depth
 

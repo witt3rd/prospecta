@@ -124,6 +124,20 @@ res = m.recall_mapreduce("what are Greg's nicknames?", entity="Greg", batch_size
 print(res.synthesis, res.citations)
 ```
 
+### Cited recall, task recall and ask (the hybrid architecture)
+
+With the `hybrid_chunk` channel (and, optionally, the cross-encoder stage) every hit is a cited item: `source`,
+`created_on`, `kind`, `match_kind`, `relevance_score`, `exact_snippet` (the matched words, `<<marked>>`) and
+`original_chunk`. See `docs/recall-stages.md` ("Cited evidence and the modes").
+
+```python
+hits = m.search('"electric dreams" 0x80070005', date_from="2024-01-01", excluded_sources=["turn:41"])
+task = m.recall_for_task(title="Library tree view", ask="Build it", done="folders page in", project="atlas")
+print(task.block)       # "## Recalled Project Context": cited notes, the project's own first
+res = m.ask("how are deletes handled?", sufficiency=True)   # optional stage 3 gate
+print(res.rendered)     # the answer with [n] markers, then [n] [source | date] "verbatim snippet"
+```
+
 ### Caller-supplied index_text — the spine override
 
 When the caller knows the right anticipated questions (or has refined them via a tighter prompt elsewhere), pass them directly. The library uses them verbatim, as the note's question items instead of its chunks (`child_chunks=True` writes both). **Caller wins on every override.**

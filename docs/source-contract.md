@@ -107,10 +107,23 @@ All idempotent; they take the record's reference, never its text.
 | call | body / query | answer |
 |---|---|---|
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
-| `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score"}]}]}` |
+| `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score","created_on","match_kind","exact_snippet","relevance_score"}]}]}` |
+| `POST /lookup` (a task brief) | `{"task":{"title","ask","done"?,"project"?}, "limit":10, ...the optional fields above}` | `{"task":{"queries":[...], "context":"## Recalled Project Context ...", "results":[{"source","created_on","kind","record_id","revision","project","match_kind","exact_snippet","relevance_score"}]}}` |
+
+Every hit says where and when it is from and why it matched (the cited-evidence contract of
+`docs/postgres-hybrid.md`): `created_on` (the record's date, `YYYY-MM-DD`), `match_kind`
+(`exact+semantic`, `exact`, `lexical`, `semantic`, or null), `exact_snippet` (the matched words in
+context, `<<marked>>`, or null) and `relevance_score` (the cross-encoder's 0..1 score when the bank
+runs stage 2 with it, else the fused `score`). `date_from` / `date_to` (`YYYY-MM-DD`, the record's
+date, inclusive) and `excluded_sources` (document sources to leave out, the anti-echo list) apply
+inside Stage 1 and need the `hybrid_chunk` channel in the bank's config (else 400);
+`reranker_model` / `decision_model` override the stage 2 / Jev model for the call. No stage 0
+gate runs on a lookup. The task form splits the brief into 2 to 4 facet queries (the
+query-writer model), runs each through Stage 1 + Stage 2 and returns one cited context block: the
+task's `project` first, other projects' notes labeled with theirs.
 
 `/lookup` accepts `"explain": true` (default false; must be a boolean). The default
-response is unchanged. With it, each question's object gains `channels_run` (channels
+response is otherwise unchanged. With it, each question's object gains `channels_run` (channels
 that ran and did not fail) and `channels_failed` (`[{"channel","reason"}]`, a reason in
 words, starting `failed:` for an error or `skipped:` for a channel disabled in the bank's
 config), and each hit gains `channels`: `[{"channel","rank","score","weight"}]` for every

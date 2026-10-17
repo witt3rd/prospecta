@@ -6,10 +6,17 @@ Endpoints (JSON):
     GET  /healthz
     POST /lookup    {"questions": [...], "limit": 10, "kind"?, "project"?, "person"?,
                      "audience_key"?,
-                     "allowed_audience_keys"?, "allowed_projects"?, "explain"?: true}
-                                          -> ranked results per question; with explain, also
+                     "allowed_audience_keys"?, "allowed_projects"?, "explain"?: true,
+                     "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?,
+                     "decision_model"?}
+                                          -> ranked results per question, each with its citation
+                                             fields (created_on, match_kind, exact_snippet,
+                                             relevance_score); with explain, also
                                              channels_run / channels_failed per question and
                                              channels (rank, score, weight) per hit
+                    {"task": {"title", "ask", "done"?, "project"?}, "limit": 10, ...}
+                                          -> the task brief's recall: {"task": {"queries": [...],
+                                             "context": "<cited block>", "results": [...]}}
     POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true, "concurrency"?}
     POST /remove    {"kind", "record_id"}
     POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}], "concurrency"?}
@@ -27,6 +34,7 @@ to bind a non-loopback address), plus the usual embedder/LLM settings.
 """
 from __future__ import annotations
 
+import datetime
 import hmac
 import json
 import logging
@@ -95,7 +103,54 @@ class Service:
             raise ApiError(409, "no source configured (set PROSPECTA_SOURCE_SCHEMA)")
         return self.indexer
 
+    @staticmethod
+    def _recall_options(body: dict) -> dict:
+        """The per-call Stage 1 filters and model overrides a lookup may carry."""
+        opts: dict = {}
+        for key in ("date_from", "date_to"):
+            v = body.get(key)
+            if v is None:
+                continue
+            try:
+                opts[key] = datetime.date.fromisoformat(v)
+            except (TypeError, ValueError):
+                raise ApiError(400, f"{key} must be a YYYY-MM-DD date") from None
+        ex = body.get("excluded_sources")
+        if ex is not None:
+            if not isinstance(ex, list) or not all(isinstance(x, str) for x in ex):
+                raise ApiError(400, "excluded_sources must be a list of strings")
+            opts["excluded_sources"] = ex
+        for key in ("reranker_model", "decision_model"):
+            v = body.get(key)
+            if v is not None:
+                if not isinstance(v, str) or not v:
+                    raise ApiError(400, f"{key} must be a non-empty string")
+                opts[key] = v
+        return opts
+
+    def _lookup_task(self, body: dict) -> dict:
+        task = body["task"]
+        if not isinstance(task, dict) or not all(
+                isinstance(task.get(k), str) and task[k].strip() for k in ("title", "ask")):
+            raise ApiError(400, "task needs a title and an ask (non-empty strings)")
+        for k in ("done", "project"):
+            if task.get(k) is not None and not isinstance(task[k], str):
+                raise ApiError(400, f"task.{k} must be a string")
+        limit = body.get("limit", 10)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
+            raise ApiError(400, f"limit must be an integer 1..{MAX_LIMIT}")
+        try:
+            got = self.memory.recall_for_task(
+                title=task["title"], ask=task["ask"], done=task.get("done"),
+                project=task.get("project"), limit=limit, **self._recall_options(body))
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        return {"task": {"queries": got.queries, "context": got.block,
+                         "results": [_cited_hit(h) for h in got.items]}}
+
     def lookup(self, body: dict) -> dict:
+        if body.get("task") is not None:
+            return self._lookup_task(body)
         qs = body.get("questions")
         if not isinstance(qs, list) or not qs or not all(isinstance(q, str) and q.strip() for q in qs):
             raise ApiError(400, "questions must be a non-empty list of strings")
@@ -121,11 +176,15 @@ class Service:
         explain = body.get("explain", False)
         if not isinstance(explain, bool):
             raise ApiError(400, "explain must be true or false")
+        options = self._recall_options(body)
         out = []
         for q in qs:
             traces: list[dict] = []
-            hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
-                                      **({"_trace": traces} if explain else {}))
+            try:
+                hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
+                                          **options, **({"_trace": traces} if explain else {}))
+            except ValueError as e:     # e.g. a date filter on a bank without the hybrid_chunk channel
+                raise ApiError(400, str(e)) from None
             best: dict[tuple, dict] = {}
             for h in hits:
                 md = h.metadata or {}
@@ -134,7 +193,10 @@ class Service:
                 key = (md["kind"], md["record_id"], md.get("revision"))
                 if key not in best or h.score > best[key]["score"]:
                     best[key] = {"kind": md["kind"], "record_id": md["record_id"],
-                                 "revision": md.get("revision"), "score": float(h.score)}
+                                 "revision": md.get("revision"), "score": float(h.score),
+                                 "created_on": h.created_on, "match_kind": h.match_kind,
+                                 "exact_snippet": h.exact_snippet,
+                                 "relevance_score": h.relevance_score}
                     if explain:
                         best[key]["_doc"] = h.document_id
                         best[key]["_scores"] = h.scores
@@ -176,6 +238,15 @@ class Service:
 
     def coverage(self, kind: str | None, project: str | None) -> dict:
         return {"coverage": [c.as_dict() for c in self._need_indexer().coverage(kind, project)]}
+
+
+def _cited_hit(h) -> dict:
+    """One recalled note as a lookup result: where and when it is from, why it matched."""
+    md = h.metadata or {}
+    return {"source": h.source, "created_on": h.created_on, "kind": md.get("kind") or h.kind,
+            "record_id": md.get("record_id"), "revision": md.get("revision"),
+            "project": md.get("project"), "match_kind": h.match_kind,
+            "exact_snippet": h.exact_snippet, "relevance_score": h.relevance_score}
 
 
 def _str(body: dict, key: str) -> str:
