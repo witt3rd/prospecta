@@ -74,7 +74,7 @@ def fit_passage(text: str, label: str) -> str:
     return cut
 
 
-CHEAP_CHANNELS = ("dense_chunk", "bm25", "question")
+CHEAP_CHANNELS = ("dense_chunk", "bm25", "question", "hybrid_chunk")
 SONNET_MODEL = "anthropic/claude-sonnet-5.5"
 
 STAGES = ("sonnet_listwise", "jev_score", "cross_encoder")

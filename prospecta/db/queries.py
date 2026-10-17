@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re as _re
 from prospecta._filters import filter_fields
+from prospecta.db.keyword_index import word_vector
 
 # ---------------------------------------------------------------------------
 # Bank lifecycle
@@ -936,6 +937,162 @@ def body_lexical_search(
                 "meta": _meta_param(metadata_filter),
             },
         )
+        cols = [c.name for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Reserved-Slot Hybrid over kind='chunk' items
+# (docs/postgres-hybrid.md section 6). One query: a semantic, a stemmed lexical
+# and an unstemmed exact/phrase retriever each keep their own top slots, so an
+# exact hit always reaches the reranker; fused by FULL OUTER JOIN into the top
+# `fused_limit` with an RRF fallback score, and ts_headline() runs on those
+# winners only. Needs pgvector >= 0.8 (hnsw.iterative_scan).
+# ---------------------------------------------------------------------------
+
+STAGE1_SEMANTIC_LIMIT = 25
+STAGE1_STEMMED_LIMIT = 20
+STAGE1_EXACT_LIMIT = 20
+STAGE1_FUSED_LIMIT = 50
+STAGE1_HNSW_EF_SEARCH = 100
+STAGE1_HEADLINE_OPTIONS = ('StartSel=<<, StopSel=>>, MaxWords=35, MinWords=15, '
+                           'MaxFragments=2, FragmentDelimiter=" … "')
+
+_NOTE_DATE = "COALESCE(d.created_on, d.created_at::date)"
+
+# Pushed into all three retrievers, before their LIMIT.
+_STAGE1_FILTERS = """
+      AND (%(date_from)s::date IS NULL OR __NOTE_DATE__ >= %(date_from)s::date)
+      AND (%(date_to)s::date IS NULL OR __NOTE_DATE__ <= %(date_to)s::date)
+      AND (%(excluded)s::text[] IS NULL OR d.source IS NULL
+           OR NOT (d.source = ANY(%(excluded)s::text[])))
+      AND (%(meta)s::jsonb IS NULL OR m.metadata @> (%(meta)s::jsonb - '_allow'))
+      AND (%(meta)s::jsonb->'_allow' IS NULL OR (
+            (%(meta)s::jsonb->'_allow'->'audience_key' IS NULL OR COALESCE(m.metadata->>'audience_key','') IN
+                (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'audience_key')))
+            AND (%(meta)s::jsonb->'_allow'->'project' IS NULL OR COALESCE(m.metadata->>'project','') IN
+                (SELECT jsonb_array_elements_text(%(meta)s::jsonb->'_allow'->'project')))))
+"""
+
+# (SELECT stem FROM q) is one parsed tsquery, evaluated once and usable as an index
+# condition. __DIM__: the bank's embedding width, so the per-bank partial HNSW index
+# (an index on embedding::vector(N), see HNSW_KIND_INDEX_TEMPLATE) can serve the
+# semantic retriever. __EXACT_VEC__: the keyword channel's word rule on
+# 'simple', which memory_items_keyword_gin (migration 0018) indexes.
+_STAGE1_SQL = """
+WITH
+  q AS (
+    SELECT websearch_to_tsquery('english', %(qt)s) AS stem,
+           websearch_to_tsquery('simple', %(qt)s) AS exact
+  ),
+  semantic_hits AS (
+    SELECT m.id,
+           ROW_NUMBER() OVER (ORDER BY m.embedding::vector(__DIM__) <=> %(qe)s::vector(__DIM__)) AS rank_ix
+    FROM memory_items m JOIN documents d ON d.id = m.document_id
+    WHERE m.bank_id = %(bank_id)s AND m.kind = 'chunk'
+      __FILTERS__
+    ORDER BY m.embedding::vector(__DIM__) <=> %(qe)s::vector(__DIM__)
+    LIMIT %(semantic_limit)s
+  ),
+  stemmed_hits AS (
+    SELECT m.id,
+           ROW_NUMBER() OVER (ORDER BY ts_rank_cd(m.body_tsv, (SELECT stem FROM q)) DESC,
+                                       __NOTE_DATE__ DESC, m.id) AS rank_ix
+    FROM memory_items m JOIN documents d ON d.id = m.document_id
+    WHERE m.bank_id = %(bank_id)s AND m.kind = 'chunk'
+      AND m.body_tsv @@ (SELECT stem FROM q)
+      __FILTERS__
+    ORDER BY ts_rank_cd(m.body_tsv, (SELECT stem FROM q)) DESC, __NOTE_DATE__ DESC, m.id
+    LIMIT %(stemmed_limit)s
+  ),
+  exact_hits AS (
+    SELECT m.id,
+           ROW_NUMBER() OVER (ORDER BY ts_rank_cd(__EXACT_VEC__, (SELECT exact FROM q), 4) DESC,
+                                       __NOTE_DATE__ DESC, m.id) AS rank_ix
+    FROM memory_items m JOIN documents d ON d.id = m.document_id
+    WHERE m.bank_id = %(bank_id)s AND m.kind = 'chunk'
+      AND __EXACT_VEC__ @@ (SELECT exact FROM q)
+      __FILTERS__
+    ORDER BY ts_rank_cd(__EXACT_VEC__, (SELECT exact FROM q), 4) DESC, __NOTE_DATE__ DESC, m.id
+    LIMIT %(exact_limit)s
+  ),
+  fused AS (
+    SELECT COALESCE(s.id, st.id, ex.id) AS id,
+           s.rank_ix AS sem_rank, st.rank_ix AS stem_rank, ex.rank_ix AS exact_rank,
+           (COALESCE(0.45 / (60 + s.rank_ix), 0.0)
+            + COALESCE(0.25 / (60 + st.rank_ix), 0.0)
+            + COALESCE(0.30 / (60 + ex.rank_ix), 0.0)) AS rrf_score
+    FROM semantic_hits s
+    FULL OUTER JOIN stemmed_hits st ON s.id = st.id
+    FULL OUTER JOIN exact_hits ex ON COALESCE(s.id, st.id) = ex.id
+    ORDER BY rrf_score DESC, COALESCE(s.id, st.id, ex.id)
+    LIMIT %(fused_limit)s
+  )
+SELECT c.id, c.document_id, d.source, c.content, c.original_chunk, c.metadata,
+       __NOTE_DATE__ AS created_on,
+       f.sem_rank, f.stem_rank, f.exact_rank, f.rrf_score,
+       CASE
+         WHEN f.exact_rank IS NOT NULL THEN
+           ts_headline('simple', c.original_chunk, (SELECT exact FROM q), %(headline)s)
+         WHEN f.stem_rank IS NOT NULL THEN
+           ts_headline('english', c.original_chunk, (SELECT stem FROM q), %(headline)s)
+       END AS exact_snippet
+FROM fused f
+JOIN memory_items c ON c.id = f.id
+JOIN documents d ON d.id = c.document_id
+ORDER BY f.rrf_score DESC, c.id
+"""
+
+
+def _stage1_statement(
+    *, bank_id: str, query_text: str, query_embedding: list[float],
+    date_from=None, date_to=None, excluded_sources: list[str] | None = None,
+    metadata_filter: dict | None = None,
+    semantic_limit: int = STAGE1_SEMANTIC_LIMIT, stemmed_limit: int = STAGE1_STEMMED_LIMIT,
+    exact_limit: int = STAGE1_EXACT_LIMIT, fused_limit: int = STAGE1_FUSED_LIMIT,
+) -> tuple[str, dict]:
+    sql = (_STAGE1_SQL
+           .replace("__FILTERS__", _STAGE1_FILTERS)
+           .replace("__NOTE_DATE__", _NOTE_DATE)
+           .replace("__EXACT_VEC__", word_vector("'simple'", "m.original_chunk"))
+           .replace("__DIM__", str(len(query_embedding))))
+    params = {
+        "bank_id": bank_id, "qt": query_text, "qe": _vec_literal(query_embedding),
+        "date_from": date_from, "date_to": date_to,
+        "excluded": list(excluded_sources) if excluded_sources is not None else None,
+        "meta": _meta_param(metadata_filter), "headline": STAGE1_HEADLINE_OPTIONS,
+        "semantic_limit": int(semantic_limit), "stemmed_limit": int(stemmed_limit),
+        "exact_limit": int(exact_limit), "fused_limit": int(fused_limit),
+    }
+    return sql, params
+
+
+def stage1_search(conn, *, hnsw_ef_search: int = STAGE1_HNSW_EF_SEARCH, **query) -> list[dict]:
+    """The Stage 1 candidates: at most `fused_limit` chunk rows, best first.
+
+    `query` is bank_id, query_text, query_embedding and optionally date_from /
+    date_to (the note's date, inclusive), excluded_sources (the anti-echo list of
+    documents.source values), metadata_filter (the metadata / `_allow` filter of the
+    other channels) and the slot counts semantic_limit / stemmed_limit / exact_limit /
+    fused_limit (defaults 25 / 20 / 20 / 50). The filters apply inside every retriever,
+    before its slots are cut. `query_text` is read by websearch_to_tsquery:
+    "exact phrase", OR, -exclude. The semantic retriever reads at least
+    `hnsw_ef_search` index candidates and keeps scanning (pgvector iterative scan)
+    until its slots are full.
+
+    Each row: id, document_id, source, content, original_chunk, metadata, created_on
+    (the note's date: documents.created_on, else its created_at date), sem_rank /
+    stem_rank / exact_rank (the chunk's rank in each retriever, None where it did not
+    match), rrf_score and exact_snippet (ts_headline with <<matches>>; None for a
+    purely semantic hit).
+    """
+    sql, params = _stage1_statement(**query)
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        cur.execute(f"SET LOCAL hnsw.ef_search = {int(hnsw_ef_search)}")
+        # prepare=False: a fresh plan per call, so the bank and kind literals select the
+        # per-bank partial HNSW index.
+        cur.execute(sql, params, prepare=False)
         cols = [c.name for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
