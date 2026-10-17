@@ -1,13 +1,5 @@
 """Score-based pools: relative cut, window batching, paged fetch, no silent drops."""
-import json
-import logging
-
-import pytest
-
 from prospecta._scorecut import fetch_until_cut, rel_cut, split_batches
-from prospecta.channels.base import Candidate
-from prospecta.channels.fusion import FusedDoc
-from prospecta.stages import Item, SonnetListwise, read_all
 
 
 def test_rel_cut_keeps_everything_at_or_above_the_relative_score():
@@ -34,70 +26,6 @@ def test_fetch_until_cut_grows_until_the_cut_is_reached():
     got = fetch_until_cut(fetch, float, 0.5, page=16)
     assert got == [s for s in scores if s >= 0.5] and asked == [16, 32, 64]
     assert fetch_until_cut(lambda n: scores[:n], float, 0, page=100) == scores
-
-
-def _item(i):
-    c = Candidate(document_id=f"d{i}", item_id=f"i{i}", source=f"n{i}.md",
-                  channel="x", rank=i + 1, score=1.0, evidence="e" * 40)
-    return Item(doc=FusedDoc(f"d{i}", f"n{i}.md", 1.0 - i / 100, c), header=f"n{i}.md",
-                evidence="e" * 40)
-
-
-class _Llm:
-    def __init__(self, fail_first=0):
-        self.fail, self.calls = fail_first, 0
-
-    def __call__(self, messages, *, json_mode=False):
-        self.calls += 1
-        if self.fail:
-            self.fail -= 1
-            raise RuntimeError("boom")
-        n = messages[0]["content"].count("\n[") + 1
-        return json.dumps({"grades": {str(i): (3 if i == n else 0) for i in range(1, n + 1)}})
-
-
-def test_rerank_over_the_window_is_map_reduced_and_keeps_every_note():
-    items = [_item(i) for i in range(6)]
-    llm = _Llm()
-    out = SonnetListwise(llm, context_tokens=4_000 + 40).rerank("q", items, [])
-    assert llm.calls > 1 and out.record["batches"] == llm.calls
-    assert sorted(out.order) == list(range(6)) and len(out.grades) == 6
-
-
-def test_a_failed_batch_is_retried_then_surfaced_with_the_full_notes(caplog):
-    items = [_item(i) for i in range(3)]
-    assert SonnetListwise(_Llm(fail_first=1)).rerank("q", items, []).order
-    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError):
-        SonnetListwise(_Llm(fail_first=2)).rerank("the question", items, [])
-    msg = caplog.records[-1].getMessage()
-    assert "the question" in msg and "d0" in msg and "d2" in msg
-
-
-def test_reader_reads_every_batch_and_unions_follow_ups():
-    class R:
-        seen = []
-
-        def read(self, q, items, mfu, calls):
-            self.seen.append(len(items))
-            return False, [f"fu{len(self.seen)}"]
-    r = R()
-    ok, fu = read_all(r, "q", [_item(i) for i in range(4)], [], context_tokens=4_000 + 25)
-    assert not ok and sum(r.seen) == 4 and len(fu) == len(r.seen) > 1
-
-
-def test_jev_reader_requests_stay_under_its_byte_limit():
-    from prospecta.stages import JEV_INPUT_BYTES, JevReader
-    sizes = []
-
-    def transport(req, timeout):
-        sizes.append(len(json.dumps(req).encode()))
-        return {"answers": {k: {"score": 3} for k in req["questions"]}}
-    items = []
-    for i in range(20):
-        it = _item(i)
-        items.append(Item(doc=it.doc, header=it.header, evidence="e" * 8_000))
-    ok, _ = read_all(JevReader(transport), "q", items, [])
-    assert ok and len(sizes) > 1 and max(sizes) <= JEV_INPUT_BYTES
 
 
 def test_semantic_channel_reaches_qualifying_items_beyond_hnsw_ef_search(fresh_db):
@@ -147,8 +75,7 @@ def test_new_defaults_keep_strict_gold_notes_the_old_ones_drop():
     fused 0.2x). The old defaults (channels 0.6 / 0.15, pool 0.4) drop them; the new
     ones (no channel cut, pool 0.15) keep them."""
     from prospecta._scorecut import CHANNEL_MIN_REL, POOL_MIN_REL
-    from prospecta.channels.bm25 import Bm25Chunks
-    from prospecta.channels.semantic import DenseChunks, AnticipatedQuestions
+    from prospecta.channels.semantic import DenseChunks
     cos = [("best", 0.9), ("gold", 0.45), ("other", 0.8)]
     bm = [("best", 20.0), ("gold", 2.0), ("other", 10.0)]
     fused = [("best", 1.0), ("gold", 0.2), ("other", 0.5)]
@@ -161,21 +88,20 @@ def test_new_defaults_keep_strict_gold_notes_the_old_ones_drop():
     assert keep(bm, CHANNEL_MIN_REL) == {"best", "gold", "other"}
     assert POOL_MIN_REL == 0.15 and "gold" in keep(fused, POOL_MIN_REL)
     assert "gold" in keep(fused, 0.05)
-    assert Bm25Chunks().min_rel == 0 and DenseChunks().min_rel == 0
-    assert AnticipatedQuestions().min_rel == 0
+    assert DenseChunks().min_rel == 0
     assert DenseChunks(min_rel=0.6).min_rel == 0.6      # explicit override stays
 
 
 def test_default_rerank_pool_cut_and_report_line():
-    from prospecta.stages import DEFAULT_RECALL_CONFIG
+    from prospecta._scorecut import POOL_MIN_REL
     from prospecta.evaluation import format_report
-    assert DEFAULT_RECALL_CONFIG["rerank"]["min_rel_score"] == 0.15
+    assert POOL_MIN_REL == 0.15
     rep = {"bank": "b", "n_questions": 0, "legacy_bank_scored_with_defaults": False,
            "full": {"stages": {}, "summary": {
                "gold": {"hit1": 1.0, "hit10": 1.0, "mrr": 1.0, "cover10": 1.0},
                "gold2": {"n": 0}, "by_class": {}}},
-           "recall_config": DEFAULT_RECALL_CONFIG, "depth": "standard", "rerank_min_rel": 0.15,
-           "channel_config": [{"name": "bm25"}, {"name": "dense_chunk"}]}
+           "recall_config": {}, "depth": "standard", "rerank_min_rel": 0.15,
+           "channel_config": [{"name": "dense_chunk"}]}
     text = format_report(rep)
-    assert ("cuts: channels bm25 0.0, dense_chunk 0.0 (0 = no cut); "
+    assert ("cuts: channels dense_chunk 0.0 (0 = no cut); "
             "rerank pool >= 0.15 x best fused score (depth: standard)") in text

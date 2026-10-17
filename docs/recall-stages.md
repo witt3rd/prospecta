@@ -27,7 +27,8 @@ A bank that stored `channel_config = []` is a legacy bank and ignores `recall_co
 | `stage3_sufficiency` | Stage 3: `enabled`, `threshold` | Stage 3 |
 | `models` | `decision_model`, `query_writer_model` | Models |
 | `depth` | the bank's default rerank-pool cut, `standard` or `deep` | Recall depth |
-| `evidence`, `fusion`, `gate`, `reader`, `link_completeness`, `rerank.stage` other than `cross_encoder`, `rerank.blend` | the previous design | `docs/legacy.md` |
+| `evidence`, `fusion` | the legacy channel set (`docs/legacy.md`) | `docs/legacy.md` |
+| `gate`, `reader`, `link_completeness`, `rerank.stage` other than `cross_encoder`, `rerank.blend` | **removed**: `set_recall_config` refuses them, and a bank that stored one has it skipped with one warning per process | `docs/legacy.md` |
 
 ## Stage 1: the `hybrid_chunk` channel
 

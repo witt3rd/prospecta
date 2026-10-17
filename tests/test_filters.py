@@ -182,8 +182,8 @@ def mem(fresh_db):
          "bob dog walk"),
         ("n1.md", "No frontmatter, a note about walking a dog in the park.", "dog park"),
     ]
-    for src, text, it in notes:
-        m.retain(text, source=src, index_text=it)
+    for src, text, it in notes:       # chunk children too: dense_chunk reads chunk items only
+        m.retain(text, source=src, index_text=it, child_chunks=True)
     yield m
     m.close()
 

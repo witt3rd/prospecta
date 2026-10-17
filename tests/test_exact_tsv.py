@@ -3,8 +3,8 @@
 The Stage 1 exact retriever matches and ranks the 'simple' word vector of
 original_chunk. Computing that vector per matching row made a query of only very common
 words cost a tokenization of every chunk that holds them; it is now a STORED generated
-column with its own GIN index, defined once (prospecta.db.keyword_index.indexed_expression,
-the rule migration 0018 indexes). These tests pin: the column and index exist and follow
+column with its own GIN index, defined once (prospecta.db.exact_tsv.indexed_expression,
+the rule migration 0018 once indexed for the retired keyword channel). These tests pin: the column and index exist and follow
 the one rule, the migration upgrades and re-runs and rolls back safely, the index build
 never waits on a lock (the 0004/0018 deadlock caveat), the Stage 1 plan reads the column
 and no longer tokenizes, and the results equal the old expression form row for row."""
@@ -18,9 +18,8 @@ import pytest
 
 from prospecta.db import migrate
 from prospecta.db.exact_tsv import (
-    COLUMN, INDEX_NAME, LOCK_KEY, ensure_exact_tsv_index, has_exact_tsv_index,
+    COLUMN, INDEX_NAME, LOCK_KEY, ensure_exact_tsv_index, has_exact_tsv_index, indexed_expression,
 )
-from prospecta.db.keyword_index import indexed_expression
 from prospecta.db.migrate import get_schema_version, run_migrations
 from prospecta.db.queries import _stage1_statement, stage1_search
 from tests._stub_embedder import EMBED_DIM

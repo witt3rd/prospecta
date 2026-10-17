@@ -25,23 +25,8 @@ def _all(conn, sql, params=()):
 
 
 # ---------------------------------------------------------------------------
-# A. retain_events.index_text_generated
+# A. retain_events.index_text_generated (written only before the model-written questions were removed)
 # ---------------------------------------------------------------------------
-
-def test_retain_persists_generated_index_text(memory_with_bank_and_mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = "q1\nq2\nq3"  # type: ignore[attr-defined]
-    mem.retain("body", source="t1", generate_questions=True)
-    with psycopg.connect(mem.database_url) as conn:
-        row = _one(
-            conn,
-            "SELECT index_text_generated FROM retain_events "
-            "WHERE bank_id = %s ORDER BY id DESC LIMIT 1",
-            ("test",),
-        )
-    assert row is not None
-    assert row[0] == ["q1", "q2", "q3"]
-
 
 def test_retain_caller_supplied_leaves_generated_null(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
@@ -121,8 +106,9 @@ def test_recall_no_synth_leaves_synthesis_null(populated_corpus):
 
 def test_llm_calls_persists_prompt_and_response_by_default(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
-    mem._llm.canned = "q1"  # type: ignore[attr-defined]
-    mem.retain("body", source="t1", generate_questions=True)
+    reply = '{"queries":[{"text":"q1"}]}'
+    mem._llm.canned = reply  # type: ignore[attr-defined]
+    mem.formulate_queries("a message")
     with psycopg.connect(mem.database_url) as conn:
         rows = _all(
             conn,
@@ -130,12 +116,12 @@ def test_llm_calls_persists_prompt_and_response_by_default(memory_with_bank_and_
             "WHERE bank_id = %s ORDER BY id",
             ("test",),
         )
-    # Should have one row for index_text generation.
-    idx_rows = [r for r in rows if r[0] == "index_text"]
+    # Should have one row for the formulate_queries call.
+    idx_rows = [r for r in rows if r[0] == "formulate_queries"]
     assert len(idx_rows) == 1
     _, prompt_text, response_text = idx_rows[0]
     assert prompt_text is not None and len(prompt_text) > 0
-    assert response_text == "q1"
+    assert response_text == reply
 
 
 def test_llm_calls_text_disabled_when_sink_flag_off(fresh_db, mock_llm):
@@ -156,14 +142,14 @@ def test_llm_calls_text_disabled_when_sink_flag_off(fresh_db, mock_llm):
         pool=mem._pool, bank_id="testbank", persist_llm_text=False
     )
     mem.create_bank("testbank", embedding_dim=EMBED_DIM)
-    mock_llm.canned = "q"
-    mem.retain("body", source="t", generate_questions=True)
+    mock_llm.canned = '{"queries":[{"text":"q"}]}'
+    mem.formulate_queries("a message")
     try:
         with psycopg.connect(mem.database_url) as conn:
             row = _one(
                 conn,
                 "SELECT prompt_text, response_text FROM llm_calls "
-                "WHERE bank_id = %s AND prompt_name = 'index_text' "
+                "WHERE bank_id = %s AND prompt_name = 'formulate_queries' "
                 "ORDER BY id DESC LIMIT 1",
                 ("testbank",),
             )

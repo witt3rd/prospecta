@@ -67,17 +67,19 @@ def test_fuse_document_counts_once_per_channel_at_best_rank():
 # -------------------------------------------------------------- registry
 
 def test_registry_builds_enabled_in_order_and_validates():
-    cfg = [{"name": "question", "enabled": True, "weight": 1},
+    cfg = [{"name": "hybrid_chunk", "enabled": True, "weight": 1},
            {"name": "dense_chunk", "enabled": False, "weight": 4}]
     built = build_channels(cfg)
-    assert [c.name for c in built] == ["question"]
-    assert [c.name for c in build_channels(DEFAULT_CHANNEL_CONFIG)] == ["dense_chunk", "question", "meta", "graph"]
+    assert [c.name for c in built] == ["hybrid_chunk"]
+    assert [c.name for c in build_channels(DEFAULT_CHANNEL_CONFIG)] == ["dense_chunk", "meta"]
     with pytest.raises(ValueError):
         validate_channel_config([{"name": "nope"}])
     with pytest.raises(ValueError):
         validate_channel_config([{"name": "bm25_none", "weight": 1}])
+    with pytest.raises(ValueError, match="retired"):
+        validate_channel_config([{"name": "bm25", "weight": 1}])     # a removed channel (docs/legacy.md)
     with pytest.raises(ValueError):
-        validate_channel_config([{"name": "question", "weight": -1}])
+        validate_channel_config([{"name": "dense_chunk", "weight": -1}])
 
 
 # --------------------------------------------------------- db integration
@@ -120,8 +122,7 @@ def test_channel_recall_fuses_documents_and_scores_per_channel(mem):
     assert len({r.document_id for r in res}) == len(res)  # document level
     top = res[0]
     assert top.scores["dense_chunk"] > 0
-    assert set(top.scores) >= {"semantic", "lexical", "lexical_body", "rrf",
-                               "dense_chunk", "question"}
+    assert set(top.scores) >= {"semantic", "lexical", "lexical_body", "rrf", "dense_chunk"}
     assert top.original_chunk == "cat sat warm mat window"  # best chunk evidence
 
 
@@ -144,14 +145,14 @@ def test_recall_trace_persists_plan_channels_fusion_and_candidates(mem):
             "SELECT channel, rank, score, document_id, item_id FROM recall_event_candidates "
             "WHERE recall_event_id=%s ORDER BY channel, rank", (ev_id,)).fetchall()
     assert plan["queries"][0]["text"] == "cat sat warm mat window"
-    assert [c["name"] for c in channels] == ["dense_chunk", "question", "meta", "graph"]
+    assert [c["name"] for c in channels] == ["dense_chunk", "meta"]
     assert all(c["error"] is None and "latency_ms" in c for c in channels)
-    assert all(c["n"] >= 1 for c in channels if c["name"] not in ("graph", "meta"))   # no links, no filter
+    assert all(c["n"] >= 1 for c in channels if c["name"] != "meta")                  # no filter for meta
     assert fusion["method"] == "weighted_rrf" and fusion["k"] == 60
-    assert fusion["weights"] == {"dense_chunk": 4.0, "question": 1.0, "graph": 0.0, "meta": 3.0}
+    assert fusion["weights"] == {"dense_chunk": 4.0, "meta": 3.0}
     assert len(fusion["pool"]) == 2
     by_channel = {c[0] for c in cands}
-    assert by_channel == {"dense_chunk", "question"}  # meta had no filter
+    assert by_channel == {"dense_chunk"}  # meta had no filter
     dense = [c for c in cands if c[0] == "dense_chunk"]
     assert [c[1] for c in dense] == [1, 2]
     assert dense[0][2] >= dense[1][2]
@@ -171,16 +172,16 @@ def test_legacy_recall_leaves_trace_columns_null(mem):
 
 def test_failing_channel_is_recorded_and_others_still_fuse(mem, monkeypatch):
     from prospecta.channels import semantic
-    mem.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
-    monkeypatch.setattr(semantic.AnticipatedQuestions, "_sql", "SELECT broken FROM nowhere")
-    mem.recall(["cat sat warm mat window"], limit=5)
+    mem.set_channel_config([{"name": "dense_chunk", "weight": 4}, {"name": "hybrid_chunk", "weight": 1}])
+    monkeypatch.setattr(semantic.DenseChunks, "_sql", "SELECT broken FROM nowhere")
+    res = mem.recall(["cat sat warm mat window"], limit=5)
     with psycopg.connect(mem.database_url) as conn:
         channels = conn.execute(
             "SELECT channels FROM recall_events WHERE bank_id='b' "
             "ORDER BY id DESC LIMIT 1").fetchone()[0]
-    q = next(c for c in channels if c["name"] == "question")
-    assert q["error"] and q["n"] == 0
-    assert next(c for c in channels if c["name"] == "dense_chunk")["n"] >= 1
+    d = next(c for c in channels if c["name"] == "dense_chunk")
+    assert d["error"] and d["n"] == 0
+    assert next(c for c in channels if c["name"] == "hybrid_chunk")["n"] >= 1 and res
 
 
 # ------------------------------------------ floor-preserving fusion (floor_union)
@@ -232,10 +233,9 @@ def test_fuse_rejects_unknown_method_and_default_is_rrf():
 
 
 def test_recall_config_fusion_setting_validates():
-    from prospecta.stages import validate_recall_config, DEFAULT_RECALL_CONFIG
+    from prospecta.stages import validate_recall_config
     validate_recall_config({"fusion": {"method": "floor_union", "floor": 3}})
     validate_recall_config({"fusion": {"method": "rrf"}})
-    assert "fusion" not in DEFAULT_RECALL_CONFIG       # not the default
     for bad in ({"method": "x"}, {"floor": 0}, {"floor": True}, {"floor": "3"}, "rrf"):
         with pytest.raises(ValueError):
             validate_recall_config({"fusion": bad})

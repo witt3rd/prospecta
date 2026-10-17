@@ -1,7 +1,7 @@
-"""Built-in channels over the existing semantic code: DenseChunks and
-AnticipatedQuestions, the same cosine search as SEMANTIC_SQL restricted to
-one memory_items.kind. Each repeats the kind predicate literally so the
-per-kind partial HNSW index (migration 0004) can serve it."""
+"""DenseChunks: the cosine search of SEMANTIC_SQL restricted to the chunk items
+(memory_items.kind = 'chunk'). It repeats the kind predicate literally so the
+per-kind partial HNSW index (migration 0004) can serve it. (The `question` channel,
+the same search over the question items, was removed: docs/legacy.md.)"""
 from __future__ import annotations
 
 import logging
@@ -27,7 +27,6 @@ ORDER BY m.embedding <=> %(qe)s::vector
 LIMIT %(n)s
 """
 DENSE_CHUNK_SQL = _SQL.format(kind="chunk")
-QUESTION_SQL = _SQL.format(kind="question")
 
 logger = logging.getLogger(__name__)
 _warned_exact = False
@@ -109,7 +108,3 @@ class DenseChunks(_Semantic):
     name = "dense_chunk"
     _sql = DENSE_CHUNK_SQL
 
-
-class AnticipatedQuestions(_Semantic):
-    name = "question"
-    _sql = QUESTION_SQL

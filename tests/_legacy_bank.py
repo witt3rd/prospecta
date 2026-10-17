@@ -12,4 +12,5 @@ def create_legacy_bank(mem, bank_id: str, *, embedding_dim: int, **kw) -> None:
     mem.create_bank(bank_id, embedding_dim=embedding_dim, **kw)
     mem.set_channel_config([], bank_id)
     mem.set_recall_config({}, bank_id)
-    mem.set_link_config({}, bank_id)
+    with mem._pool.cursor() as cur:       # the column default, as a legacy bank stored it
+        cur.execute("UPDATE banks SET link_config = '{}'::jsonb WHERE bank_id = %s", (bank_id,))

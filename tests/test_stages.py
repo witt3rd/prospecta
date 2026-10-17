@@ -1,18 +1,17 @@
-"""Recall stages after fusion: Reranker (SonnetListwise, JevScore, Jev gate),
-reader and agentic hop, accounting (migration 0009). LLM and Jev are stubs."""
+"""Recall stages after fusion: the cross-encoder rerank (Stage 2), the decision model's holder
+(JevScore), the validation of a recall_config. The reranker and Jev are stubs. (The Sonnet and Jev
+rerank, the Jev gate, the reader and its hop and the rerank blend were removed: docs/legacy.md; their
+tests went with them, and tests/test_retired_code.py pins what a bank that still names them does.)"""
 from __future__ import annotations
 
 from prospecta._test_helpers import no_cut
-
-import json
-import re
 
 import psycopg
 import pytest
 
 from prospecta.channels import DEFAULT_CHANNEL_CONFIG
 from prospecta.memory import Memory
-from prospecta.stages import JEV_CRITERIA, JEV_TASK, JevScore, LLMResult, validate_recall_config
+from prospecta.stages import JEV_MODEL, JevScore, validate_recall_config
 from tests._legacy_bank import create_legacy_bank
 from tests._stub_embedder import EMBED_DIM, stub_embed
 
@@ -28,31 +27,6 @@ QUERY = "cat sat"
 
 def vec(text):
     return "[" + ",".join(map(str, stub_embed([text])[0])) + "]"
-
-
-class StubLLM:
-    """Replies by the prompt it is asked: rerank vs reader."""
-
-    def __init__(self, ranking=None, reader=None, fail=False, raw=None):
-        self.ranking, self.reader, self.fail, self.raw = ranking, reader, fail, raw
-        self.prompts: list[str] = []
-
-    def __call__(self, messages, *, json_mode=False):
-        assert json_mode
-        text = messages[-1]["content"]
-        self.prompts.append(text)
-        if self.fail:
-            raise RuntimeError("provider down")
-        if "ranking notes" in text:
-            n = len(re.findall(r"^\[(\d+)\] ", text, re.M))
-            if self.raw is not None:
-                return self.raw
-            ranking = self.ranking(n) if callable(self.ranking) else (self.ranking or list(range(1, n + 1)))
-            reply = json.dumps({"grades": {str(i): 3 - min(r, 3) for r, i in enumerate(ranking)},
-                                "ranking": ranking})
-        else:
-            reply = json.dumps(self.reader or {"sufficient": True, "follow_ups": []})
-        return LLMResult(reply, model="stub-sonnet", tokens_in=100, tokens_out=10, cost_usd=0.002)
 
 
 @pytest.fixture
@@ -89,193 +63,6 @@ def test_stages_off_by_default_and_scores_unchanged(mem):
     assert "rerank" not in res[0].scores and "jev" not in res[0].scores
     with psycopg.connect(mem.database_url) as conn:
         assert conn.execute("SELECT recall_config FROM banks WHERE bank_id='b'").fetchone()[0] == {}
-
-
-def test_sonnet_listwise_reorders_grades_and_accounts(mem):
-    base = mem.search(QUERY, limit=5)
-    llm = StubLLM(ranking=lambda n: list(range(n, 0, -1)))   # reverse the fused order
-    mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True}})
-    res = mem.recall([QUERY], limit=5)
-    assert sources(res) == sources(base)[::-1]
-    assert all({"rerank", "jev"} <= set(r.scores) for r in res)
-    assert res[0].scores["rerank"] == 3.0
-    rerank, cost, tin, tout, n = last_event(mem, "rerank, cost_usd, tokens_in, tokens_out, n_llm_calls")
-    rec = rerank["per_query"][0]
-    assert rec["stage"] == "sonnet_listwise" and rec["fallback_reason"] is None
-    assert rec["order"] == [r.document_id for r in res]
-    assert rec["n_candidates"] == 5 and rec["model"] == "anthropic/claude-sonnet-5.5"
-    assert (float(cost), tin, tout, n) == (0.002, 100, 10, 1)
-    with psycopg.connect(mem.database_url) as conn:
-        row = conn.execute("SELECT prompt_name, model, tokens_in, tokens_out, cost_usd "
-                           "FROM llm_calls WHERE prompt_name='rerank_listwise'").fetchone()
-    assert row[:4] == ("rerank_listwise", "stub-sonnet", 100, 10) and float(row[4]) == 0.002
-
-
-def test_evidence_in_prompt_is_best_chunk_in_full(mem):
-    long = "cat sat " + "x" * 3000
-    mem.retain(long, source="long.md", index_text="cat sat long")
-    with psycopg.connect(mem.database_url) as conn:
-        conn.execute("INSERT INTO memory_items (bank_id, document_id, content, original_chunk,"
-                     " embedding, kind, ordinal, char_start, char_end) SELECT 'b', d.id, %s, %s,"
-                     " %s::vector, 'chunk', 0, 0, 1 FROM documents d WHERE d.source='long.md'",
-                     (long, long, vec(long)))
-        conn.commit()
-    llm = StubLLM()
-    mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True}})
-    mem.search("cat sat " + "x" * 3000, limit=5)
-    prompt = llm.prompts[0]
-    assert "long.md | date:" in prompt
-    assert "x" * 3000 in prompt   # no silent clipping of evidence
-
-
-def test_fit_passage_keeps_text_and_logs_full_warning_only_on_physical_limit(caplog):
-    from prospecta.stages import JEV_PASSAGE_MAX_BYTES, fit_passage
-    ok = "y" * 10_000
-    assert fit_passage(ok, "h") == ok
-    big = "z" * (JEV_PASSAGE_MAX_BYTES + 500)
-    with caplog.at_level("WARNING"):
-        cut = fit_passage(big, "h")
-    assert len(cut) == JEV_PASSAGE_MAX_BYTES
-    assert big in caplog.text   # the warning carries the full passage
-
-
-@pytest.mark.parametrize("llm", [StubLLM(fail=True), StubLLM(raw="no json here"),
-                                 StubLLM(raw='{"ranking": "x"}')])
-def test_failure_falls_back_to_fused_order_and_says_why(mem, llm):
-    base = sources(mem.search(QUERY, limit=5))
-    mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True}})
-    assert sources(mem.recall([QUERY], limit=5)) == base
-    rerank, n = last_event(mem, "rerank, n_llm_calls")
-    assert rerank["per_query"][0]["fallback_reason"].startswith("fused order stands")
-    assert n == 2   # one retry, then the stage fails loudly
-
-
-def fake_jev(scores, calls=None, fail=False, key="test-key"):
-    """Offline System One, strict like the real door: POST body keys exactly
-    {model, state, questions}; answers keyed by question id."""
-    def transport(req, timeout):
-        assert set(req) == {"model", "state", "questions"}
-        assert req["model"] == "typesafe/jev-1.14"
-        if calls is not None:
-            calls.append(req)
-        if fail:
-            raise TimeoutError("jev timed out")
-        return {"answers": {qid: {"type": "score", "score": scores(i)}
-                            for i, qid in enumerate(req["questions"])},
-                "id": "gen-dec-1", "model": "typesafe/jev-1.13-20260917",
-                "provider": "TypeSafe",
-                "usage": {"cost": 2.5e-05, "input_tokens": 596, "output_tokens": 75}}
-    return transport
-
-
-jev_transport = fake_jev
-
-
-def test_jev_score_as_reranker_in_spire_call_shape(mem):
-    seen = []
-    # the last candidate scores highest
-    mem._jev = JevScore(jev_transport(lambda i: float(i) / 4, seen))
-    base = sources(mem.search(QUERY, limit=5))
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
-    res = mem.recall([QUERY], limit=5)
-    assert sources(res) == base[::-1]
-    req = seen[0]
-    assert req["state"] == {"query": QUERY}
-    assert list(req["questions"]) == [f"p{i}" for i in range(len(req["questions"]))]
-    assert all(q["type"] == "score" and q["criteria"] == JEV_CRITERIA
-               and q["instructions"]["task"] == JEV_TASK
-               and q["instructions"]["kind"] == "note" and q["instructions"]["title"]
-               and q["instructions"]["text"] for q in req["questions"].values())
-    assert res[0].scores["jev"] == max(r.scores["jev"] for r in res)
-    n, cost = last_event(mem, "n_llm_calls, cost_usd")
-    assert n == 1 and float(cost) == pytest.approx(2.5e-05)
-
-
-def test_jev_failure_standalone_keeps_fused_order(mem):
-    mem._jev = JevScore(jev_transport(None, fail=True))
-    base = sources(mem.search(QUERY, limit=5))
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
-    assert sources(mem.recall([QUERY], limit=5)) == base
-    rerank, = last_event(mem, "rerank")
-    assert "TimeoutError" in rerank["per_query"][0]["fallback_reason"]
-
-
-def test_jev_partial_answer_is_a_failure(mem):
-    def transport(req, timeout):
-        return {"answers": {"p0": {"type": "score", "score": 3}}}
-    mem._jev = JevScore(transport)
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
-    mem.recall([QUERY], limit=5)
-    rerank, = last_event(mem, "rerank")
-    assert "answers are not exactly the asked ids" in rerank["per_query"][0]["fallback_reason"]
-
-
-@pytest.mark.parametrize("answers", [
-    {"p0": {"score": 1}, "p1": {"score": 1}, "p2": {"score": 1}, "p3": {"score": 1},
-     "p4": {"score": 1}, "p99": {"score": 1}},                       # extra id
-    {f"p{i}": {"score": 3.5} for i in range(5)},                     # out of range
-    {f"p{i}": {"score": float("nan")} for i in range(5)},            # not finite
-    {f"p{i}": {"score": "2"} for i in range(5)},                     # not a number
-])
-def test_jev_invalid_answers_mean_no_ranking(mem, answers):
-    mem._jev = JevScore(lambda req, timeout: {"answers": answers})
-    base = sources(mem.search(QUERY, limit=5))
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
-    assert sources(mem.recall([QUERY], limit=5)) == base
-    assert last_event(mem, "rerank")[0]["per_query"][0]["fallback_reason"]
-
-
-def test_jev_response_without_answers_is_no_ranking(mem):
-    mem._jev = JevScore(lambda req, timeout: {"error": {"message": "overloaded"}})
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}})
-    mem.recall([QUERY], limit=5)
-    assert "no answers" in last_event(mem, "rerank")[0]["per_query"][0]["fallback_reason"]
-
-
-def test_jev_gate_decides_jev_or_sonnet(mem):
-    gate = {"rerank": {"enabled": True}, "gate": {"enabled": True, "threshold": 2.95}}
-    base = sources(mem.search(QUERY, limit=5))
-    llm = StubLLM(ranking=lambda n: list(range(n, 0, -1)))
-    mem._rerank_llm = llm
-    mem.set_recall_config(gate)
-
-    mem._jev = JevScore(jev_transport(lambda i: 3.0 - 0.1 * i))      # confident: Jev order = fused
-    assert sources(mem.recall([QUERY], limit=5)) == base
-    rec = last_event(mem, "rerank")[0]["per_query"][0]
-    assert rec["gate"]["decision"] == "jev" and llm.prompts == []
-
-    mem._jev = JevScore(jev_transport(lambda i: 1.0))                # not confident: Sonnet reranks
-    assert sources(mem.recall([QUERY], limit=5)) == base[::-1]
-    rec = last_event(mem, "rerank")[0]["per_query"][0]
-    assert rec["gate"]["decision"] == "sonnet" and rec["stage"] == "sonnet_listwise"
-    assert len(llm.prompts) == 1 and rec["jev"]
-
-    mem._jev = JevScore(jev_transport(None, fail=True))              # Jev down: Sonnet reranks
-    assert sources(mem.recall([QUERY], limit=5)) == base[::-1]
-    assert last_event(mem, "rerank")[0]["per_query"][0]["gate"]["decision"] == "jev_failed"
-
-
-def test_jev_requests_are_15_per_call_and_two_for_a_pool_of_30():
-    from prospecta.channels.base import Candidate
-    from prospecta.channels.fusion import FusedDoc
-    from prospecta.stages import Item
-    items = []
-    for i in range(30):
-        c = Candidate(f"d{i}", None, f"s{i}", "x", i + 1, 0.0, "e", {})
-        items.append(Item(FusedDoc(f"d{i}", f"s{i}", 1.0, c), f"s{i}", "e" * 100))
-    calls: list[dict] = []
-    reqs: list[dict] = []
-    s = JevScore(jev_transport(lambda i: 1.0, reqs)).score("q", items, calls)
-    assert [len(r["questions"]) for r in reqs] == [15, 15] and len(s) == 30 and len(calls) == 2
-    # the 60 KB request cap splits a large batch further
-    big = [Item(it.doc, it.header, "e" * 2400) for it in items]
-    reqs.clear()
-    JevScore(jev_transport(lambda i: 1.0, reqs)).score("q", big, [])
-    assert all(len(json.dumps(r).encode()) <= 60_000 for r in reqs) and sum(
-        len(r["questions"]) for r in reqs) == 30
 
 
 def cross_encoder_transport(scores, fail=None):
@@ -327,92 +114,23 @@ def test_models_are_configurable_per_call_bank_and_env(mem, monkeypatch):
         mem.recall([QUERY], limit=5)
     assert seen == ["env/rr", "bank/rr", "call/rr"]
 
-    jev_models: list[str] = []
 
-    def jev(req, timeout):
-        jev_models.append(req["model"])
-        return {"answers": {qid: {"type": "score", "score": 1.0} for qid in req["questions"]}}
-    mem._jev = JevScore(jev)
-    for cfg, call_model in (({}, None), ({"models": {"decision_model": "bank/jev"}}, None),
-                            ({"models": {"decision_model": "bank/jev"}}, "call/jev")):
-        mem._decision_model = call_model
-        mem.set_recall_config({"rerank": {"enabled": True, "stage": "jev_score"}, **cfg})
-        mem.recall([QUERY], limit=5)
-    assert jev_models == ["typesafe/jev-1.14", "bank/jev", "call/jev"]
-
-
-def test_reader_sufficient_runs_no_hop(mem):
-    llm = StubLLM(reader={"sufficient": True, "follow_ups": ["ignored"]})
-    mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True}, "reader": {"enabled": True}})
-    mem.recall([QUERY], limit=5)
-    hops, n = last_event(mem, "hops, n_llm_calls")
-    h = hops["per_query"][0]
-    assert h["verdict"] == "sufficient" and h["follow_ups"] == [] and n == 2
-
-
-def test_reader_follow_ups_join_new_notes_and_rerank_again(mem):
-    # a top-1 pool: the follow-up must bring in notes outside the top 1
-    llm = StubLLM(reader={"sufficient": False,
-                          "follow_ups": ["dog barked moon", "revenue grew", "third follow-up"]})
-    mem._rerank_llm = llm
-    mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
-                           "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
-    res = mem.recall([QUERY], limit=10)
-    hops, n = last_event(mem, "hops, n_llm_calls")
-    h = hops["per_query"][0]
-    assert h["verdict"] == "follow_up" and h["follow_ups"] == ["dog barked moon", "revenue grew", "third follow-up"]   # no count cap
-    assert len(h["new_candidates"]) >= 2 and h["rerank"]["n_candidates"] == 1 + len(h["new_candidates"])
-    assert n == 3   # first rerank, reader, rerank of the joined set
-    assert len({r.document_id for r in res}) == len(res)
-    assert {"delta.md", "echo.md"} <= set(sources(res))
-
-
-def test_hop_keeps_scope_promotion(mem):
-    # a hard filter selects delta.md and echo.md (person Alice); the hop's
-    # cheap-only channel run must not drop the main run's meta list
-    with psycopg.connect(mem.database_url) as conn:
-        conn.execute("UPDATE documents SET person = 'Alice' WHERE source = ANY(%s)",
-                     (["delta.md", "echo.md"],))
-        conn.commit()
-
-    def extract_llm(messages, *, json_mode=False):
-        return json.dumps({"people": ["Alice"], "date_from": None, "date_to": None, "hard": True})
-    mem._llm = extract_llm
-    mem._rerank_llm = StubLLM(reader={"sufficient": False, "follow_ups": ["cat sat mat"]})
-    mem.set_recall_config({"rerank": {"enabled": True, "min_rel_score": 0.99},
-                           "reader": {"enabled": True, "min_rel_score": 1.0, "hop_min_rel_score": 0}})
-    cfg = no_cut(DEFAULT_CHANNEL_CONFIG)
-    for e in cfg:
-        if e["name"] == "meta":
-            e["params"] = {**(e.get("params") or {}), "promote": True}
-    mem.set_channel_config(cfg)
-    res = mem.recall([QUERY], limit=5)
-    h = last_event(mem, "hops")[0]["per_query"][0]
-    assert h["verdict"] == "follow_up" and h["new_candidates"]   # the hop really fired
-    fusion = last_event(mem, "fusion")[0]
-    assert len(fusion["scope_promoted"]) == 2
-
-
-def test_reader_failure_is_recorded_and_order_stands(mem):
-    class Bad(StubLLM):
-        def __call__(self, messages, *, json_mode=False):
-            if "ranking notes" in messages[-1]["content"]:
-                return super().__call__(messages, json_mode=json_mode)
-            raise RuntimeError("reader down")
-    mem._rerank_llm = Bad()
-    mem.set_recall_config({"rerank": {"enabled": True}, "reader": {"enabled": True}})
-    assert mem.recall([QUERY], limit=5)
-    h = last_event(mem, "hops")[0]["per_query"][0]
-    assert h["verdict"] == "error" and "reader down" in h["error"]
+def test_the_decision_model_is_the_call_then_the_bank_then_the_default():
+    from prospecta.stages import _with_decision_model
+    jev = JevScore(lambda request, timeout: {})
+    assert _with_decision_model(jev, None, None) is jev and jev.model == JEV_MODEL == "typesafe/jev-1.14"
+    assert _with_decision_model(jev, None, "bank/jev").model == "bank/jev"
+    assert _with_decision_model(jev, "call/jev", "bank/jev").model == "call/jev"
+    assert jev.model == JEV_MODEL                          # the shared holder is never mutated
+    assert _with_decision_model(None, "call/jev", None) is None
 
 
 def test_validate_recall_config():
     validate_recall_config({})
-    validate_recall_config({"rerank": {"enabled": True}, "gate": {"enabled": True}})
-    for bad in ({"nope": 1}, {"rerank": {"stage": "x"}}, {"gate": {"enabled": True}},
-                {"rerank": {"enabled": True, "stage": "jev_score"}, "gate": {"enabled": True}},
-                {"rerank": {"pool": 30}}, {"reader": {"top": 8}}, {"rerank": {"min_rel_score": 2}}, []):
+    validate_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
+    validate_recall_config({"rerank": {"enabled": False}})
+    for bad in ({"nope": 1}, {"rerank": {"stage": "x"}}, {"rerank": {"pool": 30}},
+                {"rerank": {"enabled": True, "stage": "cross_encoder", "min_rel_score": 2}}, []):
         with pytest.raises(ValueError):
             validate_recall_config(bad)
 
@@ -420,69 +138,9 @@ def test_validate_recall_config():
 def test_run_stages_misconfiguration_falls_back_to_fused_order():
     from prospecta.stages import StageDeps, run_stages
 
-    fused = ["a", "b"]
-    out, trace = run_stages(None, "q", fused, [], {"rerank": {"enabled": True}}, StageDeps())
+    fused = ["a", "b"]       # cross_encoder with no rerank transport
+    out, trace = run_stages(None, "q", fused, {"rerank": {"enabled": True, "stage": "cross_encoder"}},
+                            StageDeps())
     assert out == fused
     assert trace["fallback_reason"]
     assert trace["n_llm_calls"] == 0
-
-
-# ------------------------------------------------------------- rerank blend
-
-def _items(n):
-    from prospecta.channels.fusion import FusedDoc
-    from prospecta.stages import Item
-    # d0 is the channel-agreed top hit (two channels at rank 1), the rest single-channel
-    return [Item(doc=FusedDoc(document_id=f"d{i}", source=f"s{i}",
-                              score=2 / 61 if i == 0 else 1 / (60 + i), best=None),
-                 header="", evidence="") for i in range(n)]
-
-
-class _DemoteTop:
-    """Stub reranker: moves the fused/dense top hit to rank 11, reverses nothing else."""
-    name = "stub"
-
-    def rerank(self, query, items, calls):
-        from prospecta.stages import Outcome
-        order = list(range(1, len(items)))
-        order.insert(10, 0)
-        return Outcome(order=order)
-
-
-def test_blend_alone_keeps_fused_top_inside_first_n():
-    from prospecta.stages import BlendedReranker
-    items = _items(30)
-    out = BlendedReranker(_DemoteTop(), {"enabled": True}).rerank("q", items, [])
-    assert out.order.index(0) < 10 and out.record["blend"]["floor"] is False
-    assert sorted(out.order) == list(range(30))
-
-
-def test_optional_floor_guarantees_top_k_even_with_rerank_only_weights():
-    from prospecta.stages import BlendedReranker
-    items = _items(30)
-    rerank_only = {"weight_rerank": 1.0, "weight_fused": 0.0}
-    out = BlendedReranker(_DemoteTop(), rerank_only).rerank("q", items, [])
-    assert out.order.index(0) == 10                       # no floor: the demotion stands
-    out = BlendedReranker(_DemoteTop(), {**rerank_only, "floor": True}).rerank("q", items, [])
-    assert out.order.index(0) < 10 and sorted(out.order) == list(range(30))
-
-
-def test_blend_off_is_old_behaviour():
-    from prospecta.stages import build_reranker
-    rr = build_reranker({"rerank": {"enabled": True, "blend": {"enabled": False}}},
-                        llm=lambda *a, **k: "", jev=None)
-    assert type(rr).__name__ == "SonnetListwise"
-    default = build_reranker({"rerank": {"enabled": True}}, llm=lambda *a, **k: "", jev=None)
-    assert type(default).__name__ == "SonnetListwise"      # blend is opt-in
-    on = build_reranker({"rerank": {"enabled": True, "blend": {"enabled": True}}},
-                        llm=lambda *a, **k: "", jev=None)
-    assert type(on).__name__ == "BlendedReranker"
-    assert _DemoteTop().rerank("q", _items(30), []).order.index(0) == 10
-
-
-def test_blend_config_validation():
-    from prospecta.stages import validate_recall_config
-    validate_recall_config({"rerank": {"blend": {"floor": True, "keep": 3, "within": 10}}})
-    for bad in ({"keep": 11}, {"floor": "yes"}, {"weight_fused": -1}, {"bogus": 1}):
-        with pytest.raises(ValueError):
-            validate_recall_config({"rerank": {"blend": bad}})

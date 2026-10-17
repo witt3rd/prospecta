@@ -11,8 +11,7 @@ bound on work or cost, configurable, never clips evidence; **caller** = the call
 argument.
 
 This page lists the limits of the current design (`docs/postgres-hybrid.md`). The limits of the
-retired graph, linker, reader / hop, BM25 and grounded-synthesis code are in that code
-(`docs/legacy.md`).
+retired graph, linker, reader / hop and BM25 code are in git history (`docs/legacy.md`).
 
 ## The write path
 

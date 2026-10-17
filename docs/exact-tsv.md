@@ -11,16 +11,15 @@ verification, growing linearly with the bank. Migration 0020 stores the vector:
 - `memory_items_exact_tsv_gin`, a GIN index on it, built `CREATE INDEX CONCURRENTLY` (writes are never
   blocked) right after the migration commits.
 
-**One definition of the word rule.** `indexed_expression()` in `prospecta/db/keyword_index.py` (the
-`simple` configuration plus the pieces of a path split at slashes) is the expression migration 0018
-indexes for the `keyword` channel. The migration file carries only the placeholder
+**One definition of the word rule.** `indexed_expression()` in `prospecta/db/exact_tsv.py` (the
+`simple` configuration plus the pieces of a path split at slashes) is the expression migration 0018 once
+indexed for the removed `keyword` channel. The migration file carries only the placeholder
 `{{EXACT_TSV_EXPRESSION}}`, which `migrate.run_migrations` fills from that function; the query names only
 the column. `tests/test_exact_tsv.py` checks that every row's column equals the expression, and that the
 Stage 1 results equal the old expression form row for row.
 
-`memory_items_keyword_gin` (migration 0018) is kept: the legacy `keyword` channel still uses it
-(see "Legacy keyword index" at the end of this page). Dropping it, or moving that channel to
-`exact_tsv`, is a separate decision.
+`memory_items_keyword_gin` (migration 0018) is no longer used by any code (the `keyword` channel was
+removed; see "The retired keyword index" at the end of this page). A database that has it keeps it.
 
 ## What the migration costs (read before applying it to a live database)
 
@@ -178,25 +177,19 @@ seconds. This is not capped here: whether to bound it (and how) is a product dec
 recall of `docs/postgres-hybrid.md` section 1 feeds the stemmed retriever a short `query` per search, so
 the words per OR stay few there.
 
-## Legacy keyword index (`memory_items_keyword_gin`, migration 0018)
+## The retired keyword index (`memory_items_keyword_gin`, migration 0018)
 
-Not part of Stage 1. The legacy `keyword` channel (`docs/legacy.md`) matches the question's
-words against `memory_items.original_chunk` (chunk text; for an unchunked document, the
-document text). Migration 0018 adds a GIN expression index, `memory_items_keyword_gin`, over
-that channel's word rule: the `simple` text-search configuration (stemming off) plus path
-pieces split at slashes. The channel's query uses the same expression (`indexed_expression()`
-in `prospecta/db/keyword_index.py`, the one definition `exact_tsv` is generated from), so
-Postgres uses the index and keeps it current on every write.
+Not part of Stage 1, and **no longer used by any code**. Migration 0018 owed a GIN expression
+index, `memory_items_keyword_gin`, over the word rule of the `keyword` channel (the `simple`
+text-search configuration, stemming off, plus path pieces split at slashes): the same rule
+`exact_tsv` is generated from (`indexed_expression()` in `prospecta/db/exact_tsv.py`). The
+`keyword` channel and `prospecta keyword-index` were removed (`docs/legacy.md`), and
+`prospecta migrate` no longer builds the index.
 
-- **New and migrated databases:** `prospecta migrate` builds it after migration 0018.
-- **Existing bank, one command:** `prospecta keyword-index` (idempotent; also repairs an
-  interrupted build). `prospecta keyword-index --rebuild` rebuilds a valid one; the old index
-  serves until the swap.
-- **No lock on writes:** built with `CREATE INDEX CONCURRENTLY`. Reads and writes continue; the
-  build takes longer and waits for transactions open when it starts.
-- **Fallback:** without a valid index, and for `stemming: true` queries, the channel runs the
-  same expression as a scan of the bank (correct, slow). `KeywordChunks.used_index` reports
-  which path ran.
-- **Cost:** disk and write cost grow with text size. The index is shared by all banks in the
-  database; the bank filter is applied after the index lookup. A bank that never uses the
-  `keyword` channel still pays for it on every write until the index is dropped.
+- **A database that has it keeps it.** It is not dropped by any code. It costs disk and write time
+  on every row written, shared by all banks of the database; the operator may drop it when
+  nothing of the previous library still runs (`DROP INDEX CONCURRENTLY memory_items_keyword_gin`):
+  that is a decision for the operator, not a step of any upgrade.
+- **A new database does not get it.**
+- Its advisory key (`MIGRATE_LOCK_KEY + 3`) stays reserved (`prospecta/db/builder_locks.py`), so a
+  process still running the previous library, which builds the index, takes turns with this one.

@@ -3,39 +3,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from prospecta.channels.bm25 import Bm25Chunks
-from prospecta.channels.graph import GraphExpand
+from prospecta._warn import warn_once
 from prospecta.channels.hybrid import HybridChunks
-from prospecta.channels.keyword import KeywordChunks
 from prospecta.channels.meta import MetadataScope
-from prospecta.channels.semantic import AnticipatedQuestions, DenseChunks
+from prospecta.channels.semantic import DenseChunks
 
 REGISTRY: dict[str, type] = {
     DenseChunks.name: DenseChunks,
-    AnticipatedQuestions.name: AnticipatedQuestions,
-    Bm25Chunks.name: Bm25Chunks,
-    KeywordChunks.name: KeywordChunks,
     HybridChunks.name: HybridChunks,
-    GraphExpand.name: GraphExpand,
     MetadataScope.name: MetadataScope,
 }
 
-# The measured weights (design 8.2) for the channels built so far. `bm25` (weight 1)
-# is registered but opt-in: add {"name": "bm25", "weight": 1} to a bank's config.
-# `hybrid_chunk`, the native Postgres Stage 1 (docs/postgres-hybrid.md) that replaces
-# dense_chunk + bm25 + keyword with one reserved-slot query, is not in this list because it
-# is what a bank created fresh stores (prospecta/bank_defaults.py); this list is the legacy
-# default of banks that stored `[]`.
-# `graph` (an expand channel over memory_links) ships at weight 0, silent: links are
-# optional and off by default (docs/legacy.md), and a bank with no link rows
-# returns nothing from it. Set its weight per bank when the bank builds links.
+# Channels that were removed (docs/legacy.md), and why. A NEW config cannot name them
+# (validate_channel_config raises); a STORED config that does is still read: the channel is
+# skipped with one warning per process (build_channels), never an error that fails a recall.
+RETIRED: dict[str, str] = {
+    "bm25": "hybrid_chunk's stemmed retriever replaced it",
+    "keyword": "hybrid_chunk's exact retriever replaced it",
+    "question": "hybrid_chunk reads chunk items, and no channel reads question items any more",
+    "graph": "the linker that wrote the links it walked was removed",
+}
+
+# The measured weights (design 8.2) of the channels that remain besides `hybrid_chunk`: this is
+# the legacy default of a bank that names its channels by hand. `hybrid_chunk`, the native
+# Postgres Stage 1 (docs/postgres-hybrid.md), is not in this list because it is what a bank
+# created fresh stores (prospecta/bank_defaults.py).
 DEFAULT_CHANNEL_CONFIG: list[dict] = [
     {"name": "dense_chunk", "enabled": True, "weight": 4, "params": {}},
-    {"name": "question", "enabled": True, "weight": 1, "params": {}},
-    {"name": "graph", "enabled": True, "weight": 0,
-     "params": {"max_hops": 2, "decay": 0.5,
-                "type_weights": {"SEMANTIC": 1.0, "CAUSAL": 0.8,
-                                 "TEMPORAL": 0.5, "ENTITY": 0.5}}},
     {"name": "meta", "enabled": True, "weight": 3, "params": {}},
 ]
 
@@ -52,11 +46,14 @@ class ConfiguredChannel:
 
 
 def validate_channel_config(config: list[dict]) -> None:
+    """For a NEW config (set_channel_config): every channel must exist. A retired one is refused."""
     if not isinstance(config, list):
         raise ValueError("channel_config must be a list")
     seen: set[str] = set()
     for e in config:
         name = e.get("name") if isinstance(e, dict) else None
+        if name in RETIRED:
+            raise ValueError(f"channel {name!r} was retired ({RETIRED[name]}); see docs/legacy.md")
         if name not in REGISTRY:
             raise ValueError(f"unknown channel {name!r}; known: {sorted(REGISTRY)}")
         if name in seen:
@@ -71,8 +68,22 @@ def _make(cls, params: dict):
     return cls(**params) if getattr(cls, "takes_params", False) else cls()
 
 
+def retired_channels(config: list[dict]) -> list[str]:
+    """The enabled channels of a STORED config that were retired: skipped, never run."""
+    return [e["name"] for e in config
+            if isinstance(e, dict) and e.get("name") in RETIRED and e.get("enabled", True)]
+
+
 def build_channels(config: list[dict]) -> list[ConfiguredChannel]:
-    """Enabled channels in config order, recall first, then filter, then expand."""
+    """Enabled channels in config order, recall first, then filter.
+
+    This reads a STORED config: a retired channel it names is skipped with one warning per
+    process (the bank keeps what it stored; recall must not fail for it)."""
+    for name in retired_channels(config):
+        warn_once(f"channel:{name}",
+                  "channel_config names the %r channel, which was retired (%s) and is skipped; "
+                  "see docs/legacy.md", name, RETIRED[name])
+    config = [e for e in config if not (isinstance(e, dict) and e.get("name") in RETIRED)]
     validate_channel_config(config)
     out = []
     for e in config:
@@ -83,6 +94,6 @@ def build_channels(config: list[dict]) -> list[ConfiguredChannel]:
             channel=_make(REGISTRY[e["name"]], params), weight=float(e.get("weight", 1)),
             params=params,
         ))
-    order = {"recall": 0, "filter": 1, "expand": 2}
+    order = {"recall": 0, "filter": 1}
     out.sort(key=lambda c: order[c.channel.kind])  # type: ignore[attr-defined]  # stable
     return out

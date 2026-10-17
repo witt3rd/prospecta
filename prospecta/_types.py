@@ -232,20 +232,6 @@ class DocumentSourceConflictError(Exception):
         )
 
 
-class IndexTextGenerationError(Exception):
-    """Raised when LLM returns no usable index_text strings.
-
-    Carries the raw LLM response so the caller (or T14 sweeper) can decide
-    whether to log + skip, retry with a different prompt, or surface.
-    """
-
-    def __init__(self, *, raw_response: str) -> None:
-        self.raw_response = raw_response
-        super().__init__(
-            f"LLM produced no usable index_text strings; raw response: {raw_response[:200]!r}"
-        )
-
-
 Tracer = Callable[[str, dict[str, Any]], None]
 """Observability primitive. Default no-op.
 

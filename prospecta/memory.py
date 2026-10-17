@@ -84,10 +84,9 @@ def _channel_trace_payload(traces: "list[dict]") -> dict:
         "fusion": {**traces[0]["fusion"], "per_query": [t["fusion"] for t in traces]},
         "candidates": candidates,
     }
-    for key in ("rerank", "hops"):
-        per = [{**t[key], "query_index": qi} for qi, t in enumerate(traces) if t.get(key)]
-        if per:
-            out[key] = {"per_query": per}
+    per = [{**t["rerank"], "query_index": qi} for qi, t in enumerate(traces) if t.get("rerank")]
+    if per:
+        out["rerank"] = {"per_query": per}
     accs = [t["accounting"] for t in traces if t.get("accounting")]
     if accs:
         def _sum(k):
@@ -144,14 +143,11 @@ class Memory:
         tracer: Tracer | None = None,
         shadow_bank_id: str | None = None,
         shadow_embed: EmbedCallable | None = None,
-        rerank_llm: LLMCallable | None = None,
-        rerank_model: str | None = None,
         synth_llm: LLMCallable | None = None,
         jev: "Any | None" = None,
         rerank_transport: "Any | None" = None,
         reranker_model: str | None = None,
         decision_model: str | None = None,
-        linker: "Any | None" = None,
         schema: str | None = None,
     ) -> None:
         if not database_url:
@@ -165,10 +161,8 @@ class Memory:
         self._database_url = database_url
         self._llm = llm
         self._embed = embed
-        # Recall stages (banks.recall_config): the reranker / reader LLM falls
-        # back to `llm`; `jev` is a prospecta.stages.JevScore (None = no Jev).
-        self._rerank_llm = rerank_llm
-        self._rerank_model = rerank_model
+        # `synth_llm` answers Memory.ask (and the grounded recall_synth), else `llm`; `jev` is a
+        # prospecta.stages.JevScore, the decision model of Stage 0's gate and Stage 3 (None = no Jev).
         self._synth_llm = synth_llm
         self._jev = jev
         # Stage 2 cross-encoder (recall_config.rerank.stage = cross_encoder): its
@@ -177,12 +171,6 @@ class Memory:
         self._rerank_transport = rerank_transport
         self._reranker_model = reranker_model
         self._decision_model = decision_model
-        # Linker (prospecta._linker.Linker): typed links + entities after retain.
-        # None = no linking; with `asynchronous` it runs on one worker thread.
-        self._linker = linker
-        self._link_executor = None
-        self._pass_executor = None
-        self._link_futures: list = []
         self._default_bank_id = bank_id
         # Shadow reads (embedding migration): recall() also queries this bank
         # with shadow_embed and stores both runs in recall_events.
@@ -237,8 +225,10 @@ class Memory:
 
         A bank created here runs the hybrid architecture out of the box
         (prospecta.bank_defaults): channel_config = [hybrid_chunk] (Stage 1),
-        recall_config = a cross_encoder rerank (Stage 2), link_config = linking and
-        entity extraction off. `set_channel_config([])` makes it a legacy bank.
+        recall_config = a cross_encoder rerank (Stage 2). It stores link_config =
+        {"links": false, "entities": false}, which this library never reads (the linker
+        was removed) and an older library does: so a bank is never linked by one either.
+        `set_channel_config([])` makes it a legacy bank.
 
         Also creates the per-bank HNSW partial index for embedding columns.
         """
@@ -279,7 +269,9 @@ class Memory:
         """Set a bank's recall channel registry (banks.channel_config).
 
         `[]` restores the legacy three-channel hybrid recall. See
-        prospecta.channels.DEFAULT_CHANNEL_CONFIG for the measured defaults.
+        prospecta.channels.DEFAULT_CHANNEL_CONFIG for the measured defaults. A removed
+        channel (bm25, keyword, question, graph) is refused (docs/legacy.md); a bank that
+        stored one before still recalls, with that channel skipped.
         """
         import json as _json
 
@@ -297,47 +289,6 @@ class Memory:
             if cur.rowcount == 0:
                 raise ValueError(f"No such bank: {bank_id!r}")
 
-    def set_link_config(self, config: dict, bank_id: str | None = None) -> None:
-        """Set a bank's linker switches (banks.link_config). Keys: `links` (default
-        False: write link rows) and `entities` (default True: extract entities and
-        aliases). A key left out keeps its default; see docs/legacy.md."""
-        import json as _json
-
-        from prospecta._linker import validate_link_config
-        validate_link_config(config)
-        bank_id = bank_id or self._default_bank_id
-        validate_bank_id(bank_id)
-        with self._pool.cursor() as cur:
-            cur.execute(
-                "UPDATE banks SET link_config = %s::jsonb, updated_at = now() "
-                "WHERE bank_id = %s", (_json.dumps(config), bank_id))
-            if cur.rowcount == 0:
-                raise ValueError(f"No such bank: {bank_id!r}")
-
-    def get_link_config(self, bank_id: str | None = None) -> dict:
-        """The bank's effective linker switches, defaults filled in."""
-        from prospecta._linker import effective_link_config
-        bank_id = bank_id or self._default_bank_id
-        with self._pool.cursor() as cur:
-            cur.execute("SELECT link_config FROM banks WHERE bank_id = %s", (bank_id,))
-            row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"No such bank: {bank_id!r}")
-        return effective_link_config(row[0])
-
-    def drop_links(self, bank_id: str | None = None, *, yes: bool = False,
-                   batch: int = 10000) -> dict:
-        """Remove the link rows (memory_links) of a bank, in small transactions
-        (row locks only: no table lock, safe beside retain and recall). Entities,
-        aliases, link state and the pair cache are kept. Refuses (PermissionError)
-        unless `yes=True`. Returns {"rows", "bytes"}: rows removed and the space
-        they took (estimate: average row of the table plus its indexes)."""
-        from prospecta._linkdrop import drop_links
-        bank_id = bank_id or self._default_bank_id
-        validate_bank_id(bank_id)
-        with self._pool.dedicated() as conn:
-            return drop_links(conn, bank_id, yes=yes, batch=batch)
-
     def _emit_stage_calls(self, traces: "list[dict]") -> None:
         """One llm_call event per model call a recall stage made."""
         for t in traces:
@@ -348,9 +299,10 @@ class Memory:
                     logger.exception("tracer raised on llm_call; ignoring")
 
     def set_recall_config(self, config: dict, bank_id: str | None = None) -> None:
-        """Set a bank's recall stages (banks.recall_config): rerank, Jev gate,
-        reader/hop. `{}` turns every stage off. Needs a channel-configured bank.
-        See prospecta.stages.DEFAULT_RECALL_CONFIG."""
+        """Set a bank's recall stages (banks.recall_config): the cross_encoder rerank, the
+        models, the Stage 0 / Stage 3 settings, query expansion. `{}` turns every stage off. Needs a
+        channel-configured bank. A removed stage or key (the Sonnet / Jev rerank, the gate, the
+        reader, the blend) is refused (docs/legacy.md); docs/recall-stages.md lists the keys."""
         import json as _json
 
         from prospecta.stages import validate_recall_config
@@ -400,95 +352,8 @@ class Memory:
             )
 
     def close(self) -> None:
-        """Close the connection pool (after the link worker drains)."""
-        self.wait_for_links()
-        if self._pass_executor is not None:
-            self._pass_executor.shutdown(wait=True)
-        if self._link_executor is not None:
-            self._link_executor.shutdown(wait=True)
+        """Close the connection pool."""
         self._pool.close()
-
-    # ------------------------------------------------------------------
-    # Linker (migration 0006): typed links and entities, after retain
-    # ------------------------------------------------------------------
-
-    def link_document(self, document_id: str, bank_id: str | None = None) -> dict:
-        """Link one document now (needs Memory(linker=...)). Returns its stats."""
-        if self._linker is None:
-            raise RuntimeError("link_document needs Memory(linker=...)")
-        calls: list[dict] = []
-        with self._pool.dedicated() as conn:   # own connection: never the retain one
-            stats = self._linker.link_document(
-                conn, bank_id or self._default_bank_id, document_id, calls)
-        for c in calls:
-            try:
-                self._tracer("llm_call", {"bank_id": bank_id or self._default_bank_id, **c})
-            except Exception:  # pragma: no cover
-                logger.exception("tracer raised on llm_call; ignoring")
-        return stats
-
-    def link_pending(self, limit: int = 100, bank_id: str | None = None) -> int:
-        """Link up to `limit` documents that have no link state yet (the safety
-        net for documents written by the sweeper or before a Linker was set)."""
-        from prospecta._linker import pending_documents
-        bank = bank_id or self._default_bank_id
-        with self._pool.dedicated() as conn:
-            docs = pending_documents(conn, bank, limit)
-        for d in docs:
-            self.link_document(d, bank)
-        return len(docs)
-
-    def link_pass(self, mode: str = "all-pairs", limit: int | None = None,
-                  bank_id: str | None = None, background: bool = False, on_progress=None):
-        """Upgrade linked documents to `mode` after the import (see Linker.link_pass):
-        resumable by the link state and the pair cache, never blocks retain (own
-        connection; with background=True it runs on its own thread and a Future of the
-        progress dict {documents, judged, cached, failed, remaining} is returned)."""
-        if self._linker is None:
-            raise RuntimeError("link_pass needs Memory(linker=...)")
-        bank = bank_id or self._default_bank_id
-
-        def run():
-            calls: list[dict] = []
-            try:
-                with self._pool.dedicated() as conn:
-                    return self._linker.link_pass(conn, bank, mode, limit, calls, on_progress)
-            finally:
-                for c in calls:
-                    try:
-                        self._tracer("llm_call", {"bank_id": bank, **c})
-                    except Exception:  # pragma: no cover
-                        logger.exception("tracer raised on llm_call; ignoring")
-        if not background:
-            return run()
-        from concurrent.futures import ThreadPoolExecutor
-        if getattr(self, "_pass_executor", None) is None:
-            self._pass_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="link-pass")
-        return self._pass_executor.submit(run)
-
-    def _enqueue_link(self, document_id: str) -> None:
-        if self._linker is None:
-            return
-        if not self._linker.asynchronous:
-            self.link_document(document_id)
-            return
-        if self._link_executor is None:
-            from concurrent.futures import ThreadPoolExecutor
-            self._link_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="linker")
-        bank = self._default_bank_id
-
-        def run():
-            try:
-                self.link_document(document_id, bank)
-            except Exception:
-                logger.exception("linker failed for document %s", document_id)
-        self._link_futures.append(self._link_executor.submit(run))
-
-    def wait_for_links(self) -> None:
-        """Block until the link worker has drained its queue."""
-        futs, self._link_futures = self._link_futures, []
-        for f in futs:
-            f.result()
 
     # ------------------------------------------------------------------
     # T9 — index/search/remove (delegate to _index)
@@ -528,12 +393,11 @@ class Memory:
         return _index.remove_documents(self, sources)
 
     def retain(self, content: str, **kwargs) -> str:
-        """Write-side bilateral spine. Returns document_id (str UUID).
+        """Write a note. Returns document_id (str UUID).
 
         See prospecta._retain.retain for full signature and semantics:
           - the note is indexed as kind='chunk' items, no LLM call
           - caller-supplied index_text writes those question items instead (P4)
-          - generate_questions=True opts in to LLM-written question items
           - replace-on-source-match (docs/schema.md, "Re-retain")
           - DocumentSourceConflictError on hash collision with different source
         """
@@ -972,8 +836,7 @@ class Memory:
         event (recall_events.citations). `synth_prompt_override` is ignored.
 
         Grounded mode runs ONE recall: the question is the single query (no
-        formulation call), so meta extraction, rerank, reader and hop happen
-        once. `scope` defaults to the notes the extracted hard filter promoted
+        formulation call), so meta extraction and rerank happen once. `scope` defaults to the notes the extracted hard filter promoted
         (the filter set); `evidence_top` None keeps the notes scoring at least
         half the top score, and a set question uses the whole scope set of any
         size whatever the top.
@@ -1102,98 +965,6 @@ class Memory:
                        "chunks": list(n.chunks)} for n in grounded_res.notes]
             if grounded_res else [],
             synth_call=dict(grounded_res.call) if grounded_res else {},
-        )
-
-    def recall_mapreduce(
-        self,
-        message: str,
-        *,
-        entity: str,
-        aliases: "list[str] | None" = None,
-        metadata_filter: dict | None = None,
-        batch_size: int | None = None,
-        scan_relevance: float | None = None,
-        on_progress=None,
-        depth: "Literal['standard','deep'] | None" = None,
-    ) -> RAGResult:
-        """Map-reduce recall for SET / discovery questions (``what are X's
-        nicknames``): every note tied to `entity` (documents.person, the entity
-        table by name or `aliases`, `metadata_filter`) is read in batches of
-        `batch_size` notes, facts are extracted with a citation each, then
-        merged into one deduplicated cited list (RAGResult.synthesis,
-        .citations). Completeness over speed. Cost, notes visited and facts
-        found are recorded per batch in recall_events.plan (mode 'mapreduce').
-        Map-reduce reads the whole entity set (no rerank pool), so `depth`
-        defaults to 'deep' and is recorded in recall_events.depth.
-        Notes tied by person/entity/alias rows are always read; notes reached
-        only by scanning alias text must rank >= `scan_relevance` x the best
-        scan hit (default _mapreduce.DEFAULT_SCAN_RELEVANCE).
-        """
-        from prospecta._scorecut import check_depth
-        depth = check_depth(depth) or "deep"
-        import time as _time
-
-        from prospecta import _mapreduce
-
-        llm = self._synth_llm or self._llm
-        if llm is None:
-            raise RuntimeError(
-                "Memory.recall_mapreduce requires an `llm` callable; "
-                "construct Memory(llm=...)"
-            )
-        t_start = _time.monotonic()
-        bank_id = self._default_bank_id
-        with self._pool.connection() as conn:
-            res = _mapreduce.run_mapreduce(
-                conn, bank_id, message, llm, entity=entity, aliases=aliases,
-                metadata_filter=metadata_filter,
-                batch_size=_mapreduce.DEFAULT_BATCH_SIZE if batch_size is None else batch_size,
-                scan_relevance=(_mapreduce.DEFAULT_SCAN_RELEVANCE
-                                if scan_relevance is None else scan_relevance),
-                on_progress=on_progress)
-        duration_ms = int((_time.monotonic() - t_start) * 1000)
-
-        from prospecta.stages import totals
-        tot = totals(res.calls)
-        for c in res.calls:
-            try:
-                self._tracer("llm_call", {
-                    "bank_id": bank_id, "purpose": c["purpose"], "json_mode": True,
-                    "duration_ms": c["duration_ms"], "messages_count": 1,
-                    "prompt_text": c["prompt_text"], "response_text": c["response_text"],
-                    "model": c["model"], "tokens_in": c["tokens_in"],
-                    "tokens_out": c["tokens_out"], "cost_usd": c["cost_usd"],
-                })
-            except Exception:  # pragma: no cover
-                logger.exception("tracer raised on llm_call; ignoring")
-        try:
-            self._tracer("recall", {
-                "bank_id": bank_id,
-                "queries": [message],
-                "mode": "mapreduce",
-                "n_results": len(res.items),
-                "duration_ms": duration_ms,
-                "trace": None,
-                "results": [{"fact": it["fact"], "notes": it["notes"]} for it in res.items],
-                "synthesis": res.synthesis,
-                "citations": res.citations,
-                "plan": res.plan,
-                "depth": depth,
-                **tot,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on recall; ignoring")
-
-        return RAGResult(
-            synthesis=res.synthesis, sources=[], queries=[Query(text=message)],
-            queries_to_results={}, citations=res.citations,
-            evidence=[{"fact": it["fact"], "notes": it["notes"],
-                       "citations": it["citations"]} for it in res.items],
-            synth_call={"model": next((c["model"] for c in res.calls if c["model"]), None),
-                        "tokens_in": tot["tokens_in"], "tokens_out": tot["tokens_out"],
-                        "cost_usd": tot["cost_usd"], "duration_ms": duration_ms,
-                        "n_llm_calls": tot["n_llm_calls"],
-                        "notes_visited": res.notes_visited, "facts_found": res.facts_found},
         )
 
     # ------------------------------------------------------------------

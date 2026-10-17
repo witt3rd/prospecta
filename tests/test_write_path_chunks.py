@@ -1,8 +1,8 @@
 """Hybrid plan slice 1: the write path indexes a note's chunks directly.
 
 retain() writes kind='chunk' items (content = original_chunk = the chunk) with
-no model call, stamps documents.created_on on every note, and generates
-anticipated questions only when asked (`generate_questions=True`). The directory
+no model call and stamps documents.created_on on every note (the model-written
+anticipated questions of `generate_questions=True` were removed). The directory
 indexer writes its chunks as kind='chunk' as well. Existing question items and
 an explicit `index_text` keep working (tests/test_retain_roundtrip.py)."""
 from __future__ import annotations
@@ -11,7 +11,6 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import psycopg
-import pytest
 
 # Several paragraphs of invented text: more than one 1,000-character chunk.
 BODY = "\n\n".join(
@@ -85,25 +84,8 @@ def test_retain_replace_regenerates_chunks_only(memory_with_bank):
 
 
 # --------------------------------------------------------------------------
-# retain(): questions only when asked, index_text still wins
+# retain(): index_text still wins
 # --------------------------------------------------------------------------
-
-def test_generate_questions_is_opt_in(memory_with_bank_and_mock_llm, mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    doc = mem.retain(BODY, source="harbour.md", generate_questions=True)
-    assert len(mock_llm.calls) == 1
-    rows = _items(mem.database_url, doc)
-    assert {r[0] for r in rows} == {"question"} and len(rows) == 3
-    assert all(r[6] is True for r in rows)
-
-
-def test_generate_questions_with_child_chunks_adds_the_chunks(memory_with_bank_and_mock_llm, mock_llm):
-    mem = memory_with_bank_and_mock_llm
-    doc = mem.retain(BODY, source="harbour.md", generate_questions=True, child_chunks=True)
-    kinds = [r[0] for r in _items(mem.database_url, doc)]
-    assert kinds.count("question") == 3 and kinds.count("chunk") > 1
-    assert len(mock_llm.calls) == 1
-
 
 def test_index_text_wins_and_writes_no_chunks_unless_asked(memory_with_bank_and_mock_llm, mock_llm):
     mem = memory_with_bank_and_mock_llm
@@ -111,26 +93,6 @@ def test_index_text_wins_and_writes_no_chunks_unless_asked(memory_with_bank_and_
     assert mock_llm.calls == []
     assert [(r[0], r[1]) for r in _items(mem.database_url, doc)] == [
         ("question", "Where is the lighthouse?")]
-
-
-@pytest.mark.parametrize("kwargs", [
-    {"index_text": "q?", "generate_questions": True},
-    {"index_text_prompt_override": "Questions for {{ content }}"},
-])
-def test_conflicting_question_arguments_are_refused_before_any_write(
-        memory_with_bank_and_mock_llm, mock_llm, kwargs):
-    mem = memory_with_bank_and_mock_llm
-    with pytest.raises(ValueError):
-        mem.retain(BODY, source="harbour.md", **kwargs)
-    with psycopg.connect(mem.database_url) as conn:
-        assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 0
-    assert mock_llm.calls == []
-
-
-def test_generate_questions_needs_an_llm(memory_with_bank):
-    memory_with_bank._llm = None
-    with pytest.raises(RuntimeError, match="llm"):
-        memory_with_bank.retain(BODY, source="harbour.md", generate_questions=True)
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +126,7 @@ def test_note_date_comes_from_frontmatter_then_metadata_kwarg(memory_with_bank):
 def test_every_write_variant_is_stamped(memory_with_bank_and_mock_llm):
     mem = memory_with_bank_and_mock_llm
     docs = [mem.retain("one", source="1", index_text="q?"),
-            mem.retain("two", source="2", generate_questions=True),
+            mem.retain("two", source="2", index_text="q2?", child_chunks=True),
             mem.retain("three", source="3", child_chunks=True)]
     assert all(_created_on(mem.database_url, d) is not None for d in docs)
 

@@ -39,7 +39,7 @@ def _list_migrations() -> list[tuple[int, Path]]:
 
 def _render(sql: str) -> str:
     """Fill a migration's placeholders. `{{EXACT_TSV_EXPRESSION}}` (0020) is the one word
-    rule of keyword_index.indexed_expression(), so the rule is defined once."""
+    rule of exact_tsv.indexed_expression(), so the rule is defined once."""
     from prospecta.db.exact_tsv import column_expression
     return sql.replace("{{EXACT_TSV_EXPRESSION}}", column_expression())
 
@@ -114,9 +114,9 @@ def run_migrations(database_url: str, schema: str | None = None) -> dict:
         finish_0004(database_url)
     if 5 in current or 5 in applied:
         finish_0005(database_url)
-    if 18 in current or 18 in applied:
-        from prospecta.db.keyword_index import ensure_keyword_index
-        ensure_keyword_index(database_url)
+    # Migration 0018 is applied (it is a version marker) but its index, memory_items_keyword_gin, is
+    # no longer built here: the keyword channel was removed and no code reads the index. A database
+    # that has it keeps it.
     if 20 in current or 20 in applied:
         from prospecta.db.exact_tsv import ensure_exact_tsv_index
         ensure_exact_tsv_index(database_url)

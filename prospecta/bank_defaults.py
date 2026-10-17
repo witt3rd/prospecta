@@ -10,14 +10,17 @@ db/queries.py), so every path that creates a bank gets them: `prospecta init`,
   timeout are not stored: they come from the code defaults and the environment
   (stages.RERANKER_MODEL, PROSPECTA_RERANKER_MODEL), so changing a default reaches
   every bank that does not set its own.
-- link_config: the linker and entity extraction are off.
+- link_config: linking and entity extraction are off. The linker was removed from this library
+  (docs/legacy.md) and nothing here reads the column; it is still written, `{"links": false,
+  "entities": false}`, because an older library reading the bank treats a stored `{}` as "entities
+  on" and would extract entities on every write.
 
 Existing banks are never changed. These constants are used only by that INSERT:
 there is no migration that writes them, and the column DEFAULTs of `banks` stay the
 legacy values (`[]`, `{}`, `{}`), so a bank inserted by anything else (an older
 library, a restore, raw SQL) is a legacy bank that runs the legacy path unchanged.
-Nothing here imports the channel, stage or linker modules (tests validate each
-value against them).
+Nothing here imports the channel or stage modules (tests validate each value
+against them).
 """
 from __future__ import annotations
 

@@ -30,13 +30,14 @@ files in order, once each, recording them in `prospecta_schema_version`. Concurr
 serialise on one advisory lock. Hand-written SQL, no ORM; a migration is additive unless it
 says otherwise (only `0020` rewrites a table).
 
-Four migrations have a second half that cannot run inside a transaction
+Three migrations have a second half that cannot run inside a transaction
 (`CREATE INDEX CONCURRENTLY`); `run_migrations` does it right after the commit and on every
 later run, so re-running `prospecta migrate` repairs an interrupted build: `0004` (backfill of
 `kind`, the `(bank_id, kind)` index and the per-kind HNSW indexes), `0005` (the
-`created_on` / `person` indexes), `0018` (the keyword index) and `0020` (the `exact_tsv` GIN
-index). `0020` also has a placeholder, `{{EXACT_TSV_EXPRESSION}}`, that the runner fills from
-`prospecta/db/keyword_index.py:indexed_expression()` so the word rule is defined once.
+`created_on` / `person` indexes) and `0020` (the `exact_tsv` GIN index). (`0018`, the keyword
+index, had one too; it is no longer built.) `0020` also has a placeholder,
+`{{EXACT_TSV_EXPRESSION}}`, that the runner fills from
+`prospecta/db/exact_tsv.py:indexed_expression()` so the word rule is defined once.
 
 **Shared-database mode.** With `PROSPECTA_SCHEMA` (or `Memory(schema=...)`) every connection
 pins `search_path` to that schema, every object lands in it, the migration ledger included,
@@ -59,7 +60,7 @@ config, its own indexes.
 | `config` | jsonb `'{}'` | unused by the library |
 | `channel_config` | jsonb `'[]'` (0008) | the recall channels (`docs/recall-stages.md`). `[]` is a **legacy bank** (`docs/legacy.md`) |
 | `recall_config` | jsonb `'{}'` (0009) | rerank, expansion, gate, Stage 3, models, depth (`docs/recall-stages.md`) |
-| `link_config` | jsonb `'{}'` (0019) | linker switches `{links, entities}` (`docs/legacy.md`) |
+| `link_config` | jsonb `'{}'` (0019) | linker switches `{links, entities}`: **no code reads it any more** (the linker was removed, `docs/legacy.md`); `create_bank` still writes both false so that an older library never links the bank |
 | `created_at`, `updated_at` | timestamptz | |
 
 The three config columns keep the legacy values as their column `DEFAULT`s. A bank created by
@@ -101,7 +102,7 @@ What is searched. One row per chunk (or, on a legacy bank, per anticipated quest
 |---|---|---|
 | `id` | uuid PK | |
 | `bank_id`, `document_id` | → banks, → documents | |
-| `kind` | text `'question'` (0004) | **`'chunk'`** (a slice of its document, written by `retain` and the directory index) or `'question'` (an anticipated question, only when the caller supplies `index_text` or asks for `generate_questions`; the column default is `'question'` for rows that predate the column) |
+| `kind` | text `'question'` (0004) | **`'chunk'`** (a slice of its document, written by `retain` and the directory index) or `'question'` (an anticipated question: only the caller's own `index_text` writes one now; the model-written ones of older banks stay; the column default is `'question'` for rows that predate the column) |
 | `content` | text | for a chunk, the chunk text; for a question, the question |
 | `original_chunk` | text | the source text of the item: the chunk itself, or for a question the chunk of the note that matches it. What Stage 2 reads and what is cited |
 | `embedding` | vector (no fixed width) | the embedding of `content`; a trigger checks its width against `banks.embedding_dim` |
@@ -119,7 +120,7 @@ overlap from `retain` and **200** by default from `index_directory` (`chunk_size
 
 Indexes: `(bank_id, created_at DESC)`, `(bank_id, kind)`, `(document_id)`, GIN on `tags`,
 `content_tsv`, `body_tsv`, `exact_tsv` (`memory_items_exact_tsv_gin`, built concurrently), the
-legacy keyword expression index `memory_items_keyword_gin` (0018), and, **per bank, three
+on a database that built it before, the unused keyword expression index `memory_items_keyword_gin` (0018), and, **per bank, three
 partial HNSW indexes** on `(embedding::vector(N)) vector_cosine_ops` with `m = 16`,
 `ef_construction = 64`: `memory_items_embedding_<bank>_idx` (`WHERE bank_id = '<bank>'`),
 `…_<bank>_chunk_idx` and `…_<bank>_question_idx` (`… AND kind = '<kind>'`), where `N` is the
@@ -155,11 +156,12 @@ how to read it.
 
 ### Legacy tables
 
-Created by `0006`, `0014`, `0016`; used only by the entity / link / graph machinery that new
-banks do not run (`docs/legacy.md`): `memory_entities`, `memory_item_entities`,
+Created by `0006`, `0014`, `0016`; written only by the entity / link / graph machinery that was
+removed (`docs/legacy.md`), and kept for the banks that ran it: `memory_entities`, `memory_item_entities`,
 `memory_entity_aliases`, `memory_links`, `memory_link_state`, `memory_link_pairs`,
 `memory_alias_state`, and the SQL function `prospecta_doc_date` (0006, 0013). They are empty for a bank that never
-extracted entities or built links.
+extracted entities or built links. No code reads or writes them now; deleting a document or its items cascades
+through them as before.
 
 ## Write semantics
 
@@ -176,8 +178,7 @@ extracted entities or built links.
    whose content changed replaces the earlier document of that source.)
 5. The note is cut into chunks (frontmatter excluded), embedded in one call, and written as
    `kind = 'chunk'` items. **No model is called.** With `index_text=` the caller's questions are
-   written *instead of* the chunks (`child_chunks=True` writes both); `generate_questions=True`
-   has the model write them. A directory file whose frontmatter has `index_text:` gets its
+   written *instead of* the chunks (`child_chunks=True` writes both). A directory file whose frontmatter has `index_text:` gets its
    questions and its body chunks.
 6. `documents.created_on` is always set (see above); a `retain_events` row is written.
 
@@ -209,7 +210,7 @@ entity and link rows and its `source_refs` row by cascade.
 | 0003 | durable event detail: `retain_events.index_text_generated`, `recall_events.results` / `synthesis`, `llm_calls.prompt_text` / `response_text`, `formulate_events.error_kind` |
 | 0004 | `memory_items.kind`, `ordinal`, `char_start`, `char_end`; `(bank_id, kind)`; per-kind HNSW indexes (post-commit) |
 | 0005 | `documents.created_on`, `person`, `source_kind` + indexes (post-commit) |
-| 0006 | entities, entity-item join, typed links, link state, `prospecta_doc_date` (legacy) |
+| 0006 | entities, entity-item join, typed links, link state, `prospecta_doc_date` (legacy; its code was removed) |
 | 0007 | recall trace: `plan`, `channels`, `fusion`, `rerank`, `hops`; `recall_event_candidates`; `llm_calls.model` / tokens / cost |
 | 0008 | `banks.channel_config` |
 | 0009 | `banks.recall_config`; `recall_events` cost and token totals |
@@ -221,6 +222,6 @@ entity and link rows and its `source_refs` row by cascade.
 | 0015 | `recall_events.depth` |
 | 0016 | `memory_link_pairs` (legacy) |
 | 0017 | `source_refs` |
-| 0018 | the keyword expression index `memory_items_keyword_gin` (post-commit; legacy) |
+| 0018 | a version marker; it once owed the keyword expression index `memory_items_keyword_gin` (post-commit). That index is no longer built, a database that has it keeps it (legacy) |
 | 0019 | `banks.link_config` |
 | 0020 | `memory_items.exact_tsv` + GIN (**rewrites `memory_items`**) |

@@ -95,7 +95,7 @@ We use **Dual-Config Native PostgreSQL FTS (`english` + `simple`)** with GIN ind
 | `fts_en` | `to_tsvector('english', original_chunk)` | Stemmed keywords (`running` $\leftrightarrow$ `run`), natural-language terms, boolean operators. |
 | `fts_exact` | `to_tsvector('simple', original_chunk)` (plus the pieces of a path split at slashes) | Unstemmed exact tokens, proper names (`dan maycock`), IDs, flags, version strings (`v1.14`), and quoted exact phrases without stemmer distortion. |
 
-**Implementation names.** In Prospecta's schema `fts_en` is `memory_items.body_tsv` (migration 0002) and `fts_exact` is `memory_items.exact_tsv`, a STORED generated column (migration 0020) holding the keyword word rule over `original_chunk` (the `simple` configuration plus the pieces of a path split at slashes; defined once as `indexed_expression()` in `prospecta/db/keyword_index.py`), with its own GIN index. Adding the column rewrites the table: `docs/exact-tsv.md` is the operator runbook.
+**Implementation names.** In Prospecta's schema `fts_en` is `memory_items.body_tsv` (migration 0002) and `fts_exact` is `memory_items.exact_tsv`, a STORED generated column (migration 0020) holding the keyword word rule over `original_chunk` (the `simple` configuration plus the pieces of a path split at slashes; defined once as `indexed_expression()` in `prospecta/db/exact_tsv.py`), with its own GIN index. Adding the column rewrites the table: `docs/exact-tsv.md` is the operator runbook.
 
 ### Supported User & Agent Query Syntax (`websearch_to_tsquery`)
 
@@ -145,7 +145,7 @@ The design's names map to the shipped ones:
 | `category` | `documents.source_kind` (the cited `kind`) |
 | `content` | `memory_items.content` = `original_chunk` = the chunk text |
 | `fts_en` | `memory_items.body_tsv`, `to_tsvector('english', original_chunk)`, generated, GIN (migration 0002) |
-| `fts_exact` | `memory_items.exact_tsv`, the `simple` word vector of `original_chunk` plus the pieces of a path split at slashes (`indexed_expression()` in `prospecta/db/keyword_index.py`), generated, GIN (migration 0020) |
+| `fts_exact` | `memory_items.exact_tsv`, the `simple` word vector of `original_chunk` plus the pieces of a path split at slashes (`indexed_expression()` in `prospecta/db/exact_tsv.py`), generated, GIN (migration 0020) |
 | `embedding VECTOR(1536)` | `memory_items.embedding` (`vector`, width = the bank's `embedding_dim`; 1536 for the default embedder) |
 | the HNSW index | one partial index **per bank and kind**: `... USING hnsw ((embedding::vector(N)) vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE bank_id = '<bank>' AND kind = 'chunk'` (and `kind = 'question'`, and one on the bank alone); built by `create_bank` |
 | bank + date pre-filter | `documents (bank_id, created_on)` and `(bank_id, created_at DESC)`, `memory_items (bank_id, kind)` |

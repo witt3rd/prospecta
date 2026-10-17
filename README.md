@@ -20,7 +20,7 @@ The design is `docs/postgres-hybrid.md`; it is the one normative description.
 
 ## Status
 
-**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]`, a `cross_encoder` rerank and no linker (`prospecta/bank_defaults.py`). Banks created earlier keep the config they stored; the retired recall machinery that still serves them is in `docs/legacy.md`, and is not how new banks run. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
+**v0.1.** A bank created fresh runs all of the above with no configuration: `Memory.create_bank` (so `prospecta init`, `create-bank`, the service and `migrate-bank`) stores `channel_config = [hybrid_chunk]`, a `cross_encoder` rerank and no linker (`prospecta/bank_defaults.py`). Banks created earlier keep the config they stored; what was removed from the library and the legacy path that still serves them are in `docs/legacy.md`; neither is how new banks run. Tests: `tests/` (Postgres-backed tests use testcontainers, or `PROSPECTA_TEST_PG_URL`: `docs/testing.md`).
 
 Substrate: Postgres with the `pgvector` extension, **0.8 or newer** (Stage 1 uses iterative index scans). Models: an embedder and an `llm` are injected callables; the Stage 2 reranker and the decision model are reached over HTTP with an `OPENROUTER_API_KEY`. Without that key retrieval still works: the Stage 1 order stands instead of a rerank and a chat message is not gated (the result says so).
 
@@ -74,7 +74,7 @@ prospecta retain "Kelly was born March 4th 1990" --source kelly.md
 
 **One default embedder:** the LiteLLM default is `openai/text-embedding-3-large` cut to **1536** dimensions, also what `migrate-bank` writes and the width of new banks. The CLI reads the bank's `embedding_dim` and embeds queries at that width (`PROSPECTA_EMBED_DIM` overrides); `prospecta health` prints `PROSPECTA DOWN` if the embedder's width differs from the bank's. A bank's `embedding_dim` is fixed at creation and must match the embedder's output dimensionality: a sentence-transformers bank is **not** interchangeable with an OpenAI (1536-dim) bank.
 
-With `OPENROUTER_API_KEY` set the CLI also builds the Stage 2 rerank transport, the decision model (Jev, System One) and the accounted LLMs of the legacy stages and the synthesis. `PROSPECTA_JEV=off` opts out of Jev. The linker is built only for a bank whose `link_config` enables links or entities (a new bank stores both off) or when `PROSPECTA_LINKER=on`; `PROSPECTA_LINKER=off` never builds it (`docs/legacy.md`).
+With `OPENROUTER_API_KEY` set the CLI also builds the Stage 2 rerank transport, the decision model (Jev, System One) and the accounted LLM that writes the `ask` answer. `PROSPECTA_JEV=off` opts out of Jev. No linker is ever built: it was removed (`docs/legacy.md`).
 
 **Note dates:** every retained note gets `documents.created_on`: its own date (frontmatter `created` / `created_on` / `date`, or the `metadata=` kwarg), else today's date in the zone named by `PROSPECTA_TIMEZONE` (an IANA name such as `America/Los_Angeles`; UTC when unset).
 
@@ -153,7 +153,7 @@ prospecta config                         # show loaded config (passwords redacte
 prospecta backup FILE / restore FILE     # docs/backup-restore.md
 ```
 
-Legacy-bank commands (`link-pass`, `drop-links`, `keyword-index`, `retain --index-text`, `search --mode semantic|lexical`) are in `docs/legacy.md`. The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else `PROSPECTA_BANK`, default `prospecta`).
+Legacy-bank commands (`retain --index-text`, `search --mode semantic|lexical`) are in `docs/legacy.md`, which also says what was removed (`link-pass`, `drop-links`, `keyword-index`). The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else `PROSPECTA_BANK`, default `prospecta`).
 
 ## The HTTP service
 
@@ -186,7 +186,7 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/deployment.md`](docs/deployment.md) | Docker, local Postgres, Neon, Azure; pgvector 0.8 |
 | [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |
 | [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
-| [`docs/legacy.md`](docs/legacy.md) | the retired recall machinery that existing banks still use |
+| [`docs/legacy.md`](docs/legacy.md) | what was removed (and how to get it back), and the legacy read path that existing banks still use |
 | [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 

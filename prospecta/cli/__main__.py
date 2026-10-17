@@ -56,12 +56,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ---- migrate (T3) ---------------------------------------------------
     sub.add_parser("migrate", help="Apply pending database migrations")
-    ki = sub.add_parser(
-        "keyword-index",
-        help="Build (or --rebuild) the stored keyword index without blocking writes",
-    )
-    ki.add_argument("--rebuild", action="store_true",
-                    help="Rebuild even if a valid index exists (old one serves until the swap)")
 
     # ---- create-bank (T4) -----------------------------------------------
     cb = sub.add_parser(
@@ -125,8 +119,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--judge", action="store_true",
                     help="With --synth: judge answers against `answer:` lines (implies --synth)")
     ev.add_argument("--json", action="store_true", help="Emit the full report as JSON")
-    ev.add_argument("--rerank-blend", action=argparse.BooleanOptionalAction, default=None,
-                    help="Force the 0.7/0.3 rerank blend on/off for this run (default: config, off)")
     ev.add_argument("--depth", choices=("standard", "deep"), default=None,
                     help="Recall depth = rerank pool cut: standard 0.15, deep 0.05 "
                          "(default: the bank's recall_config.depth, else standard)")
@@ -188,22 +180,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sw.add_argument("--interval", type=float, default=86400.0)
 
-    # ---- link-pass ------------------------------------------------------
-    lp = sub.add_parser(
-        "link-pass",
-        help="Upgrade linked documents to --mode all-pairs after the import (resumable)")
-    lp.add_argument("--mode", choices=("all-pairs", "connected"), default="all-pairs")
-    lp.add_argument("--resume", action="store_true",
-                    help="Accepted for clarity: a pass always resumes (link state + pair cache)")
-    lp.add_argument("--limit", type=int, default=None, help="Documents in this run (default all)")
-
-    # ---- drop-links -----------------------------------------------------
-    dl = sub.add_parser(
-        "drop-links",
-        help="Remove the link rows of the bank (row locks only; needs --yes)")
-    dl.add_argument("--yes", action="store_true", help="Really remove them")
-    dl.add_argument("--batch", type=int, default=10000, help="Rows per transaction")
-
     # ---- backup / restore ----------------------------------------------
     bk = sub.add_parser("backup", help="pg_dump the database to a file")
     bk.add_argument("path", type=Path)
@@ -226,9 +202,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migrate":
         from prospecta.cli import migrate as migrate_cmd
         return migrate_cmd.run(args)
-    if args.command == "keyword-index":
-        from prospecta.cli import migrate as migrate_cmd
-        return migrate_cmd.run_keyword_index(args)
     if args.command == "create-bank":
         from prospecta.cli.bank import run_create_bank
         return run_create_bank(args)
@@ -262,12 +235,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sweep":
         from prospecta.cli.sweep import cmd_sweep
         return cmd_sweep(args)
-    if args.command == "link-pass":
-        from prospecta.cli.link_pass import cmd_link_pass
-        return cmd_link_pass(args)
-    if args.command == "drop-links":
-        from prospecta.cli.drop_links import cmd_drop_links
-        return cmd_drop_links(args)
     if args.command == "backup":
         from prospecta.cli.backup import cmd_backup
         return cmd_backup(args)

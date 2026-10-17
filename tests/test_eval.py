@@ -5,7 +5,6 @@ from __future__ import annotations
 from prospecta._test_helpers import no_cut
 
 import json
-import re
 from types import SimpleNamespace
 
 import psycopg
@@ -103,25 +102,35 @@ def test_verdict_ablation_and_addition_margin():
 
 
 def test_ablation_variants():
-    rc = {"rerank": {"enabled": True}, "gate": {"enabled": True}, "reader": {"enabled": False}}
+    rc = {"rerank": {"enabled": True, "stage": "cross_encoder"}}
     vs = {v["name"]: v for v in ev.ablation_variants(DEFAULT_CHANNEL_CONFIG, rc)}
-    assert set(vs) == {"-dense_chunk", "-question", "-meta", "+graph", "+bm25", "+keyword", "+hybrid_chunk", "-rerank", "-gate"}
-    off = [e for e in vs["-question"]["channels"] if e["name"] == "question"][0]
+    assert set(vs) == {"-dense_chunk", "-meta", "+hybrid_chunk", "-rerank"}
+    off = [e for e in vs["-meta"]["channels"] if e["name"] == "meta"][0]
     assert off["enabled"] is False
     assert [e["name"] for e in DEFAULT_CHANNEL_CONFIG if not e.get("enabled", True)] == []
-    assert vs["-rerank"]["stages"]["gate"]["enabled"] is False
-    assert rc["gate"]["enabled"] is True   # the bank's own config is not mutated
+    assert vs["-rerank"]["stages"]["rerank"]["enabled"] is False
+    assert rc["rerank"]["enabled"] is True   # the bank's own config is not mutated
     dark = [dict(e) for e in DEFAULT_CHANNEL_CONFIG]
     dark[1]["weight"] = 0
-    assert "-question" not in {v["name"] for v in ev.ablation_variants(dark, {})}
-    assert "+question" in {v["name"] for v in ev.ablation_variants(dark, {})}
+    assert "-meta" not in {v["name"] for v in ev.ablation_variants(dark, {})}
+    assert "+meta" in {v["name"] for v in ev.ablation_variants(dark, {})}
+    stored = DEFAULT_CHANNEL_CONFIG + [{"name": "question", "enabled": True, "weight": 1}]   # a retired channel
+    assert "-question" not in {v["name"] for v in ev.ablation_variants(stored, {})}
 
 
 # ------------------------------------------------------------- integration
 
+class ReversingRerank:
+    """A rerank transport that scores the documents of a request in the reverse of their order."""
+
+    def __call__(self, req, timeout):
+        return {"model": req["model"], "usage": {"total_tokens": 100, "cost": 0.002},
+                "results": [{"index": i, "relevance_score": 0.2 + 0.1 * i}
+                            for i in range(len(req["documents"]))]}
+
+
 class EvalLLM:
-    """Rerank: reverse the candidate order. Judge: correct iff answer names alpha.
-    Synthesis: cites [alpha.md]."""
+    """Judge: correct iff answer names alpha. Synthesis: cites [alpha.md]."""
 
     def __init__(self):
         self.calls = []
@@ -129,11 +138,6 @@ class EvalLLM:
     def __call__(self, messages, *, json_mode=False):
         text = messages[-1]["content"]
         self.calls.append(text)
-        if json_mode and "ranking notes" in text:
-            n = len(re.findall(r"^\[(\d+)\] ", text, re.M))
-            rev = list(range(n, 0, -1))
-            return LLMResult(json.dumps({"grades": {str(i): 3 for i in rev}, "ranking": rev}),
-                             model="stub-sonnet", tokens_in=100, tokens_out=10, cost_usd=0.002)
         if json_mode and "grading an answer" in text:
             ans = text.split("## Answer under test")[1]
             return LLMResult(json.dumps({"correct": "alpha" in ans}), cost_usd=0.0005)
@@ -145,7 +149,7 @@ class EvalLLM:
 @pytest.fixture
 def mem(fresh_db):
     llm = EvalLLM()
-    m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed)
+    m = Memory(database_url=fresh_db, bank_id="b", llm=llm, embed=stub_embed, rerank_transport=ReversingRerank())
     m.create_bank("b", embedding_dim=EMBED_DIM)
     m.set_channel_config(no_cut(DEFAULT_CHANNEL_CONFIG))
     for src, text in NOTES.items():
@@ -169,38 +173,33 @@ def test_run_eval_full_ablate_stage_costs_and_earning(mem):
     # the reversing reranker moves the worst fused note to the top: make it the gold
     worst = base[-1]
     qs = [ev.Question("W", qs[0].text, [worst], [], "single", None)]
-    mem.set_recall_config({"rerank": {"enabled": True, "stage": "sonnet_listwise"}})
+    mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
     rep = ev.run_eval(mem, qs, ablate=True)
     assert rep["full"]["summary"]["gold"]["hit1"] == 1.0
     stages = rep["full"]["stages"]
-    assert stages["stage:rerank_listwise"]["cost_usd"] == pytest.approx(0.002)
+    assert stages["stage:cross_encoder_rerank"]["cost_usd"] == pytest.approx(0.002)
     assert "channel:dense_chunk" in stages and stages["total"]["mean_latency_ms"] >= 0
     abl = {a["name"]: a for a in rep["ablations"]}
-    assert set(abl) == {"-dense_chunk", "-question", "-meta", "+graph", "+bm25", "+keyword", "+hybrid_chunk", "-rerank"}
+    assert set(abl) == {"-dense_chunk", "-meta", "+hybrid_chunk", "-rerank"}
     assert abl["-rerank"]["summary"]["gold"]["hit1"] == 0.0
     assert abl["-rerank"]["earns"] and "gold.hit1" in abl["-rerank"]["because"]
-    assert not abl["-question"]["earns"]
-    assert abl["+bm25"]["kind"] == "channel_on"
+    assert abl["+hybrid_chunk"]["kind"] == "channel_on"
     # the run wrote no config to the bank
     assert mem.search(qs[0].text, limit=3)
     text = ev.format_report(rep)
-    assert "-rerank" in text and "EARNS" in text and "stage:rerank_listwise" in text
+    assert "-rerank" in text and "EARNS" in text and "stage:cross_encoder_rerank" in text
     json.loads(ev.report_json(rep))
 
 
-def test_eval_flags_force_blend_and_promote(mem, monkeypatch):
+def test_eval_flag_forces_promote(mem, monkeypatch):
     seen = []
     monkeypatch.setattr(ev, "run_variant", lambda m, q, ch, rc, pool=None, depth=None: (
         seen.append((ch, rc)) or {"summary": {}, "stages": {}}))
-    ev.run_eval(mem, [])
-    assert not (seen[-1][1].get("rerank", {}).get("blend", {}).get("enabled", False))
-    ev.run_eval(mem, [], rerank_blend=True, scope_promote=True)
+    ev.run_eval(mem, [], scope_promote=True)
     ch, rc = seen[-1]
-    assert rc["rerank"]["blend"]["enabled"] is True
     assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [True]
-    ev.run_eval(mem, [], rerank_blend=False, scope_promote=False)
+    ev.run_eval(mem, [], scope_promote=False)
     ch, rc = seen[-1]
-    assert rc["rerank"]["blend"]["enabled"] is False
     assert [e["params"]["promote"] for e in ch if e["name"] == "meta"] == [False]
 
 
@@ -233,7 +232,7 @@ def test_cli_eval_prints_report_and_json(mem, tmp_path, monkeypatch, capsys):
     args = SimpleNamespace(questions=qf, ablate=True, synth=False, judge=False, json=False)
     assert cmd_eval(args) == 0
     out = capsys.readouterr().out
-    assert "full:" in out and "+bm25" in out
+    assert "full:" in out and "+hybrid_chunk" in out
     args.json = True
     assert cmd_eval(args) == 0
     assert json.loads(capsys.readouterr().out)["n_questions"] == 2

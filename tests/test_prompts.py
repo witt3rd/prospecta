@@ -10,7 +10,6 @@ import pytest
 PROMPTS_DIR = Path(__file__).parent.parent / "prospecta" / "prompts"
 
 PROSPECTA_PROMPTS = [
-    "generate-index-text.md",
     "formulate-queries.md",
     "rag-synthesize.md",
 ]
@@ -57,12 +56,6 @@ def test_prompt_has_no_forbidden_glyphs(prompt_file, glyph):
     assert glyph not in text, (
         f"{prompt_file} contains glyph '{glyph}' — translation incomplete"
     )
-
-
-def test_generate_index_text_no_person_var():
-    text = (PROMPTS_DIR / "generate-index-text.md").read_text()
-    assert "{{ person }}" not in text
-    assert "{{person}}" not in text
 
 
 def test_formulate_queries_specifies_json_mode():
