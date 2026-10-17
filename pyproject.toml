@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prospecta"
-version = "0.1.0.dev0"
+version = "1.0.0"
 description = "Long-term memory for agents on Postgres + pgvector: chunk-only writes, native hybrid retrieval, cross-encoder rerank, cited evidence"
 readme = "README.md"
 requires-python = ">=3.11"
