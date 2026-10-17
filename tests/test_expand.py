@@ -691,7 +691,7 @@ def test_a_tasks_own_project_comes_first_and_other_projects_are_labeled(made):
 def test_the_block_lists_the_searches_and_tells_the_agent_to_cite(made):
     mem = made(llm=FakeWriter([S("bridge lamp relay incident", ['"electric dreams"'], df="2024-03-01", dt="2024-04-30"),
                                S("pontoon survey due date")]), rerank=FakeRerank())
-    got = mem.expand_and_recall("lamps", gate=False)
+    got = mem.expand_and_recall('the lamps called "electric dreams"', gate=False)     # the prompt quotes the term
     head, *_ = got.block.split("\n\n")
     assert head == HEADING and CITE_LINE in got.block
     assert ('(1) bridge lamp relay incident | terms: "electric dreams" | dates: 2024-03-01 to 2024-04-30'
@@ -727,7 +727,8 @@ def test_the_block_is_sized_by_relevance_never_by_a_count(made):
                notes=notes)
     mem.set_channel_config([{"name": "hybrid_chunk", "weight": 1,
                              "params": {"semantic_limit": 50, "stemmed_limit": 50, "exact_limit": 50}}])
-    got = mem.expand_and_recall("pontoon survey", gate=False)
+    got = mem.expand_and_recall("pontoon survey", gate=False,
+                                near_copy_cosine=1.0)        # 40 notes of one template: no meaning collapse here
     assert len(got.items) == 40 and got.block.count("source=p") == 40       # more than any default limit
     assert got.dropped_for_tokens == 0
 
@@ -737,14 +738,15 @@ def test_the_max_tokens_valve_is_off_by_default_and_trims_the_tail_when_set(made
                           {"created_on": "2024-02-10"}) for n in range(12)}
     mem = made(llm=FakeWriter([S("pontoon survey records")]),
                rerank=FakeRerank(score=lambda q, d: 0.5), notes=notes)
-    full = mem.expand_and_recall("pontoon survey", gate=False)
+    same = dict(near_copy_cosine=1.0)                      # 12 notes of one template: no meaning collapse here
+    full = mem.expand_and_recall("pontoon survey", gate=False, **same)
     assert len(full.items) == 12 and full.dropped_for_tokens == 0
-    cut = mem.expand_and_recall("pontoon survey", gate=False, max_tokens=300)
+    cut = mem.expand_and_recall("pontoon survey", gate=False, max_tokens=300, **same)
     assert 1 <= len(cut.items) < 12 and cut.dropped_for_tokens == 12 - len(cut.items)
     assert f"({cut.dropped_for_tokens} more records matched less well and not shown.)" in cut.block
     assert [i.source for i in cut.items] == [i.source for i in full.items][:len(cut.items)]    # the best stay
-    assert len(mem.expand_and_recall("pontoon survey", gate=False, max_tokens=1).items) == 1  # one is always kept
-    mem.set_recall_config({"expansion": {"max_tokens": 300},
+    assert len(mem.expand_and_recall("pontoon survey", gate=False, max_tokens=1, **same).items) == 1  # one is always kept
+    mem.set_recall_config({"expansion": {"max_tokens": 300, "near_copy_cosine": 1.0},
                            "rerank": {"enabled": True, "stage": "cross_encoder", "min_score": 0}})
     assert len(mem.expand_and_recall("pontoon survey", gate=False).items) == len(cut.items)  # the bank's
 

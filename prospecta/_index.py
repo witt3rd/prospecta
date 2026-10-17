@@ -767,6 +767,7 @@ def recalled_from_fused(fused, bank_id: str, channel_lists: dict, channel_names:
             relevance_score=float(f.scores["rerank"]) if cross_encoder and "rerank" in f.scores
             else float(f.score),
             exact_snippet=d.get("exact_snippet"),
+            item_id=b.item_id,
         ))
     return out
 

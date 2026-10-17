@@ -91,6 +91,7 @@ RERANK_TOP_N = 10
 RERANK_MIN_SCORE = 0.15        # absolute floor on the calibrated relevance score (0..1)
 RERANK_TIMEOUT_S = 2.5
 NEAR_COPY_JACCARD = 0.88       # token Jaccard above which two notes are near-copies
+NEAR_COPY_COSINE = 0.90        # chunk-embedding cosine at or above which two notes say the same thing (query expansion's merge; measured, docs/postgres-hybrid.md)
 # qwen3-reranker-8b reads 41K tokens per request. A request carries at most 32K
 # estimated tokens (4 chars/token): the rest is margin for tokenizer variance,
 # the instruction and the query. A larger pool is split into several requests.
@@ -157,9 +158,9 @@ def validate_recall_config(cfg: dict) -> None:
         raise ValueError("stage0_gate.needs_memory_threshold must be a number in [0, 1]")
     ex = cfg.get("expansion", {})
     if not isinstance(ex, dict) or set(ex) - {"max_searches", "max_concurrency", "deadline_s",
-                                              "max_tokens", "fallback_min_rel"}:
+                                              "max_tokens", "fallback_min_rel", "near_copy_cosine"}:
         raise ValueError("expansion must be an object of max_searches/max_concurrency/"
-                         "deadline_s/max_tokens/fallback_min_rel")
+                         "deadline_s/max_tokens/fallback_min_rel/near_copy_cosine")
     for name, floor in (("max_searches", 1), ("max_concurrency", 1), ("max_tokens", 0)):
         v = ex.get(name)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < floor):
@@ -170,6 +171,9 @@ def validate_recall_config(cfg: dict) -> None:
     v = ex.get("fallback_min_rel")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1):
         raise ValueError("expansion.fallback_min_rel must be a number in [0, 1]")
+    v = ex.get("near_copy_cosine")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1):
+        raise ValueError("expansion.near_copy_cosine must be a number in (0, 1]")
     rr, gate, rd = (cfg.get(k) or {} for k in ("rerank", "gate", "reader"))
     for section, name in ((models, "decision_model"), (models, "query_writer_model"), (rr, "model")):
         v = section.get(name)
@@ -661,6 +665,74 @@ def deduplicate_near_copies(texts: Sequence[str], order: Sequence[int],
         survivors.append(i)
         for t in prefix:
             index.setdefault(t, []).append(len(survivors) - 1)
+    return survivors, collapsed
+
+
+def _numpy():
+    """numpy when it is installed (pgvector needs it, so it is), else None: the pure-Python path
+    below gives the same answer, only slower."""
+    try:
+        import numpy
+        return numpy
+    except ImportError:         # pragma: no cover
+        return None
+
+
+def deduplicate_by_meaning(vectors: Sequence[Sequence[float] | None], order: Sequence[int],
+                           threshold: float = NEAR_COPY_COSINE) -> tuple[list[int], dict[int, int]]:
+    """Collapse near-copies BY MEANING: `vectors` are embeddings indexed like the records (None where
+    a record has none), `order` lists indexes best first. A record whose cosine similarity to an
+    already kept record is at or above `threshold` collapses into the first (best) such kept record;
+    a record is compared with the kept ones only, never with one that collapsed. A record without a
+    usable vector (None, zero, not finite, or not of the usual length) is kept as it is and never
+    compared. Returns (the surviving indexes, in `order`; {collapsed index: the survivor it
+    collapsed into}), like deduplicate_near_copies."""
+    sizes: dict[int, int] = {}
+    for i in order:
+        v = vectors[i]
+        if v is not None:
+            sizes[len(v)] = sizes.get(len(v), 0) + 1
+    dim = max(sizes, key=lambda d: (sizes[d], d), default=0)
+    np = _numpy()
+    unit: dict[int, Any] = {}
+    for i in order:
+        v = vectors[i]
+        if v is None or len(v) != dim or dim == 0:
+            continue
+        if np is not None:
+            a = np.asarray(v, dtype=np.float64)
+            norm = float(np.linalg.norm(a)) if np.isfinite(a).all() else 0.0
+            if norm > 0:
+                unit[i] = a / norm
+        else:
+            vals = [float(x) for x in v]
+            norm = math.sqrt(sum(x * x for x in vals)) if all(math.isfinite(x) for x in vals) else 0.0
+            if norm > 0:
+                unit[i] = [x / norm for x in vals]
+    survivors: list[int] = []
+    collapsed: dict[int, int] = {}
+    kept: list[int] = []                    # the survivors that have a vector, best first
+    matrix = np.zeros((len(unit), dim)) if np is not None else None
+    for i in order:
+        u = unit.get(i)
+        if u is None:
+            survivors.append(i)
+            continue
+        twin = None
+        if kept:
+            if np is not None:
+                hits = np.flatnonzero(matrix[:len(kept)] @ u >= threshold - 1e-12)
+                twin = kept[int(hits[0])] if len(hits) else None
+            else:
+                twin = next((k for k in kept
+                             if sum(x * y for x, y in zip(unit[k], u)) >= threshold - 1e-12), None)
+        if twin is not None:
+            collapsed[i] = twin
+            continue
+        survivors.append(i)
+        if matrix is not None:
+            matrix[len(kept)] = u
+        kept.append(i)
     return survivors, collapsed
 
 

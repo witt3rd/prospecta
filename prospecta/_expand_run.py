@@ -17,6 +17,7 @@ one, not a queue of them."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -109,6 +110,7 @@ class _Plan:
     rr_timeout: float
     rr_dedupe: bool
     depth: str | None
+    near_copy_cosine: float
     excluded: list[str] | None
     meta: dict | None
     window: tuple[str | None, str | None]
@@ -123,6 +125,7 @@ def run_expansion(memory, prompt, kind: str = "chat", *, agent_last: str | None 
                   reranker_model: str | None = None, decision: Callable | None = None,
                   gate: bool | None = None, needs_memory_threshold: float | None = None,
                   min_score: float | None = None, depth: str | None = None,
+                  near_copy_cosine: float | None = None,
                   record: bool | None = None, now: date | None = None) -> ExpandedRecall:
     """See Memory.expand_and_recall (the arguments are its own). Never raises."""
     run = _Run(memory, kind)
@@ -134,7 +137,7 @@ def run_expansion(memory, prompt, kind: str = "chat", *, agent_last: str | None 
                       query_writer_model=query_writer_model, decision_model=decision_model,
                       reranker_model=reranker_model, decision=decision, gate=gate,
                       needs_memory_threshold=needs_memory_threshold, min_score=min_score,
-                      depth=depth, record=record, now=now)
+                      depth=depth, near_copy_cosine=near_copy_cosine, record=record, now=now)
     except Exception as exc:        # never into the caller
         logger.warning("query expansion failed (%s: %s); nothing recalled", type(exc).__name__, exc,
                        exc_info=True)
@@ -170,7 +173,7 @@ class _Run:
     def go(self, prompt, *, agent_last, project, date_from, date_to, excluded_sources,
            metadata_filter, deadline, max_searches, max_concurrency, max_tokens, query_writer_model,
            decision_model, reranker_model, decision, gate, needs_memory_threshold, min_score,
-           depth, record, now) -> ExpandedRecall:
+           depth, near_copy_cosine, record, now) -> ExpandedRecall:
         memory = self.memory
         if self.requested not in ("chat", "task"):
             return self.result(error="kind must be 'chat' or 'task'")
@@ -228,6 +231,7 @@ class _Run:
             rr_min_score=float(_pick(min_score, rr.get("min_score"), RERANK_MIN_SCORE)),
             rr_timeout=float(rr.get("timeout_s", RERANK_TIMEOUT_S)),
             rr_dedupe=bool(rr.get("deduplicate_near_copies", True)), depth=depth,
+            near_copy_cosine=ex.resolve_near_copy_cosine(near_copy_cosine, xcfg.get("near_copy_cosine")),
             excluded=excluded_sources, meta=metadata_filter,
             window=(_day(date_from, "date_from"), _day(date_to, "date_to")))
 
@@ -239,15 +243,31 @@ class _Run:
                     memory._emit_calls(self.calls)
                 return self.result(skipped=True, skipped_reason=skip)
 
-        # ---- the writer: the prompt becomes the searches
+        # ---- the writer: the prompt becomes the searches (its terms: names and identifiers only)
         writer_model = ex.resolve_query_writer_model(query_writer_model, models.get("query_writer_model"))
-        specs, why = self._write(text, kind, agent_last, today, writer_model, plan)
-        if why is None:
+        parsed = self._write(text, guard_text, kind, agent_last, today, writer_model, plan)
+        if parsed.why is None:
+            specs = parsed.searches
+            if parsed.dropped_terms:
+                shown = parsed.dropped_terms[:10]
+                self.fallbacks.append(
+                    f"{len(parsed.dropped_terms)} writer terms that are common words dropped (only names, "
+                    f"identifiers and quoted phrases of the prompt are terms): " + ", ".join(shown)
+                    + (", ..." if len(parsed.dropped_terms) > len(shown) else ""))
+            if parsed.dropped_searches:
+                k = parsed.dropped_searches
+                self.fallbacks.append(f"{k} {'search' if k == 1 else 'searches'} with nothing but common words "
+                                      "(no query, no name or identifier) dropped")
+            if not specs:       # the writer wrote searches and every one was dropped: nothing to ask
+                if record:
+                    memory._emit_calls(self.calls)
+                return self.result(skipped=True, skipped_reason="the writer's searches held nothing but "
+                                                                "common words: nothing asked")
             specs, cut = ex.apply_maximum(specs, max_searches)
             if cut is not None:
                 self.fallbacks.append(f"writer wrote {cut} searches: cut to the maximum of {max_searches}")
         else:
-            self.fallbacks.append(f"writer: {why}: one search with the prompt itself")
+            self.fallbacks.append(f"writer: {parsed.why}: one search with the prompt itself")
             specs = [SearchSpec(query=_clean(own_text))]
         specs, put_back = ex.guard_terms(specs, guard_text)
         if put_back:
@@ -265,7 +285,9 @@ class _Run:
         # ---- merge, scope, valve, block
         t = time.monotonic()
         ok = [r for r in self.runs if r.status == "ok"]
-        merged = ex.scope_first(ex.merge_records({r.index: outs[r.index].items for r in ok}), project)
+        merged = ex.scope_first(ex.merge_records(
+            {r.index: outs[r.index].items for r in ok}, vectors=self._vectors(plan),
+            near_copy_cosine=plan.near_copy_cosine), project)
         dropped = 0
         if plan.max_tokens > 0:
             kept: list[RecalledMemory] = []
@@ -327,11 +349,12 @@ class _Run:
 
     # ------------------------------------------------------------------ the writer
 
-    def _write(self, text, kind, agent_last, today, model, plan) -> tuple[list[SearchSpec], str | None]:
-        """(the writer's searches, None) or ([], why the writer gave none)."""
+    def _write(self, text, guard_text, kind, agent_last, today, model, plan) -> ex.ParsedReply:
+        """The writer's searches (terms filtered against the prompt `guard_text`), or a reply whose
+        `why` says why the writer gave none."""
         llm = self.memory._llm
         if llm is None:
-            return [], "no query-writer model (construct Memory(llm=...))"
+            return ex.ParsedReply([], "no query-writer model (construct Memory(llm=...))")
         from prospecta.channels.extract import _accepts_model
         prompt = ex.render_writer_prompt(text, kind=kind, agent_last=agent_last if kind == "chat" else None,
                                          max_searches=plan.max_searches, today=today)
@@ -348,14 +371,42 @@ class _Run:
             rec.update({k: v for k, v in llm_call_record(raw, purpose="expand_searches", model=model).items()
                         if k != "purpose"})
             rec["response_text"] = llm_text(raw)
-            specs, why = ex.parse_searches(rec["response_text"], today)
+            parsed = ex.parse_writer_reply(rec["response_text"], today, guard_text)
         except Exception as exc:
             name = type(exc).__name__
             rec["error"] = f"{name}: {exc}" if str(exc) else name
-            specs, why = [], f"the writer failed ({rec['error']})"
+            parsed = ex.ParsedReply([], f"the writer failed ({rec['error']})")
         rec["duration_ms"] = self.timings["writer"] = _ms(t)
         self.calls.append(rec)
-        return specs, why
+        return parsed
+
+    # ------------------------------------------------------------------ the merge's vectors
+
+    def _vectors(self, plan: _Plan) -> Callable[[list[str]], dict]:
+        """What merge_records asks for the meaning collapse: the chunk vectors of the records it
+        kept, read in ONE primary-key query on a borrowed connection, inside VECTORS_TIMEOUT_S. A
+        failure (or a late answer) leaves the vectors out: the merge then collapses by wording only,
+        and the run says so in `fallbacks`."""
+        memory = self.memory
+
+        def vectors(chunk_ids: list[str]) -> dict:
+            def read() -> dict:
+                with memory._pool.connection() as conn:
+                    conn.execute(f"SET LOCAL statement_timeout = {int(ex.VECTORS_TIMEOUT_S * 1000)}")
+                    out = load_chunk_vectors(conn, plan.bank_id, chunk_ids)
+                    conn.rollback()
+                return out
+            t = time.monotonic()
+            try:
+                return _call_within(read, ex.VECTORS_TIMEOUT_S)
+            except Exception as exc:
+                self.fallbacks.append(
+                    f"meaning collapse skipped: the chunk vectors could not be read ({type(exc).__name__}"
+                    f"{': ' + str(exc) if str(exc) else ''}): near-copies collapsed by wording only")
+                return {}
+            finally:
+                self.timings["vectors"] = _ms(t)
+        return vectors
 
     # ------------------------------------------------------------------ stages 1 and 2
 
@@ -419,6 +470,19 @@ class _Run:
                 **_channel_trace_payload(traces)})
         except Exception:  # pragma: no cover
             logger.exception("tracer raised on recall; ignoring")
+
+
+def load_chunk_vectors(conn, bank_id: str, ids: list[str]) -> dict[str, list[float]]:
+    """chunk id -> its embedding (memory_items.embedding), for the chunk ids given, in one
+    primary-key query. Cost: one round trip and 6 to 14 KB of text per chunk (1536 floats), parsed
+    with json: for the records a merge keeps (tens to a hundred or two), not for every candidate
+    of every search."""
+    if not ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id::text, embedding::text FROM memory_items "
+                    "WHERE bank_id = %s AND id = ANY(%s::uuid[])", (bank_id, list(ids)))
+        return {row[0]: json.loads(row[1]) for row in cur.fetchall()}
 
 
 def _search(memory, spec: SearchSpec, p: _Plan, cancelled: threading.Event, db) -> _Out:

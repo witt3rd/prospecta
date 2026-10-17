@@ -685,6 +685,7 @@ class Memory:
         needs_memory_threshold: float | None = None,
         min_score: float | None = None,
         depth: "Literal['standard','deep'] | None" = None,
+        near_copy_cosine: float | None = None,
         record: bool | None = None,
         now: "date | None" = None,
     ) -> "ExpandedRecall":
@@ -702,10 +703,14 @@ class Memory:
         2. Writer: the query-writer model (`query_writer_model`, else recall_config.models
            .query_writer_model, else PROSPECTA_QUERY_WRITER_MODEL, else
            openrouter/google/gemini-2.5-flash-lite; it is the Memory's `llm`) expands the prompt into
-           N searches {query, terms (verbatim names, identifiers, "quoted phrases"), date_from,
-           date_to}: about 3 for a short chat message, up to 10 to 20 for an elaborate one, never
-           more than `max_searches` (20). Terms of the prompt that no search carries are put back
-           into the first search. A bad reply falls back to ONE search: the prompt itself.
+           N searches {query, terms (verbatim proper names, identifiers, versions, paths, error
+           codes and "quoted phrases", never common words), date_from, date_to}: about 3 for a
+           short chat message, up to 10 to 20 for an elaborate one, never more than `max_searches`
+           (20). A term that is a plain English word is dropped unless the prompt quoted it, a
+           search left with neither query nor terms is dropped, and when every search is dropped
+           nothing is asked (a skipped result, an empty block). Names, identifiers and quoted
+           phrases of the prompt that no search carries are put back into the first search. A bad
+           reply (not JSON, no search, a timeout) falls back to ONE search: the prompt itself.
         3. Every search runs Stage 1 (the bank's hybrid_chunk channel; its `terms` feed the exact
            retriever, its `query` the semantic and stemmed ones) in parallel, at most
            `max_concurrency` (8, and never more than the pool) at once, each with the same filters:
@@ -716,8 +721,12 @@ class Memory:
            whose rerank fails keeps Stage 1's order, cut to the candidates within recall_config
            .expansion.fallback_min_rel (0.5) of its best.
         5. The records merge: one record once (best score, `found_by` the searches that found it),
-           near-copies collapsed, best first, the `project`'s own notes first and other projects'
-           labeled. Sized by relevance, never by a count; `max_tokens` (0 = off) is only a safety valve.
+           near-copies collapsed (by wording: token Jaccard over 0.88; then by meaning: chunk
+           embedding cosine at or above `near_copy_cosine`, else recall_config.expansion
+           .near_copy_cosine, else PROSPECTA_NEAR_COPY_COSINE, else 0.90), the kept record taking
+           the searches of the copies and listing them (`collapsed_ids`), best first, the `project`'s
+           own notes first and other projects' labeled. Sized by relevance, never by a count;
+           `max_tokens` (0 = off) is only a safety valve.
         6. One cited block (`format_cited_rag_block`): the searches that ran, the line telling the
            agent to cite [n], then the numbered items.
 
@@ -726,7 +735,7 @@ class Memory:
         `fallbacks` and `accounting`. `record` (default: for a task, not for a chat) writes the
         llm_call events and one `recall` event. Defaults for the numbers also come from the bank's
         recall_config (`expansion`: max_searches, max_concurrency, deadline_s, max_tokens,
-        fallback_min_rel; `stage0_gate`: enabled, needs_memory_threshold)."""
+        fallback_min_rel, near_copy_cosine; `stage0_gate`: enabled, needs_memory_threshold)."""
         from prospecta._expand_run import run_expansion
         return run_expansion(
             self, prompt, kind, agent_last=agent_last, project=project, date_from=date_from,
@@ -735,7 +744,7 @@ class Memory:
             max_tokens=max_tokens, query_writer_model=query_writer_model, decision_model=decision_model,
             reranker_model=reranker_model, decision=decision, gate=gate,
             needs_memory_threshold=needs_memory_threshold, min_score=min_score, depth=depth,
-            record=record, now=now)
+            near_copy_cosine=near_copy_cosine, record=record, now=now)
 
     def recall_for_task(
         self,

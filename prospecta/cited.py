@@ -65,7 +65,8 @@ def format_cited_rag_block(items: "list[RecalledMemory]", *, heading: str | None
     Query expansion (docs/postgres-hybrid.md, Mode 1) adds three things: `searches`, the
     (number, search) pairs that were run, listed under the heading by their queries (with the
     exact terms and dates they carried), and an item that carries `found_by` says which of
-    them found it (`found_by=1,3`); `cite`, the line telling the agent to cite `[n]` when it
+    them found it (`found_by=1,3`) and how many similar notes collapsed into it (`similar=2`);
+    `cite`, the line telling the agent to cite `[n]` when it
     uses an item; `omitted`, how many records a token valve left out."""
     if not items:
         return ""
@@ -90,6 +91,8 @@ def format_cited_rag_block(items: "list[RecalledMemory]", *, heading: str | None
             head += f" | match={it.match_kind}"
         if it.found_by:
             head += " | found_by=" + ",".join(str(x) for x in it.found_by)
+        if it.collapsed_ids:
+            head += f" | similar={len(it.collapsed_ids)}"
         project = (it.metadata or {}).get("project")
         if own_project and project and project != own_project:
             head += f" | project={project} (another project)"
