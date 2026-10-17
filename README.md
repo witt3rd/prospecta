@@ -187,6 +187,7 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |
 | [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
 | [`docs/legacy.md`](docs/legacy.md) | the retired recall machinery that existing banks still use |
+| [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 
 ## Caveats (v0.1)
