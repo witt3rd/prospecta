@@ -17,27 +17,23 @@ Across **all** modes, every retrieved or synthesized answer is **RAG with citati
 
 Designing the SQL schema, stages, and output format starts from how each caller consumes the result:
 
-### Mode 1A: Automatic Recall in Conversational Turns (Augur, Forge, Spire Chats)
+### Mode 1: Automatic Recall by Query Expansion (Chat Messages and Tasks)
 
-In a live chat, the conversation history already holds the recent exchange. Automatic recall exists to surface **what is not already in the active window**.
+Automatic recall is **query expansion**: take whatever the prompt is (a chat message, or a task brief: title, ask, done criteria) and expand it into a set of searches whose job is to find the **surrounding context that could be useful for responding to the prompt**. It is not "answer a question" and it is not "search with the prompt". The caller (the venue in Spire; the Hermes plugin for Augur and Forge) runs it and hands the agent the results; the agent responds.
 
-* **Gate aggressively (`jev-1.14` Stage 0):** Skip retrieval (`0ms` DB/rerank cost) on acknowledgements (`"ok"`, `"ship it"`), greetings, self-contained instructions, and questions about live system state that must be read from live tools rather than memory.
-* **De-contextualize follow-ups using only the immediate exchange:** A user message like *"do you remember who I saw it with?"* cannot be searched raw. Resolve pronouns (`"it"`) against the **last assistant turn** (not the last 10 turns, which drowns the query in topic drift) to produce 1–3 standalone search queries, **preserving any `"quoted strings"` and proper nouns verbatim**.
-* **Exclude the active context window (Anti-Echo Invariant):** Never return notes or turn records that came from the last 2 turns of the current session—the agent already has them in front of it. Older turns from the same long-lived session remain eligible.
-* **Deduplicate near-identical notes before packing:** Repeated summary notes about the same event collapse to the single highest-scored / most complete note, citing its date range.
-* **Inject as a cited, non-instructional evidence block:** Every recalled item carries its **citation header** (`[source_id | kind | YYYY-MM-DD | score]`), the **full relevant chunk/note**, and, when an exact/phrase match fired, the **verbatim highlighted snippet**.
-
-### Mode 1B: Automatic Recall in Non-Interactive Task Prompts (Commissions, Wakes, Background Jobs)
-
-When a Spire specialist, SWE, Researcher, or background wake starts a task, there is no prior chat turn—instead, there is a **structured task brief** (`title`, `ask` / `goal`, `done` criteria, and `project_id`).
-
-* **No `needs_memory` skip:** A non-interactive task almost always benefits from prior project decisions, architecture notes, and recent related work.
-* **Faceted multi-query decomposition (2–4 queries in one batch):** Decompose the task brief into distinct retrieval facets executed in a single batched Stage 1 + Stage 2 pass:
-  1. *Domain / subject query:* core entities, subsystem names, or `"exact identifiers"` named in the ask.
-  2. *Prior decisions & conventions query:* standing rulings or design notes governing that subsystem.
-  3. *Recent related work query:* prior commissions, reports, or incidents touching the same area.
-* **Scope-first with labeled cross-project recall:** Prioritize the task's own `project_id` / `bank_id`, while allowing high-relevance cross-project notes (clearly labeled with their origin project) to surface.
-* **Cited RAG brief at task start:** Deliver a structured `## Recalled Project Context` block where every claim or excerpt has a clickable/fetchable citation (`[note_id / doc_path, YYYY-MM-DD]`) and exact-match snippets for any code symbols, error strings, or quoted terms in the brief.
+1. **Gate (chat messages only, `decision_model`):** skip the whole expansion for acknowledgements and go-aheads (`"ok"`, `"ship it"`), greetings, and questions about live state that must be read from live tools. A task is never gated: it always expands.
+2. **Expand into N searches, N scaled to the prompt (`query_writer_model`):** about **3** for a short chat message, up to **10–20** for an elaborate instruction or task brief. Each search covers one piece of surrounding context the response could use: the entities and subsystems named; prior decisions, conventions and standing rulings that govern them; earlier work, reports and incidents in the same area; the people involved; relevant dates and periods; related artifacts and documents. Follow-ups are resolved against the agent's last turn so every search stands alone.
+3. **Each search is a structured request shaped for the engine**, not a question:
+   * `query`: a short natural-language description of what to find (for the semantic retriever and the reranker);
+   * `terms`: names, identifiers and `"quoted phrases"` copied verbatim from the prompt (for the exact retriever);
+   * `date_from` / `date_to`: when the prompt states or implies a period (pushed into Stage 1 as a filter).
+4. **Run every search through Stage 1 in parallel** (bounded by the connection pool), with the same filters in each: scope, date window, and the anti-echo exclusion of what is already in the agent's context.
+5. **Rerank each search's candidates against its own `query` (Stage 2)**, in parallel; keep what clears the score floor.
+6. **Merge across searches:** one record once (its best score, the searches that found it), near-copies collapsed, ordered by score; the task's own project first with other projects labeled. The block is sized by relevance, never by a count.
+7. **Deliver one compact cited block:** each item numbered with its source, date, kind, why it matched and the exact-match snippet, quoted material and never instructions, with the line that the response cites `[n]` when it uses an item.
+8. **The agent can always pull more:** the same engine is its explicit search tool when the automatic set missed something.
+9. **Latency:** the expansion and every search run inside the caller's deadline; searches and reranks run in parallel, so 20 searches cost about the time of the slowest one plus the writer.
+10. **Judged by one measure:** did the agent have what it needed to respond, on real prompts.
 
 ### Mode 2: Interactive Search (Human Search Bars, `#` Pickers, Explicit Agent Search)
 
