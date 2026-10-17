@@ -8,6 +8,10 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 
 The default cross-encoder rerank timeout (`rerank.timeout_s`) is now 4 s, up from 2.5 s. Banks that store their own value keep it.
 
+The cross-encoder reranker now retries once on an HTTP 503 or 429 inside the same time budget (`rerank.retries`, default 1, 0 turns it off); the fallback to the Stage 1 order is unchanged.
+
+The cited block now indents every line of a snippet and a note and flattens header values, so a newline in a note cannot forge a numbered header.
+
 ## [1.0.0]
 
 Prospecta 1.0 is one design with one read path and one write path. The design is

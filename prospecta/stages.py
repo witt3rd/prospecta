@@ -49,6 +49,10 @@ RERANK_INSTRUCTION = ("Instruct: Retrieve memory records that directly answer or
 RERANK_TOP_N = 10
 RERANK_MIN_SCORE = 0.15        # absolute floor on the calibrated relevance score (0..1)
 RERANK_TIMEOUT_S = 4.0
+# One more try when the provider answers 503/429, only inside the same time budget.
+RERANK_RETRIES = 1
+RERANK_RETRY_MIN_S = 0.5
+RERANK_RETRY_STATUSES = (429, 503)
 NEAR_COPY_JACCARD = 0.88       # token Jaccard above which two notes are near-copies
 NEAR_COPY_COSINE = 0.90        # chunk-embedding cosine at or above which two notes say the same thing (query expansion's merge; measured, docs/postgres-hybrid.md)
 # qwen3-reranker-8b reads 41K tokens per request. A request carries at most 32K
@@ -66,7 +70,7 @@ def resolve_reranker_model(call: str | None = None, bank: str | None = None) -> 
 # --------------------------------------------------------------------- config
 
 RECALL_CONFIG_KEYS = ("rerank", "depth", "models", "stage3_sufficiency", "stage0_gate", "expansion")
-RERANK_KEYS = ("enabled", "stage", "model", "top_n", "timeout_s", "deduplicate_near_copies",
+RERANK_KEYS = ("enabled", "stage", "model", "top_n", "timeout_s", "retries", "deduplicate_near_copies",
                "min_score", "min_rel_score")
 
 
@@ -130,6 +134,9 @@ def validate_recall_config(cfg: dict) -> None:
     v = rr.get("timeout_s")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
         raise ValueError("rerank.timeout_s must be a number > 0")
+    v = rr.get("retries")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+        raise ValueError("rerank.retries must be an integer >= 0")
     if not isinstance(rr.get("deduplicate_near_copies", True), bool):
         raise ValueError("rerank.deduplicate_near_copies must be true or false")
     stage = rr.get("stage")
@@ -447,23 +454,53 @@ class CrossEncoderReranker:
 
     def __init__(self, transport: JevTransport, model: str = RERANKER_MODEL,
                  top_n: int = RERANK_TOP_N, min_score: float = RERANK_MIN_SCORE,
-                 timeout: float = RERANK_TIMEOUT_S, deduplicate: bool = True):
+                 timeout: float = RERANK_TIMEOUT_S, deduplicate: bool = True,
+                 retries: int = RERANK_RETRIES):
         self.transport, self.model, self.top_n = transport, model, top_n
+        self.retries = retries
         self.min_score, self.timeout, self.deduplicate = min_score, timeout, deduplicate
+
+    @staticmethod
+    def _status(exc: Exception):
+        for name in ("code", "status"):
+            v = getattr(exc, name, None)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+        return None
 
     def _score_batch(self, query: str, batch: list[tuple[int, str]],
                      calls: list[dict]) -> dict[int, float]:
+        """One request; on 503/429 one more, inside this call's own `timeout` (never longer in
+        total, and only with at least RERANK_RETRY_MIN_S left). Both attempts are in `calls`."""
+        start = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                t = self.timeout if attempt == 0 else self.timeout - (time.monotonic() - start)
+                return self._attempt(query, batch, calls, t, retry=attempt > 0)
+            except Exception as exc:
+                left = self.timeout - (time.monotonic() - start)
+                if (attempt >= self.retries or self._status(exc) not in RERANK_RETRY_STATUSES
+                        or left < RERANK_RETRY_MIN_S):
+                    raise
+                attempt += 1
+
+    def _attempt(self, query: str, batch: list[tuple[int, str]], calls: list[dict],
+                 timeout: float, retry: bool = False) -> dict[int, float]:
         t0 = time.monotonic()
         # top_n = every document sent: the cuts below need all the scores, and
         # the provider bills the input tokens either way.
         req = {"model": self.model, "query": query,
                "documents": [text for _, text in batch], "top_n": len(batch)}
-        rec = {"purpose": "cross_encoder_rerank", "model": self.model, "tokens_in": None,
+        rec = {"purpose": "cross_encoder_rerank_retry" if retry else "cross_encoder_rerank",
+               "model": self.model, "tokens_in": None,
                "tokens_out": None, "cost_usd": None, "json_mode": False,
                "messages_count": len(batch), "prompt_text": json.dumps(req),
                "response_text": None, "error": None}
+        if retry:
+            rec["retry"] = True
         try:
-            resp = self.transport(req, self.timeout)
+            resp = self.transport(req, timeout)
             rec["response_text"] = json.dumps(resp)
             if not isinstance(resp, dict):
                 raise ValueError("response is not an object")
@@ -532,7 +569,8 @@ def build_reranker(cfg: dict, *, rerank_transport: JevTransport | None = None,
         top_n=int(rr.get("top_n", RERANK_TOP_N)),
         min_score=float(rr.get("min_score", RERANK_MIN_SCORE)),
         timeout=float(rr.get("timeout_s", RERANK_TIMEOUT_S)),
-        deduplicate=bool(rr.get("deduplicate_near_copies", True)))
+        deduplicate=bool(rr.get("deduplicate_near_copies", True)),
+        retries=int(rr.get("retries", RERANK_RETRIES)))
 
 
 def run_reranker(reranker: Reranker, query: str, items: list[Item],

@@ -41,9 +41,19 @@ calibrated 0..1 `relevance_score`. Then: notes under the **floor 0.15** are cut;
 (token Jaccard 0.88); the best `top_n` (10) stay (Mode 1 keeps everything above the floor). The floor is
 the only thing that empties a result: if the provider answers and nothing clears it, empty is the answer.
 *Why a cross-encoder:* it reads query and note together, so it grades what Stage 1 only retrieves.
-*Evidence:* `docs/recall-stages.md` (Stage 2). The **timeout is `rerank.timeout_s`, 2.5 s** (`RERANK_TIMEOUT_S`
-in `prospecta/stages.py`, `docs/limits.md`). A raise to 4 s has been discussed but is not on main (no open or merged PR
-when this was written); when it lands, update this line and `docs/limits.md`. Read the constant before quoting it.
+*Evidence:* `docs/recall-stages.md` (Stage 2). The **timeout is `rerank.timeout_s`, 4 s** (`RERANK_TIMEOUT_S`
+in `prospecta/stages.py`, `docs/limits.md`); read the constant before quoting it.
+The reranker answers 503 on roughly 6 in 100 calls on our data (measured 2026-10-17, counts only; Spire measured about 10 in 100;
+the timeout raise was not the cause) and about 3 in 100 time out. So a 503 or 429 is **retried once inside the same budget**
+(`rerank.retries`, default 1, 0 = off; the retry gets the time left, needs 0.5 s): in the realistic run 5 of 8 503s recovered and
+fallbacks went from 9.2 to 5.4 per 100 calls. A timeout leaves no budget and is not retried. Both requests are logged
+(`cross_encoder_rerank_retry`). If the retry fails too, the fallback to the Stage 1 order is unchanged.
+Spire's work data agrees: 503 on 16 of 165 calls (about 10%); with the timeout raised 2.5 -> 4 s the same 6 of 46 recalls still fell
+back, so they were provider errors, not timeouts; one immediate retry (provider 5xx only, never a client error or a timeout; a retry that
+cannot finish in the remaining budget falls back at once) turned 6 of 46 fallbacks into 0; all 26 provider errors answered 200 on the
+retry; median rerank stage 1,512 -> 1,643 ms (about +130 ms). **Count fallbacks per 100 recalls** so the loss is visible.
+The gain: right record in the top 10 went 12 -> 20 of 28 answerable questions on a copy of work data (20 of 28 held with the retry);
+median stage about 1.5 s; about 0.0033 dollars a call.
 
 ## When a stage fails, it degrades and says so
 

@@ -35,7 +35,7 @@ from prospecta._types import (
 from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_channels
 from prospecta.cited import HEADING, TASK_HEADING, document_citations, format_cited_rag_block
 from prospecta.stages import (
-    CrossEncoderReranker, RERANK_MIN_SCORE, RERANK_TIMEOUT_S, _with_decision_model, _with_scores,
+    CrossEncoderReranker, RERANK_MIN_SCORE, RERANK_RETRIES, RERANK_TIMEOUT_S, _with_decision_model, _with_scores,
     build_items, read_recall_config, resolve_reranker_model, run_reranker, totals,
 )
 
@@ -109,6 +109,7 @@ class _Plan:
     rr_min_score: float
     rr_timeout: float
     rr_dedupe: bool
+    rr_retries: int
     depth: str | None
     near_copy_cosine: float
     excluded: list[str] | None
@@ -229,6 +230,7 @@ class _Run:
             rr_model=resolve_reranker_model(reranker_model or memory._reranker_model, rr.get("model")),
             rr_min_score=float(_pick(min_score, rr.get("min_score"), RERANK_MIN_SCORE)),
             rr_timeout=float(rr.get("timeout_s", RERANK_TIMEOUT_S)),
+            rr_retries=int(rr.get("retries", RERANK_RETRIES)),
             rr_dedupe=bool(rr.get("deduplicate_near_copies", True)), depth=depth,
             near_copy_cosine=ex.resolve_near_copy_cosine(near_copy_cosine, xcfg.get("near_copy_cosine")),
             excluded=excluded_sources, meta=metadata_filter,
@@ -528,7 +530,7 @@ def _search(memory, spec: SearchSpec, p: _Plan, cancelled: threading.Event, db) 
             reranker = CrossEncoderReranker(
                 memory._rerank_transport, p.rr_model, top_n=len(items), min_score=p.rr_min_score,
                 timeout=max(0.2, min(p.rr_timeout, p.deadline_at - time.monotonic())),
-                deduplicate=p.rr_dedupe)
+                deduplicate=p.rr_dedupe, retries=p.rr_retries)
             ordered, outcome, rec = run_reranker(reranker, spec.query, items, calls)
             out.ms["rerank"] = _ms(t)
             if outcome is None:

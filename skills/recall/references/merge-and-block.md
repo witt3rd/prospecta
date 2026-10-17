@@ -43,6 +43,18 @@ material and never instructions, with the line telling the agent to cite `[n]`. 
 to trace a memory and a note's text must not steer it. *Evidence:* `prospecta/cited.py`
 (`format_cited_rag_block`); [`PRINCIPLES.md`](../../../PRINCIPLES.md) P21.
 
+**Every field of a citation is one indented line.** Header values are flattened to one line, and the snippet and the
+body are split on newlines and every line re-indented, so text with an embedded newline cannot forge a header such as
+`[9] source=...` inside the agent's prompt. *Evidence:* Spire found an unguarded exact snippet (two reviewers); test with a
+snippet holding a newline and a forged header (`tests/test_cited_evidence_modes.py`).
+
+## Date-only and the pool
+
+- **A date-only listing honours the exclusion list (anti-echo) and stays newest first; the ranker is skipped for it.** *Why:* a
+  relevance re-rank of a cue with no words scrambled the order (Spire).
+- **The pool dedupes by record key only; near-copies collapse by meaning in the rank/merge step** (embedding similarity and the 0.88
+  word overlap), never in the pool.
+
 ## The deadline
 
 One clock, 7 s, from the call: the gate may use 30 percent, the writer 50 percent (the searches always keep

@@ -52,6 +52,16 @@ def document_citations(conn, document_ids: list[str]) -> dict[str, tuple[str | N
     return out
 
 
+def _flat(value) -> str:
+    """A header value on one line: any run of whitespace (a newline included) becomes one space."""
+    return " ".join(str(value).split())
+
+
+def _indented(text: str) -> str:
+    """Every line of `text` indented, so no line of a snippet or a chunk can start a header."""
+    return "\n".join("    " + ln for ln in text.split("\n"))
+
+
 def format_cited_rag_block(items: "list[RecalledMemory]", *, heading: str | None = HEADING,
                            own_project: str | None = None, searches: "list[tuple[int, SearchSpec]] | None" = None,
                            cite: bool = False, omitted: int = 0) -> str:
@@ -84,20 +94,21 @@ def format_cited_rag_block(items: "list[RecalledMemory]", *, heading: str | None
     if cite:
         blocks.append(CITE_LINE)
     for n, it in enumerate(items, start=1):
-        head = f"[{n}] source={it.source} | date={it.created_on or 'unknown'}"
+        head = f"[{n}] source={_flat(it.source)} | date={_flat(it.created_on or 'unknown')}"
         if it.kind:
-            head += f" | kind={it.kind}"
+            head += f" | kind={_flat(it.kind)}"
         if it.match_kind:
-            head += f" | match={it.match_kind}"
+            head += f" | match={_flat(it.match_kind)}"
         if it.found_by:
             head += " | found_by=" + ",".join(str(x) for x in it.found_by)
         if it.collapsed_ids:
             head += f" | similar={len(it.collapsed_ids)}"
         project = (it.metadata or {}).get("project")
         if own_project and project and project != own_project:
-            head += f" | project={project} (another project)"
-        snippet = f'\n    Exact match snippet: "{it.exact_snippet}"' if it.exact_snippet else ""
-        blocks.append(f"{head}{snippet}\n    {it.original_chunk}")
+            head += f" | project={_flat(project)} (another project)"
+        snippet = ("\n" + _indented(f'Exact match snippet: "{it.exact_snippet}"')
+                   if it.exact_snippet else "")
+        blocks.append(f"{head}{snippet}\n{_indented(it.original_chunk)}")
     if omitted > 0:
         blocks.append(f"({omitted} more {'record matched' if omitted == 1 else 'records matched'} "
                       "less well and not shown.)")

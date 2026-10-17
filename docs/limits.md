@@ -41,6 +41,7 @@ removed graph, linker, reader / hop and BM25 code are in git history.
 | Score floor | `rerank.min_score` | 0.15 | an absolute cut on the calibrated 0..1 score; the only thing that empties a result | tuning |
 | `top_n` | `rerank.top_n` | 10 | the notes kept after the floor and the near-copy collapse (Mode 1 keeps every note above the floor) | ours-config |
 | Timeout | `rerank.timeout_s` | 4 s | latency bound on an optional stage; failure keeps the Stage 1 order | ours-config |
+| Retry | `rerank.retries` | 1 (0 turns it off) | one more request when the provider answers 503 or 429, inside the same `timeout_s` (the retry gets what is left, only if at least 0.5 s remain; a timeout, any other status or a malformed reply is never retried). Both requests are logged | ours-config |
 | Near-copy collapse inside Stage 2 | `NEAR_COPY_JACCARD` | token Jaccard 0.88 | two notes this alike are one answer (`deduplicate_near_copies`) | tuning |
 | Evidence clip for the reranker | `stages.py` | **none** | the best chunk goes in full; a chunk is already bounded by chunking | removed |
 
