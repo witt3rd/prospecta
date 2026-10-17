@@ -4,6 +4,10 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+The default cross-encoder rerank timeout (`rerank.timeout_s`) is now 4 s, up from 2.5 s. Banks that store their own value keep it.
+
 ## [1.0.0]
 
 Prospecta 1.0 is one design with one read path and one write path. The design is

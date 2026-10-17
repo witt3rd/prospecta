@@ -79,7 +79,7 @@ stage removes a note and it never adds one; the record lists what each cut remov
 kept note (0..1) lands in `RecalledMemory.scores["rerank"]` and is its `relevance_score`. If the
 provider answers and nothing reaches the floor, the result is empty: that is the answer.
 
-Any provider error, timeout (`timeout_s`, default 2.5 s), HTTP 429/503, or reply that is not
+Any provider error, timeout (`timeout_s`, default 4 s), HTTP 429/503, or reply that is not
 exactly one finite score per note keeps the Stage 1 order for the whole pool and records
 `fallback_reason` (the call is still logged with its error); **the stage never raises into
 recall.** With no rerank transport on the Memory (no `OPENROUTER_API_KEY`) the stage cannot run
@@ -96,7 +96,7 @@ Wire the transport: `Memory(rerank_transport=openrouter_rerank_transport())` (ke
 ```python
 mem.set_recall_config({
   "rerank": {"enabled": True, "stage": "cross_encoder", "model": "qwen/qwen3-reranker-8b",
-             "top_n": 10, "min_score": 0.15, "timeout_s": 2.5, "deduplicate_near_copies": True},
+             "top_n": 10, "min_score": 0.15, "timeout_s": 4.0, "deduplicate_near_copies": True},
   "models": {"decision_model": "typesafe/jev-1.14"},
 })
 ```
