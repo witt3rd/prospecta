@@ -6,6 +6,8 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 
 ## [Unreleased]
 
+A date-only search (no searchable words, a date window) is listed newest first and no longer reranked: no rerank call, no cost.
+
 The default cross-encoder rerank timeout (`rerank.timeout_s`) is now 4 s, up from 2.5 s. Banks that store their own value keep it.
 
 The cross-encoder reranker now retries once on an HTTP 503 or 429 inside the same time budget (`rerank.retries`, default 1, 0 turns it off); the fallback to the Stage 1 order is unchanged.

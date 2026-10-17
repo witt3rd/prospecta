@@ -573,10 +573,37 @@ def build_reranker(cfg: dict, *, rerank_transport: JevTransport | None = None,
         retries=int(rr.get("retries", RERANK_RETRIES)))
 
 
+DATE_ONLY_REASON = "date-only listing: nothing to rank"
+
+
+def is_date_only(items: list[Item]) -> bool:
+    """True when every item came from the date-only listing (Stage 1's match_kind 'date': a
+    question with no searchable words and a date window). That is a listing, newest first,
+    and the one rule that keeps it from being re-ranked (single search and expansion alike)."""
+    from prospecta.cited import match_kind
+    if not items:
+        return False
+    for it in items:
+        d = it.doc.best.detail or {}
+        if match_kind(exact=d.get("exact_rank") is not None, lexical=d.get("stem_rank") is not None,
+                      semantic=d.get("sem_rank") is not None,
+                      date=d.get("date_rank") is not None) != "date":
+            return False
+    return True
+
+
 def run_reranker(reranker: Reranker, query: str, items: list[Item],
                  calls: list[dict]) -> tuple[list[Item], Outcome | None, dict]:
     """Apply a reranker. On any failure the fused order stands, and the record
-    says why. Returns (ordered items, outcome or None, record)."""
+    says why. A date-only listing is not ranked at all: no call, the newest-first order
+    stands, the record says `skipped` (not a failure). Returns (ordered items, outcome or
+    None, record)."""
+    if is_date_only(items):
+        return list(items), None, {
+            "stage": getattr(reranker, "name", "?"), "model": getattr(reranker, "model", None),
+            "skipped": True, "fallback_reason": DATE_ONLY_REASON,
+            "order": [it.doc.document_id for it in items], "grades": {},
+            "n_candidates": len(items), "latency_ms": 0, **totals([])}
     t0 = time.monotonic()
     n0 = len(calls)
     try:

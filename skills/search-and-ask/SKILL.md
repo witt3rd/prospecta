@@ -32,7 +32,7 @@ cross-encoder re-scores all 50, so only membership of the 50 matters. *Evidence:
 core invariants 1 and 2; the bake-off's rank-consensus finding in `tuning-and-testing`.
 
 **Date-only search:** a query with no searchable words and a date window lists the newest chunks inside the
-window (`match_kind` `date`); no words and no window is empty. It depends on the note date ([`retain`](../retain/SKILL.md)).
+window (`match_kind` `date`); no words and no window is empty. It is **not reranked**: newest first, no rerank call, no cost. It depends on the note date ([`retain`](../retain/SKILL.md)).
 
 ## Stage 2: the cross-encoder
 
