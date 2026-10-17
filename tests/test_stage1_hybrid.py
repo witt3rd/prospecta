@@ -279,7 +279,8 @@ def test_the_plan_uses_the_hnsw_and_both_gin_indexes(fresh_db):
         plan = "\n".join(r[0] for r in conn.execute("EXPLAIN " + sql, params, prepare=False))
     assert "Index Scan using memory_items_embedding_plan" in plan   # on embedding::vector(N), the indexed expression
     assert "Bitmap Index Scan on memory_items_body_tsv_gin" in plan
-    assert "Bitmap Index Scan on memory_items_keyword_gin" in plan
+    assert "Bitmap Index Scan on memory_items_exact_tsv_gin" in plan   # the stored exact vector (0020)
+    assert "memory_items_keyword_gin" not in plan                      # the 0018 index serves `keyword` only
 
 
 # --------------------------------------------------------------------------

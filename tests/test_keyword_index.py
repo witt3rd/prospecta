@@ -105,3 +105,29 @@ def test_explain_uses_index_on_50000_documents(mem):
     # and the channel itself, on the big bank
     got, used = _run(url, "v1.2.3")
     assert used and [s for s, _ in got] == ["a.md"]
+
+
+@pytest.mark.parametrize("peer", [1, 2, 4])
+def test_a_build_waits_for_the_other_index_builders_by_polling(mem, peer):
+    """Two CREATE INDEX CONCURRENTLY on one table can deadlock (the statement waiting for the
+    table lock holds a snapshot the builder waits for: seen between finish_0004's no-op
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS and this build when four processes migrate at
+    once). The builds hold each other's advisory keys, polling: while a peer builder holds
+    its key this one waits without blocking on a lock, then builds."""
+    import threading
+    import time
+
+    from prospecta.db.migrate import MIGRATE_LOCK_KEY
+    url = mem.database_url
+    with psycopg.connect(url, autocommit=True) as holder, psycopg.connect(url, autocommit=True) as watcher:
+        holder.execute("SELECT pg_advisory_lock(%s)", (MIGRATE_LOCK_KEY + peer,))
+        done = []
+        t = threading.Thread(target=lambda: done.append(ensure_keyword_index(url, rebuild=True)))
+        t.start()
+        time.sleep(0.5)
+        assert t.is_alive()
+        assert watcher.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                               "AND wait_event = 'advisory'").fetchone()[0] == 0
+        holder.execute("SELECT pg_advisory_unlock(%s)", (MIGRATE_LOCK_KEY + peer,))
+        t.join(timeout=30)
+        assert not t.is_alive() and done[0]["rebuilt"] is True

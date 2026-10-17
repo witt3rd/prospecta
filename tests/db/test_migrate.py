@@ -50,8 +50,8 @@ def test_run_migrations_creates_version_table(fresh_db):
     assert 3 in result["applied"]
     assert 4 in result["applied"]
     assert 10 in result["applied"]
-    # Highest applied is now 19 (0019_link_config).
-    assert get_schema_version(fresh_db) == 19
+    # Highest applied is now 20 (0020_exact_tsv).
+    assert get_schema_version(fresh_db) == 20
 
 
 def test_run_migrations_idempotent(fresh_db):
@@ -63,7 +63,7 @@ def test_run_migrations_idempotent(fresh_db):
     assert 3 in result["skipped"]
     assert 4 in result["skipped"]
     assert 10 in result["skipped"]
-    assert get_schema_version(fresh_db) == 19
+    assert get_schema_version(fresh_db) == 20
 
 
 def test_all_required_tables_exist(fresh_db):
@@ -186,3 +186,42 @@ def test_advisory_lock_serializes_concurrent_migrations(fresh_db):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM prospecta_schema_version WHERE version = 1")
             assert cur.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("round_", range(3))
+def test_concurrent_migrations_one_version_behind_build_the_exact_index_once_without_deadlock(
+        fresh_db, round_):
+    """4 workers upgrade a database that is one migration behind (0020 rolled back, rows
+    present): one applies it, none deadlocks (a peer's CREATE INDEX CONCURRENTLY waits for
+    every open snapshot, so nothing else may wait on the table's lock holding one), and the
+    GIN index ends valid."""
+    from prospecta.db.exact_tsv import COLUMN, INDEX_NAME, has_exact_tsv_index
+    run_migrations(fresh_db)
+    with psycopg.connect(fresh_db, autocommit=True) as conn:
+        conn.execute(f'DROP INDEX "{INDEX_NAME}"')
+        conn.execute(f"ALTER TABLE memory_items DROP COLUMN {COLUMN}")
+        conn.execute("DELETE FROM prospecta_schema_version WHERE version = 20")
+        conn.execute("INSERT INTO banks (bank_id, embedding_dim) VALUES ('b', 2)")
+        (doc,) = conn.execute(
+            "INSERT INTO documents (bank_id, source, original_text, content_hash) "
+            "VALUES ('b', 's', 't', 'h') RETURNING id").fetchone()
+        conn.execute(
+            "INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding, kind) "
+            "VALUES ('b', %s, 'c', 'a chunk of text', '[1,2]', 'chunk')", (doc,))
+    ctx = mp.get_context("spawn")
+    results_queue = ctx.Queue()
+    workers = [ctx.Process(target=_worker_run_migrations, args=(fresh_db, results_queue, i))
+               for i in range(4)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=90)
+        assert not w.is_alive(), "Worker hung"
+    outcomes = []
+    while not results_queue.empty():
+        outcomes.append(results_queue.get())
+    assert len(outcomes) == 4
+    assert not [o for o in outcomes if o[1] == "error"], outcomes
+    assert sum(1 for _, _, r in outcomes if 20 in r["applied"]) == 1
+    with psycopg.connect(fresh_db) as conn:
+        assert has_exact_tsv_index(conn)

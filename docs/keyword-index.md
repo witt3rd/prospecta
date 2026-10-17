@@ -16,5 +16,8 @@ so Postgres uses the index and keeps it current on every write.
 - **Fallback:** without a valid index, and for `stemming: true` queries, the channel runs the
   same expression as a scan of the bank (correct, slow). `KeywordChunks.used_index` reports
   which path ran.
+- **Not the Stage 1 exact retriever:** the `hybrid_chunk` channel reads the stored `memory_items.exact_tsv`
+  column and its own GIN index (migration 0020, `docs/exact-tsv.md`), generated from the same word rule.
+  `memory_items_keyword_gin` serves this `keyword` channel only; dropping it is a separate decision.
 - **Cost:** disk and write cost grow with text size. The index is shared by all banks in the
   database; the bank filter is applied after the index lookup.

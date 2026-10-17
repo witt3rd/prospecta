@@ -112,7 +112,7 @@ All idempotent; they take the record's reference, never its text.
 
 Every hit says where and when it is from and why it matched (the cited-evidence contract of
 `docs/postgres-hybrid.md`): `created_on` (the record's date, `YYYY-MM-DD`), `match_kind`
-(`exact+semantic`, `exact`, `lexical`, `semantic`, or null), `exact_snippet` (the matched words in
+(`exact+semantic`, `exact`, `lexical`, `semantic`, `date` (a wordless question's date-window listing), or null), `exact_snippet` (the matched words in
 context, `<<marked>>`, or null) and `relevance_score` (the cross-encoder's 0..1 score when the bank
 runs stage 2 with it, else the fused `score`). `date_from` / `date_to` (`YYYY-MM-DD`, the record's
 date, inclusive) and `excluded_sources` (document sources to leave out, the anti-echo list) apply

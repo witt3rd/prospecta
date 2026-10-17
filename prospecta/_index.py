@@ -753,7 +753,8 @@ def _search_channels(
             match_kind=match_kind(
                 exact=d.get("exact_rank") is not None or "keyword" in ranked,
                 lexical=d.get("stem_rank") is not None or "bm25" in ranked,
-                semantic=d.get("sem_rank") is not None or bool(ranked & {"dense_chunk", "question"})),
+                semantic=d.get("sem_rank") is not None or bool(ranked & {"dense_chunk", "question"}),
+                date=d.get("date_rank") is not None),
             relevance_score=float(f.scores["rerank"]) if cross_encoder and "rerank" in f.scores
             else float(f.score),
             exact_snippet=d.get("exact_snippet"),
