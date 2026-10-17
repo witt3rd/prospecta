@@ -52,7 +52,7 @@ Each stage does one job that the other stages cannot do well:
 
 | Stage | Component | Used In | Role | Typical Latency | Cost |
 | --- | --- | --- | --- | --- | --- |
-| **Stage 0: Gate, Filter & Query Formation** | `typesafe/jev-1.14` (`/api/alpha/decisions`) + fast query de-contextualizer | Mode 1A (Chat), Mode 1B (Task decomposition) | Decide `needs_memory` (Mode 1A), extract structured SQL filters (date window, category), and form 1–4 standalone search queries while keeping `"quoted phrases"` and identifiers intact. Skipped in Mode 2A. | ~150–300ms | $0.042 / 1M input ($0 output) |
+| **Stage 0: Gate & Query Expansion** | `decision_model` (default `typesafe/jev-1.14`) + `query_writer_model` | Mode 1 (chat messages and tasks) | Gate chat messages (`needs_memory`); expand the prompt into 3–20 structured searches (`query`, verbatim `terms`, `date_from`/`date_to`) scaled to the prompt's size. Skipped in Mode 2A. | writer-bound | per-token |
 | **Stage 1: Hybrid Candidate Generation + Snippets** | PostgreSQL (`pgvector` HNSW + dual `tsvector` GIN + `ts_headline`) | All modes | Narrow tens of thousands of notes/chunks down to **~50 candidates** per query using **Reserved-Slot Union + RRF**, and extract **exact-match snippets** (`ts_headline`) whenever `fts_exact` or `fts_en` matches. | ~5–25ms | $0 |
 | **Stage 2: Cross-Encoder Precision Reranking** | `qwen/qwen3-reranker-8b` (`/api/v1/rerank`) | All modes (optional fast-path skip for `<100ms` keystroke typeahead) | Score all ~50 `(query, candidate)` pairs with full cross-attention across a 41K context window; return calibrated `relevance_score`s in `[0, 1]`, deduplicate near-copies, and keep the top chunks above floor. Automatic fallback to Stage 1 RRF order on provider error. | ~230–450ms | $0.20 / 1M tokens (~$0.001–$0.003/call) |
 | **Stage 3: Sufficiency Gate & Cited RAG** | `typesafe/jev-1.14` (`noul`) + cited answer/brief formatter | Mode 2B (Interactive QA), Agentic multi-hop search | Check whether top reranked chunks suffice (`noul < 0.70` triggers a broadened retry), then format the cited RAG response or evidence block with `[source_id, date]` citations and exact-match snippets. | ~120ms (gate) | $0.042 / 1M input |
@@ -123,7 +123,7 @@ CREATE TABLE rag_chunks (
     id BIGSERIAL PRIMARY KEY,
     bank_id TEXT NOT NULL,
     source_id TEXT NOT NULL,          -- Durable citation target (note_id, turn_id, doc_path)
-    session_id TEXT,                  -- Used by Mode 1A anti-echo filter
+    session_id TEXT,                  -- Used by Mode 1 anti-echo filter
     title TEXT,
     category TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,  -- Mandatory for citation dating and time_scope filtering
@@ -165,13 +165,13 @@ SET LOCAL hnsw.ef_search = 100;
 SET LOCAL hnsw.max_scan_tuples = 20000;
 ```
 
-Push all structured `WHERE` filters (`bank_id`, `created_at` bounds, `category`, and the Mode 1A `excluded_source_ids` anti-echo list) into **every** CTE (semantic, stemmed lexical, exact lexical) before combining candidates.
+Push all structured `WHERE` filters (`bank_id`, `created_at` bounds, `category`, and the Mode 1 `excluded_source_ids` anti-echo list) into **every** CTE (semantic, stemmed lexical, exact lexical) before combining candidates.
 
 ---
 
 ## 6. Production SQL Pattern: Reserved-Slot Hybrid Query with Citations & Snippets
 
-This single query serves all modes (Mode 1A chat recall, Mode 1B task recall, Mode 2A/2B interactive search). It fetches up to ~50 deduplicated candidates across semantic, stemmed lexical, and exact/phrase lexical retrievers, attaches citation metadata and `exact_snippet` highlights, and computes an `rrf_score` fallback:
+This single query serves all modes (Mode 1 automatic recall, Mode 2A/2B interactive search). It fetches up to ~50 deduplicated candidates across semantic, stemmed lexical, and exact/phrase lexical retrievers, attaches citation metadata and `exact_snippet` highlights, and computes an `rrf_score` fallback:
 
 ```sql
 BEGIN;
