@@ -14,7 +14,7 @@ The source is only read. The format is the real Hindsight schema (Postgres, pgve
 
 | Hindsight table | Lands in prospecta as |
 |---|---|
-| `memory_units` | one `documents` row (`source = hindsight:<unit id>`, `original_text` = text verbatim, `created_at`/`updated_at` kept) + one `memory_items` row (content = text). Whole unit row (fact_type, context, event_date, occurred_*, mentioned_at, proof_count, source_memory_ids = observation provenance, consolidated_at, metadata, ids…) kept in `documents.document_metadata.hindsight`. Tags: `hindsight`, `fact_type:<t>`, `entity:<slug>`, unit tags. |
+| `memory_units` | one `documents` row (`source = hindsight:<unit id>`, `original_text` = text verbatim, `created_at`/`updated_at` kept) + one `memory_items` row (`kind = 'chunk'`: content = original_chunk = the whole fact text, ordinal 0). Whole unit row (fact_type, context, event_date, occurred_*, mentioned_at, proof_count, source_memory_ids = observation provenance, consolidated_at, metadata, ids…) kept in `documents.document_metadata.hindsight`. Tags: `hindsight`, `fact_type:<t>`, `entity:<slug>`, unit tags. |
 | `unit_entities` | `imported_edges` kind `unit_entity` |
 | `entity_cooccurrences` | `imported_edges` kind `cooccurrence` (count, last_cooccurred) |
 | `memory_links` (3.37M in the real dump) | `imported_edges` kind `memory_link` (type, entity, weight, created_at) |
@@ -34,7 +34,7 @@ The source is only read. The format is the real Hindsight schema (Postgres, pgve
 
 Hindsight embeds each unit's text with MiniLM (384-dim) — the same as prospecta's offline default `all-MiniLM-L6-v2`. So each unit's vector is **carried verbatim** into `memory_items.embedding` when its dimension equals the target bank's. If the target bank doesn't exist it is created with the source's dimension (384). Units with no embedding, or a different dimension than an existing bank, are **re-embedded** with the configured embedder (`PROSPECTA_EMBEDDER`); if a batch embed call fails it is retried text by text, so one bad text never sinks the others. Only a unit that cannot be embedded at all (or is unreadable) lands in the loss report as failed, with the reason; with no embedder configured nothing can be re-embedded and those units are reported failed, never dropped. Re-run once the embedder works: already-imported units are skipped. The report shows `embeddings: carried=… re_embedded=…`.
 
-Consequence: imported items are indexed on the fact text (content-space), not on LLM-authored anticipated questions. Recall queries against a carried bank must be embedded with the same 384-dim MiniLM model (`PROSPECTA_EMBEDDER=sentence-transformers`).
+Consequence: imported items are chunk items indexed on the fact text, which is what a bank on `hybrid_chunk` reads (a bank this import creates gets the new-bank defaults), not LLM-authored anticipated questions. Items imported by an earlier release were written as question items; re-import into a fresh bank to get chunk items. Recall queries against a carried bank must be embedded with the same 384-dim MiniLM model (`PROSPECTA_EMBEDDER=sentence-transformers`).
 
 ## Idempotency
 

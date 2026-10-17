@@ -311,12 +311,14 @@ def _insert_unit(conn, bank, r, vec):
         cur.execute(
             """INSERT INTO memory_items (bank_id, document_id, content, original_chunk, embedding,
                                          metadata, tags, update_mode, llm_generated,
-                                         created_at, updated_at)
-               VALUES (%s,%s,%s,%s,%s::vector,%s::jsonb,%s,'append',false,%s,%s)""",
+                                         created_at, updated_at, kind, ordinal, char_start, char_end)
+               VALUES (%s,%s,%s,%s,%s::vector,%s::jsonb,%s,'append',false,%s,%s,'chunk',0,0,%s)""",
+            # One fact = one whole chunk (kind='chunk'): what hybrid_chunk reads, and what a
+            # bank created by this import gets as its Stage 1.
             (bank, doc_id, text, text, lit,
              json.dumps({"index_text_caller_supplied": True, "hindsight_id": uid,
                          "fact_type": fact_type}),
-             tag_list, created, updated))
+             tag_list, created, updated, len(text)))
 
 
 def _import_carried(memory, src, hbank, table, rep, batch):
