@@ -15,9 +15,8 @@ the chunks inside the window, newest note first, as `date` candidates for Stage 
 not embedded.
 
 The slot counts and the HNSW ef_search are the channel's params (the plan's
-`stage1_postgres` section). It is the channel of every bank created fresh
-(prospecta.bank_defaults); a bank that stored another config opts in with
-{"name": "hybrid_chunk", "weight": 1}.
+`stage1_postgres` section). It is the one channel: every bank runs it, a bank created fresh stores
+it (prospecta.bank_defaults), a bank with no channel config runs it with these defaults.
 """
 from __future__ import annotations
 

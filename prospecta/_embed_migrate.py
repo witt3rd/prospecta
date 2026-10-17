@@ -1,15 +1,14 @@
-"""Bank embedding-dimension migration (design 8.4): old bank -> '<bank>-v2'.
+"""Bank re-embedding (design 8.4): a bank -> '<bank>-v2' with another embedder or dimension.
 
-A bank's embedding dimension is fixed, so a change is a NEW bank. The old
+A bank's embedding dimension is fixed, so a change of embedder is a NEW bank. The source
 bank is only ever READ here; nothing in it is modified. The backfill:
 
   * copies each source document (same text, hash, source, tags, metadata)
     into the target bank, recording ``migrated_from_document_id`` in the new
     document's ``document_metadata``;
   * chunks ``original_text`` (paragraph chunks, 1,000 chars, small overlap)
-    and inserts ``kind='chunk'`` items;
-  * copies each source ``kind='question'`` item's text, re-embedded (no LLM
-    call), as ``kind='question'``;
+    and inserts ``kind='chunk'`` items: the target holds chunks only, whatever
+    kinds of item the source holds (a source bank's other items are not copied);
   * embeds through the injected callable in batches of ``batch_size`` (128).
 
 RESUMABLE BY DOCUMENT ID: a document and all its items are written in one
@@ -51,7 +50,6 @@ class MigrationReport:
     documents_already_done: int = 0
     documents_migrated: int = 0    # this run
     chunks_inserted: int = 0
-    questions_inserted: int = 0
     embed_batches: int = 0
     embed_retries: int = 0
     remaining: int = 0             # source documents not yet migrated
@@ -183,31 +181,20 @@ def migrate_bank(
                 d["chunks"] = chunk_paragraphs(
                     d["original_text"], CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS
                 )
-                d["questions"] = _fetch_questions(memory, d["id"])
                 group.append(d)
-                texts += len(d["chunks"]) + len(d["questions"])
+                texts += len(d["chunks"])
                 if (budget is not None and len(group) >= budget) or texts >= batch_size:
                     break
         if not group:
             break
 
         flat = [c.content for d in group for c in d["chunks"]]
-        flat += [q["content"] for d in group for q in d["questions"]]
         vecs = _embed_all(embed, flat, batch_size, embedding_dim, report)
 
         pos = 0
-        vec_for = []
         for d in group:
-            cv = vecs[pos:pos + len(d["chunks"])]
+            _write_document(memory, target_bank, d, vecs[pos:pos + len(d["chunks"])], report)
             pos += len(d["chunks"])
-            vec_for.append([cv, None])
-        for i, d in enumerate(group):
-            qv = vecs[pos:pos + len(d["questions"])]
-            pos += len(d["questions"])
-            vec_for[i][1] = qv
-
-        for d, (cv, qv) in zip(group, vec_for):
-            _write_document(memory, target_bank, d, cv, qv, report)
             report.documents_migrated += 1
         if budget is not None:
             budget -= len(group)
@@ -248,20 +235,7 @@ def _fetch_pending(memory, source_bank, target_bank, after_id, limit):
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def _fetch_questions(memory, document_id):
-    with memory._pool.cursor() as cur:
-        cur.execute(
-            "SELECT content, original_chunk, context, metadata, tags, "
-            "update_mode, llm_generated FROM memory_items "
-            "WHERE document_id = %s AND kind = 'question' ORDER BY created_at, id",
-            (document_id,),
-        )
-        cols = ["content", "original_chunk", "context", "metadata", "tags",
-                "update_mode", "llm_generated"]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
-def _write_document(memory, target_bank, d, chunk_vecs, q_vecs, report) -> None:
+def _write_document(memory, target_bank, d, chunk_vecs, report) -> None:
     import json
 
     meta = dict(d["document_metadata"] or {})
@@ -301,20 +275,8 @@ def _write_document(memory, target_bank, d, chunk_vecs, q_vecs, report) -> None:
                      "mode": "append", "llm": False, "kind": "chunk",
                      "ordinal": c.ordinal, "cs": c.char_start, "ce": c.char_end},
                 )
-            for q, vec in zip(d["questions"], q_vecs):
-                cur.execute(
-                    _INSERT_ITEM,
-                    {"bank": target_bank, "doc": new_id, "content": q["content"],
-                     "orig": q["original_chunk"], "ctx": q["context"],
-                     "emb": _vec_literal(vec),
-                     "meta": json.dumps(q["metadata"] or {}),
-                     "tags": list(q["tags"] or []), "mode": q["update_mode"],
-                     "llm": q["llm_generated"], "kind": "question",
-                     "ordinal": None, "cs": None, "ce": None},
-                )
         conn.commit()
     report.chunks_inserted += len(d["chunks"])
-    report.questions_inserted += len(d["questions"])
 
 
 def meta_for_item(d) -> dict:

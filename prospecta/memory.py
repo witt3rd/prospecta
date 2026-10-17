@@ -1,9 +1,6 @@
-"""prospecta.Memory — the public API.
-
-T4 ships: __init__, create_bank, bank_stats.
-Future tasks extend with retain, recall, recall_synth, formulate_queries,
-index_directory, etc.
-"""
+"""prospecta.Memory — the public API: write (retain, index_directory), read (search, recall, ask,
+expand_and_recall, recall_for_task), banks (create_bank, set_channel_config, set_recall_config,
+bank_stats) and the sweeper. docs/postgres-hybrid.md is the design."""
 from __future__ import annotations
 
 import json
@@ -18,18 +15,15 @@ from typing import Literal
 
 from prospecta.bank_defaults import new_bank_configs
 from prospecta._types import (
-    AskResult, EmbedCallable, ExpandedRecall, LLMCallable, Query, RAGResult, RecalledMemory,
-    TaskBrief, Tracer,
+    AskResult, EmbedCallable, ExpandedRecall, LLMCallable, Query, RecalledMemory, TaskBrief, Tracer,
 )
 from prospecta.db.pool import ConnectionPool
 from prospecta.db.schema import check_schema_writable, resolve_schema, scoped_url
 from prospecta.db.queries import (
-    HNSW_INDEX_TEMPLATE,
     INSERT_BANK,
     SELECT_BANK,
     SELECT_BANK_STATS,
     ensure_kind_hnsw_indexes,
-    hnsw_index_name,
     validate_bank_id,
 )
 
@@ -41,13 +35,12 @@ def _serialize_recall_results(results: "list[RecalledMemory]") -> list[dict]:
     JSONB column (migration 0003).
 
     One dict per result, in flat-list order (rank is 1-indexed within the
-    flat list — recall_synth flattens queries_to_results preserving query
-    order so the rank reflects surface position across all queries):
+    flat list, the queries' results one after the other):
 
       - source: documents.source (file path / URL / conv ID)
       - document_id: UUID string
       - rank: 1-indexed position in flat list
-      - scores: {semantic, lexical, lexical_body, rrf} all numeric (A6)
+      - scores: {hybrid_chunk, rrf} and, when Stage 2 graded the note, rerank
       - content_preview: first 200 chars of RecalledMemory.content
         (NOT a P5 violation — full content stays in memory_items;
         this is the inspection-only audit trail per 0003 column comment)
@@ -68,8 +61,7 @@ def _serialize_recall_results(results: "list[RecalledMemory]") -> list[dict]:
 
 def _channel_trace_payload(traces: "list[dict]") -> dict:
     """Merge per-query channel traces into the recall tracer payload
-    (recall_events.plan/channels/fusion + recall_event_candidates). Empty for
-    banks on the legacy recall path, so their events are unchanged."""
+    (recall_events.plan/channels/fusion + recall_event_candidates)."""
     if not traces:
         return {}
     channels: list[dict] = []
@@ -96,20 +88,6 @@ def _channel_trace_payload(traces: "list[dict]") -> dict:
     return out
 
 
-def _interleave(queries_to_results: "dict[str, list[RecalledMemory]]") -> "list[RecalledMemory]":
-    """One recall per note across the formulations: round-robin by rank, the
-    first formulation first, a note kept at its best position."""
-    lists = list(queries_to_results.values())
-    out: list = []
-    seen: set[str] = set()
-    for rank in range(max((len(x) for x in lists), default=0)):
-        for lst in lists:
-            if rank < len(lst) and str(lst[rank].document_id) not in seen:
-                seen.add(str(lst[rank].document_id))
-                out.append(lst[rank])
-    return out
-
-
 class BankConfigConflict(Exception):
     """Raised when create_bank is called with a different embedding_dim
     than an existing bank with the same bank_id."""
@@ -126,12 +104,7 @@ class BankStats:
 
 
 class Memory:
-    """The public Memory API for prospecta.
-
-    T4 surface: __init__, create_bank, bank_stats, close.
-    Future surface (T9+): retain, recall, search, recall_synth,
-    formulate_queries, index_directory, ...
-    """
+    """The public Memory API for prospecta (see the module docstring)."""
 
     def __init__(
         self,
@@ -161,7 +134,7 @@ class Memory:
         self._database_url = database_url
         self._llm = llm
         self._embed = embed
-        # `synth_llm` answers Memory.ask (and the grounded recall_synth), else `llm`; `jev` is a
+        # `synth_llm` answers Memory.ask, else `llm`; `jev` is a
         # prospecta.stages.JevScore, the decision model of Stage 0's gate and Stage 3 (None = no Jev).
         self._synth_llm = synth_llm
         self._jev = jev
@@ -221,16 +194,13 @@ class Memory:
         Idempotent for identical configs (same bank_id + same embedding_dim
         is a no-op). Raises BankConfigConflict if bank exists with different
         embedding_dim. A bank that exists is never changed (its stored
-        channel_config / recall_config / link_config stay as they are).
+        channel_config / recall_config stay as they are).
 
         A bank created here runs the hybrid architecture out of the box
         (prospecta.bank_defaults): channel_config = [hybrid_chunk] (Stage 1),
-        recall_config = a cross_encoder rerank (Stage 2). It stores link_config =
-        {"links": false, "entities": false}, which this library never reads (the linker
-        was removed) and an older library does: so a bank is never linked by one either.
-        `set_channel_config([])` makes it a legacy bank.
+        recall_config = a cross_encoder rerank (Stage 2).
 
-        Also creates the per-bank HNSW partial index for embedding columns.
+        Also creates the bank's partial HNSW index over its chunk items.
         """
         validate_bank_id(bank_id)
         if not isinstance(embedding_dim, int) or embedding_dim <= 0:
@@ -266,13 +236,11 @@ class Memory:
         self._create_hnsw_index(bank_id, embedding_dim)
 
     def set_channel_config(self, config: "list[dict]", bank_id: str | None = None) -> None:
-        """Set a bank's recall channel registry (banks.channel_config).
-
-        `[]` restores the legacy three-channel hybrid recall. See
-        prospecta.channels.DEFAULT_CHANNEL_CONFIG for the measured defaults. A removed
-        channel (bm25, keyword, question, graph) is refused (docs/legacy.md); a bank that
-        stored one before still recalls, with that channel skipped.
-        """
+        """Set a bank's Stage 1 channel (banks.channel_config): `[{"name": "hybrid_chunk", "weight": 1,
+        "params": {...}}]`, the slot counts and the HNSW ef_search being the params. `hybrid_chunk` is
+        the only channel; `[]` means its defaults (what a bank that never set one runs). Any other name
+        is refused (docs/recall-stages.md); a bank that stored one before still recalls, with that
+        entry ignored."""
         import json as _json
 
         from prospecta.channels import validate_channel_config
@@ -300,9 +268,9 @@ class Memory:
 
     def set_recall_config(self, config: dict, bank_id: str | None = None) -> None:
         """Set a bank's recall stages (banks.recall_config): the cross_encoder rerank, the
-        models, the Stage 0 / Stage 3 settings, query expansion. `{}` turns every stage off. Needs a
-        channel-configured bank. A removed stage or key (the Sonnet / Jev rerank, the gate, the
-        reader, the blend) is refused (docs/legacy.md); docs/recall-stages.md lists the keys."""
+        models, the Stage 0 / Stage 3 settings, query expansion, the depth. `{}` turns every stage
+        off. A key the design does not read is refused; docs/recall-stages.md lists the keys. (A bank
+        that stored a key it no longer reads keeps it: it is ignored.)"""
         import json as _json
 
         from prospecta.stages import validate_recall_config
@@ -316,24 +284,15 @@ class Memory:
             conn.commit()
 
     def _create_hnsw_index(self, bank_id: str, embedding_dim: int) -> None:
-        """Create the per-bank HNSW partial index for embeddings.
+        """Create the bank's partial HNSW index over its chunk items.
 
         Uses CREATE INDEX CONCURRENTLY which CANNOT run in a transaction,
-        so opens a dedicated autocommit connection.
+        so opens a dedicated autocommit connection. bank_id was validated by
+        create_bank; embedding_dim too.
         """
-        index_name = hnsw_index_name(bank_id)
-        # bank_id already validated by hnsw_index_name → validate_bank_id;
-        # embedding_dim validated by create_bank.
-        sql = HNSW_INDEX_TEMPLATE.format(
-            index_name=index_name,
-            bank_id_literal=bank_id,
-            embedding_dim=int(embedding_dim),
-        )
         with psycopg.connect(self._database_url, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
             ensure_kind_hnsw_indexes(conn, bank_id, embedding_dim)
-        logger.info("Created per-bank HNSW index %s (+ per-kind indexes)", index_name)
+        logger.info("Created the HNSW index of bank %s", bank_id)
 
     def bank_stats(self, bank_id: str | None = None) -> BankStats:
         """Return basic counts for a bank (defaults to default_bank_id)."""
@@ -376,11 +335,9 @@ class Memory:
         return _index.index_single_file(self, path, **kwargs)
 
     def search(self, text: str, **kwargs):
-        """Search across the default bank.
-
-        Modes: 'hybrid' (default), 'semantic', 'lexical'. RecalledMemory.scores
-        is always populated with three numeric keys (A6 COALESCE invariant).
-        """
+        """Mode 2A: search the default bank. Stage 1 (the bank's hybrid_chunk channel) then Stage 2
+        (the cross-encoder, when the bank's recall_config asks for it); see prospecta._index.search.
+        Each RecalledMemory carries its citation fields and scores {hybrid_chunk, rrf, rerank}."""
         from prospecta import _index
         return _index.search(self, text, **kwargs)
 
@@ -397,7 +354,6 @@ class Memory:
 
         See prospecta._retain.retain for full signature and semantics:
           - the note is indexed as kind='chunk' items, no LLM call
-          - caller-supplied index_text writes those question items instead (P4)
           - replace-on-source-match (docs/schema.md, "Re-retain")
           - DocumentSourceConflictError on hash collision with different source
         """
@@ -405,7 +361,7 @@ class Memory:
         return _retain.retain(self, content, **kwargs)
 
     # ------------------------------------------------------------------
-    # T12 — read-side bilateral spine: recall / recall_synth / formulate
+    # Read: recall (many queries), expand_and_recall (Mode 1), ask (Mode 2B)
     # ------------------------------------------------------------------
 
     def recall(
@@ -413,7 +369,6 @@ class Memory:
         queries: "list[Query] | list[str]",
         *,
         limit: int = 10,
-        mode: "Literal['hybrid','semantic','lexical']" = "hybrid",
         metadata_filter: dict | None = None,
         rrf_k: int = 60,
         depth: "Literal['standard','deep'] | None" = None,
@@ -428,15 +383,14 @@ class Memory:
     ) -> "list[RecalledMemory]":
         """Run retrieval for multiple queries; return FLAT list[RecalledMemory].
 
-        `_trace`, when given, receives the per-query channel traces (empty for
-        banks on the legacy path), so a caller can explain the hits. `_by_query`
-        receives each query's own results, in query order.
+        `_trace`, when given, receives the per-query channel traces, so a caller can explain the
+        hits. `_by_query` receives each query's own results, in query order.
 
         `date_from` / `date_to` (the note's date, inclusive) and `excluded_sources`
-        (the anti-echo list of documents.source values) are pushed into Stage 1
-        and need the hybrid_chunk channel; `reranker_model` / `decision_model`
-        override the Stage 2 / Jev model for this call (see docs/recall-stages.md).
-        `parallel=True` runs the queries concurrently, each on its own connection.
+        (the anti-echo list of documents.source values) are pushed into Stage 1;
+        `reranker_model` / `decision_model` override the Stage 2 / Jev model for this call
+        (see docs/recall-stages.md). `parallel=True` runs the queries concurrently, each on its
+        own connection.
 
         `depth` ('standard' | 'deep'; None = the bank's recall_config.depth,
         else 'standard') sets the rerank pool cut: 0.15 vs 0.05 x the best fused
@@ -446,8 +400,7 @@ class Memory:
         query order and intra-query rank. Duplicate memory_item_ids across
         queries are KEPT (caller may use this signal).
 
-        Migration 0003: fires a 'recall' tracer event with the durable
-        results array (no synthesis — that's recall_synth's territory).
+        Fires a 'recall' tracer event with the durable results array (migration 0003).
         """
         import time as _time
 
@@ -466,7 +419,6 @@ class Memory:
             own_trace: list[dict] = []
             return self.search(
                 q.text,
-                mode=mode,
                 limit=limit,
                 metadata_filter=metadata_filter,
                 rrf_k=rrf_k,
@@ -500,7 +452,7 @@ class Memory:
                 self._tracer("recall", {
                     "bank_id": self._default_bank_id,
                     "queries": [q.text for q in coerced],
-                    "mode": mode,
+                    "mode": "hybrid",
                     "n_results": len(flat),
                     "duration_ms": duration_ms,
                     "trace": None,
@@ -515,7 +467,7 @@ class Memory:
             # single event (the old side is stored by run_shadow_recall).
             from prospecta._shadow import run_shadow_recall
             run_shadow_recall(
-                self, coerced, flat, mode=mode, limit=limit,
+                self, coerced, flat, limit=limit,
                 metadata_filter=metadata_filter, rrf_k=rrf_k,
                 primary_duration_ms=duration_ms, depth=depth,
             )
@@ -742,233 +694,8 @@ class Memory:
         self._emit_calls(calls)
         return gate, sufficient
 
-    def formulate_queries(
-        self,
-        message: str,
-        *,
-        context: str | None = None,
-        prompt_override: str | None = None,
-    ) -> "list[Query]":
-        """Read-side spine: LLM-mediated multi-query expansion (JSON-mode).
-
-        Returns list[Query]. On parse failure, falls back to
-        [Query(text=message)] and records a formulate_events row with
-        parse_fallback=True (docs/observability.md). The library NEVER raises
-        on malformed LLM JSON.
-        """
-        import time as _time
-
-        from prospecta._formulate import formulate_queries as _impl
-
-        if self._llm is None:
-            raise RuntimeError(
-                "Memory.formulate_queries requires an `llm` callable; "
-                "construct Memory(llm=...)"
-            )
-
-        t_start = _time.monotonic()
-        queries, outcome = _impl(
-            message,
-            llm=self._llm,
-            context=context,
-            prompt_override=prompt_override,
-        )
-        duration_ms = int((_time.monotonic() - t_start) * 1000)
-
-        # T16: tracer dispatch (was direct append_formulate_event;
-        # default PostgresSink performs the row write). Migration 0003:
-        # llm_call payload carries verbatim prompt + response for durable
-        # trace (opt-in via PostgresSink(persist_llm_text=...)).
-        try:
-            self._tracer("llm_call", {
-                "bank_id": self._default_bank_id,
-                "purpose": "formulate_queries",
-                "json_mode": True,
-                "duration_ms": duration_ms,
-                "messages_count": 1,
-                "prompt_text": outcome.prompt,
-                "response_text": outcome.raw_response,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on llm_call; ignoring")
-
-        try:
-            self._tracer("formulate_queries", {
-                "bank_id": self._default_bank_id,
-                "message": message,
-                "n_queries": len(queries),
-                "parse_fallback": outcome.parse_fallback,
-                "raw_response": outcome.raw_response,
-                "error_kind": outcome.error_kind,
-                "duration_ms": duration_ms,
-                "json_mode_used": True,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on formulate_queries; ignoring")
-
-        return queries
-
-    def recall_synth(
-        self,
-        message: str,
-        *,
-        context: str | None = None,
-        formulate_prompt_override: str | None = None,
-        synth_prompt_override: str | None = None,
-        limit: int = 10,
-        mode: "Literal['hybrid','semantic','lexical']" = "hybrid",
-        metadata_filter: dict | None = None,
-        rrf_k: int = 60,
-        grounded: bool = False,
-        scope: "list[str] | None" = None,
-        evidence_top: int | None = None,
-        depth: "Literal['standard','deep'] | None" = None,
-    ) -> RAGResult:
-        """Chain: formulate_queries → recall → synthesize. Returns RAGResult.
-
-        grounded=True (opt-in) swaps the final step for the cited synthesis of
-        design 8.8: the evidence is every note of the blended recall scoring
-        at least `recall_config.evidence.min_rel_score` x the best (chunks
-        likewise), cut to `evidence_top` notes only when given; or,
-        when `scope` (note sources or document ids) names a
-        set, all of those notes. The answer cites [note name] per claim, may
-        say "not in memory", and RAGResult.citations is stored on the recall
-        event (recall_events.citations). `synth_prompt_override` is ignored.
-
-        Grounded mode runs ONE recall: the question is the single query (no
-        formulation call), so meta extraction and rerank happen once. `scope` defaults to the notes the extracted hard filter promoted
-        (the filter set); `evidence_top` None keeps the notes scoring at least
-        half the top score, and a set question uses the whole scope set of any
-        size whatever the top.
-
-        `depth` as in recall(); None defaults to 'deep' for a set question (an
-        explicit `scope`) and otherwise to the bank's default depth.
-        """
-        import time as _time
-
-        from prospecta import _rag
-        from prospecta._scorecut import check_depth
-        check_depth(depth)
-        if depth is None and grounded and scope:
-            depth = "deep"
-
-        if self._llm is None:
-            raise RuntimeError(
-                "Memory.recall_synth requires an `llm` callable; "
-                "construct Memory(llm=...)"
-            )
-
-        t_start = _time.monotonic()
-        bank_id = self._default_bank_id
-
-        # 1. Formulate (grounded: the question is the single query, one recall)
-        if grounded:
-            formulated = [Query(text=message)]
-        else:
-            formulated = self.formulate_queries(
-                message,
-                context=context,
-                prompt_override=formulate_prompt_override,
-            )
-
-        # 2. Recall per-query → queries_to_results + flat list (preserves order)
-        queries_to_results: dict[str, list[RecalledMemory]] = {}
-        flat_results: list[RecalledMemory] = []
-        traces: list[dict] = []
-        for q in formulated:
-            results = self.search(
-                q.text,
-                mode=mode,
-                limit=limit,
-                metadata_filter=metadata_filter,
-                rrf_k=rrf_k,
-                _trace=traces,
-                depth=depth,
-            )
-            queries_to_results[q.text] = results
-            flat_results.extend(results)
-
-        self._emit_stage_calls(traces)
-
-        # 3. Synthesize — full content (P5), no truncation.
-        synth_t0 = _time.monotonic()
-        grounded_res = None
-        if grounded:
-            from prospecta import _synth
-            blended = _interleave(queries_to_results)
-            if not scope:   # the extracted filter's promoted set (design 8.5)
-                scope = [d for t in traces
-                         for d in t.get("fusion", {}).get("scope_promoted", [])] or None
-            from prospecta.db.queries import _vec_literal
-            from prospecta.stages import read_recall_config
-            qvec = _vec_literal(self._embed([message])[0])
-            with self._pool.connection() as conn:
-                ev_cfg = read_recall_config(conn, bank_id).get("evidence") or {}
-                notes, set_mode = _synth.gather_evidence(
-                    conn, bank_id, blended, top=evidence_top, scope=scope, qvec=qvec,
-                    min_rel_score=ev_cfg.get("min_rel_score", _synth.DEFAULT_MIN_REL_SCORE),
-                    context_tokens=ev_cfg.get("context_tokens", _synth.DEFAULT_CONTEXT_TOKENS))
-            grounded_res = _synth.synthesize_grounded(
-                message, notes, self._synth_llm or self._llm, set_mode=set_mode)
-            synthesis, synth_prompt = grounded_res.synthesis, grounded_res.prompt
-        else:
-            synthesis, synth_prompt = _rag.synthesize(
-                message,
-                flat_results,
-                self._llm,
-                prompt_override=synth_prompt_override,
-            )
-        synth_duration_ms = int((_time.monotonic() - synth_t0) * 1000)
-
-        duration_ms = int((_time.monotonic() - t_start) * 1000)
-
-        # 4. T16 + migration 0003: tracer dispatch carries the full durable
-        # trace — llm_call gets verbatim prompt + response; recall gets the
-        # results array (200-char content_preview per element; full content
-        # stays in memory_items) + synthesis text.
-        try:
-            self._tracer("llm_call", {
-                "bank_id": bank_id,
-                "purpose": "synthesize_grounded" if grounded else "synthesize",
-                "json_mode": False,
-                "duration_ms": synth_duration_ms,
-                "messages_count": 1,
-                "prompt_text": synth_prompt,
-                "response_text": synthesis,
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on llm_call; ignoring")
-
-        try:
-            self._tracer("recall", {
-                "bank_id": bank_id,
-                "queries": [q.text for q in formulated],
-                "mode": mode,
-                "n_results": len(flat_results),
-                "duration_ms": duration_ms,
-                "trace": None,
-                "results": _serialize_recall_results(flat_results),
-                "synthesis": synthesis,
-                "citations": grounded_res.citations if grounded_res else None,
-                **_channel_trace_payload(traces),
-            })
-        except Exception:  # pragma: no cover
-            logger.exception("tracer raised on recall; ignoring")
-
-        return RAGResult(
-            synthesis=synthesis,
-            sources=flat_results,
-            queries=formulated,
-            queries_to_results=queries_to_results,
-            citations=grounded_res.citations if grounded_res else [],
-            evidence=[{"note": n.name, "document_id": n.document_id,
-                       "chunks": list(n.chunks)} for n in grounded_res.notes]
-            if grounded_res else [],
-            synth_call=dict(grounded_res.call) if grounded_res else {},
-        )
-
     # ------------------------------------------------------------------
-    # T14 — background sweeper (P14 filesystem drift safety net)
+    # The background sweeper (P14 filesystem drift safety net)
     # ------------------------------------------------------------------
 
     def start_sweeper(

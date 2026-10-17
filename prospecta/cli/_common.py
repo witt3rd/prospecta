@@ -80,8 +80,7 @@ def _stage_kwargs() -> dict:
     """synth_llm, rerank_transport and jev for Memory, built when configured: an OPENROUTER_API_KEY
     configures them (the cited answer's model through the accounted LLM; the cross-encoder through
     OpenRouter's rerank endpoint; the decision model, Jev, through OpenRouter's System One door).
-    PROSPECTA_JEV=off opts out of Jev. Without a key none is built. (No linker is ever built: the
-    linker was removed, docs/legacy.md.)"""
+    PROSPECTA_JEV=off opts out of Jev. Without a key none is built."""
     if not os.environ.get("OPENROUTER_API_KEY"):
         return {}
     try:
@@ -203,7 +202,7 @@ def pretty_print_recalled(results) -> None:
     for i, r in enumerate(results, start=1):
         scores = r.scores or {}
         score_parts = []
-        for k in ("rrf", "semantic", "lexical"):
+        for k in ("rrf", "rerank"):
             v = scores.get(k)
             if v is not None:
                 score_parts.append(f"{k}={v:.4f}")

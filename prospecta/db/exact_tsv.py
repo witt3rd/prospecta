@@ -13,7 +13,7 @@ fills from `column_expression()`, so the migration and the column cannot drift, 
 names only the column.
 
 Migration 0018 once built a GIN index (`memory_items_keyword_gin`) over the same expression for
-the `keyword` channel. That channel was removed (docs/legacy.md): no code reads or builds the index
+the `keyword` channel. That channel was removed: no code reads or builds the index
 any more. A database that has it keeps it (it is not dropped); a new database does not get it.
 
 Adding the column REWRITES `memory_items` (every row, every index of the table), once, inside

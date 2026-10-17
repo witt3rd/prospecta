@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 from prospecta import _expand as ex
 from prospecta._filters import today as _today
-from prospecta._llmutil import llm_call_record, llm_text
+from prospecta._llmutil import accepts_model, llm_call_record, llm_text
 from prospecta._scorecut import check_depth, estimate_tokens, pool_min_rel, rel_cut, resolve_depth
 from prospecta._types import (
     ExpandedRecall, GateDecision, RecalledMemory, SearchRun, SearchSpec, TaskBrief,
@@ -36,7 +36,7 @@ from prospecta.channels import QueryPlan, RecallState, read_channel_config, run_
 from prospecta.cited import HEADING, TASK_HEADING, document_citations, format_cited_rag_block
 from prospecta.stages import (
     CrossEncoderReranker, RERANK_MIN_SCORE, RERANK_TIMEOUT_S, _with_decision_model, _with_scores,
-    build_items, read_recall_config, resolve_reranker_model, run_reranker, totals, warn_retired_recall_config,
+    build_items, read_recall_config, resolve_reranker_model, run_reranker, totals,
 )
 
 logger = logging.getLogger("prospecta.expand")
@@ -199,7 +199,6 @@ class _Run:
             channel_config = read_channel_config(conn, bank_id)
             conn.rollback()
         self.timings["config"] = _ms(t)
-        warn_retired_recall_config(cfg)
         xcfg, g0, rr = cfg.get("expansion") or {}, cfg.get("stage0_gate") or {}, cfg.get("rerank") or {}
         models = cfg.get("models") or {}
         deadline = float(_pick(deadline, xcfg.get("deadline_s"), ex.DEFAULT_DEADLINE_S))
@@ -216,9 +215,8 @@ class _Run:
         entry = next((e for e in channel_config
                       if e.get("name") == "hybrid_chunk" and e.get("enabled", True)), None)
         if entry is None:
-            return self.result(error="the bank's channel_config has no hybrid_chunk channel: query "
-                                     "expansion runs on Stage 1 (add {\"name\": \"hybrid_chunk\", "
-                                     "\"weight\": 1})")
+            return self.result(error="the bank's channel_config disables the hybrid_chunk channel: query "
+                                     "expansion runs on Stage 1 (remove its \"enabled\": false)")
         if memory._embed is None:
             return self.result(error="query expansion needs an `embed` callable; construct "
                                      "Memory(embed=...)")
@@ -356,7 +354,6 @@ class _Run:
         llm = self.memory._llm
         if llm is None:
             return ex.ParsedReply([], "no query-writer model (construct Memory(llm=...))")
-        from prospecta.channels.extract import _accepts_model
         prompt = ex.render_writer_prompt(text, kind=kind, agent_last=agent_last if kind == "chat" else None,
                                          max_searches=plan.max_searches, today=today)
         budget = max(0.1, min(ex.WRITER_SHARE * plan.deadline,
@@ -365,7 +362,7 @@ class _Run:
         rec: dict = {"purpose": "expand_searches", "model": model, "tokens_in": None, "tokens_out": None,
                      "cost_usd": None, "json_mode": True, "messages_count": 1, "prompt_text": prompt,
                      "response_text": None, "error": None}
-        kw = {"model": model} if _accepts_model(llm) else {}
+        kw = {"model": model} if accepts_model(llm) else {}
         try:
             raw = _call_within(lambda: llm(messages=[{"role": "user", "content": prompt}],
                                            json_mode=True, **kw), budget)

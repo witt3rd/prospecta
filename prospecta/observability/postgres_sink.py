@@ -1,6 +1,6 @@
 """PostgresSink — canonical persistence tracer.
 
-Dispatches each of the six prospecta events to the corresponding
+Dispatches each of the five prospecta events to the corresponding
 append_*_event helper in prospecta.db.queries.
 
 Architecture (per T16 spec, stance (a)):
@@ -18,7 +18,6 @@ Architecture (per T16 spec, stance (a)):
   - Events:
       'retain'             → append_retain_event
       'recall'             → append_recall_event
-      'formulate_queries'  → append_formulate_event
       'sweep_pass'         → append_sweep_pass + upsert_sweeper_state
                               (docs/observability.md; one txn)
       'index_single_file'  → no-op for v0.1 (no index_events table)
@@ -30,7 +29,6 @@ import logging
 from typing import Any
 
 from prospecta.db.queries import (
-    append_formulate_event,
     append_llm_call,
     append_recall_event,
     append_retain_event,
@@ -114,11 +112,8 @@ class PostgresSink:
                 bank_id=p["bank_id"],
                 document_id=p.get("document_id"),
                 items_count=int(p["items_count"]),
-                index_text_caller_supplied=bool(p["index_text_caller_supplied"]),
                 duration_ms=int(p["duration_ms"]),
-                raw_llm_response=p.get("raw_llm_response"),
                 error=p.get("error"),
-                index_text_generated=p.get("index_text_generated"),
             )
             conn.commit()
 
@@ -138,7 +133,6 @@ class PostgresSink:
                 channels=p.get("channels"),
                 fusion=p.get("fusion"),
                 rerank=p.get("rerank"),
-                hops=p.get("hops"),
                 candidates=p.get("candidates"),
                 cost_usd=p.get("cost_usd"),
                 tokens_in=p.get("tokens_in"),
@@ -146,21 +140,6 @@ class PostgresSink:
                 n_llm_calls=p.get("n_llm_calls"),
                 citations=p.get("citations"),
                 depth=p.get("depth"),
-            )
-            conn.commit()
-
-    def _handle_formulate(self, p: dict[str, Any]) -> None:
-        with self._connection() as conn:
-            append_formulate_event(
-                conn,
-                bank_id=p["bank_id"],
-                message=p["message"],
-                n_queries=int(p["n_queries"]),
-                parse_fallback=bool(p["parse_fallback"]),
-                raw_response=p.get("raw_response"),
-                error_kind=p.get("error_kind"),
-                duration_ms=int(p["duration_ms"]),
-                json_mode_used=bool(p.get("json_mode_used", True)),
             )
             conn.commit()
 
@@ -243,7 +222,6 @@ class PostgresSink:
 _HANDLERS = {
     "retain": PostgresSink._handle_retain,
     "recall": PostgresSink._handle_recall,
-    "formulate_queries": PostgresSink._handle_formulate,
     "sweep_pass": PostgresSink._handle_sweep_pass,
     "index_single_file": PostgresSink._handle_index_single_file,
     "llm_call": PostgresSink._handle_llm_call,

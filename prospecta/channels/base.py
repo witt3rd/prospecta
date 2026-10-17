@@ -1,17 +1,17 @@
-"""Channel interface (hybrid retrieval design 8.2)."""
+"""Channel interface (hybrid retrieval design 8.2). `hybrid_chunk` is the one channel."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Callable, Literal, Protocol
 
 
 @dataclass(frozen=True)
 class Candidate:
     document_id: str            # the parent note
-    item_id: str | None         # the child chunk or question item that matched
+    item_id: str | None         # the chunk that matched
     source: str                 # documents.source (the file name)
-    channel: str                # "dense_chunk" | "hybrid_chunk" | "meta"
+    channel: str                # "hybrid_chunk"
     rank: int                   # 1-based within the channel (document level)
     score: float                # the channel's own score
     evidence: str | None        # the matched item's original text
@@ -19,42 +19,14 @@ class Candidate:
 
 
 @dataclass(frozen=True)
-class Filters:
-    people: list[str] = field(default_factory=list)
-    date_from: str | None = None
-    date_to: str | None = None
-    tags: list[str] = field(default_factory=list)
-    hard: bool = False
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@dataclass(frozen=True)
 class QueryPlan:
     text: str
-    formulations: list[str] = field(default_factory=list)
-    filters: Filters = field(default_factory=Filters)
-    now: datetime = field(default_factory=_utcnow)
     # What the Stage 1 exact retriever reads instead of `text` (the verbatim names, identifiers
     # and "quoted phrases" of a query expansion's search); None: it reads `text`.
     exact_text: str | None = None
 
     def to_json(self) -> dict:
-        return {
-            "text": self.text,
-            "formulations": list(self.formulations),
-            "filters": {
-                "people": list(self.filters.people),
-                "date_from": self.filters.date_from,
-                "date_to": self.filters.date_to,
-                "tags": list(self.filters.tags),
-                "hard": self.filters.hard,
-            },
-            "now": self.now.isoformat(),
-            **({"exact_text": self.exact_text} if self.exact_text is not None else {}),
-        }
+        return {"text": self.text, **({"exact_text": self.exact_text} if self.exact_text is not None else {})}
 
 
 @dataclass
@@ -83,7 +55,6 @@ class RecallState:
 
 class Channel(Protocol):
     name: str
-    kind: Literal["recall", "filter"]
-    # recall: finds; filter: constrains / promotes
+    kind: Literal["recall"]
 
     def retrieve(self, plan: QueryPlan, state: RecallState, limit: int) -> list[Candidate]: ...

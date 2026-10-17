@@ -1,9 +1,9 @@
 """Tracer primitives (M6).
 
-The tracer is the observability fan-out for prospecta. Six named events
+The tracer is the observability fan-out for prospecta. Five named events
 fire from canonical call sites:
 
-  retain | recall | formulate_queries | index_single_file | sweep_pass | llm_call
+  retain | recall | index_single_file | sweep_pass | llm_call
 
 Callers may supply any callable matching the Tracer Protocol (see _types.py).
 The default tracer is `PostgresSink` when a database_url is configured (it

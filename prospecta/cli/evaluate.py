@@ -1,4 +1,4 @@
-"""`prospecta eval QUESTIONS.md` — score recall, ablate channels, report cost and latency."""
+"""`prospecta eval QUESTIONS.md` — score recall, ablate Stage 2, report cost and latency."""
 from __future__ import annotations
 
 import sys
@@ -26,9 +26,7 @@ def cmd_eval(args) -> int:
     try:
         report = evaluation.run_eval(
             memory, questions, ablate=args.ablate, synth=args.synth or args.judge,
-            judge=args.judge,
-            scope_promote=getattr(args, "scope_promote", None),
-            depth=getattr(args, "depth", None))
+            judge=args.judge, depth=getattr(args, "depth", None))
     except Exception as e:
         print(f"error: eval failed: {e}", file=sys.stderr)
         return 2
