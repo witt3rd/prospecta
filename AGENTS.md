@@ -5,6 +5,8 @@ time), found by one SQL query (semantic + stemmed + exact) plus a cross-encoder,
 `README.md` is the overview; `docs/postgres-hybrid.md` is the one normative design; `PRINCIPLES.md` holds
 the principles; `CHANGELOG.md` the release notes.
 
+Logo: docs/assets/prospecta-logo.png
+
 ## Tests
 
 `uv run --with pytest python -m pytest -q`. Postgres-backed tests start a pgvector testcontainer, or use a

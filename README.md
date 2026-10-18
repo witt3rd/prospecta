@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/prospecta-logo.png" alt="Prospecta" width="320"></p>
+
 # Prospecta
 
 **Long-term memory for agents, on Postgres.** Prospecta stores what an agent (or a person) writes as verbatim notes cut into chunks, finds them again with one native Postgres query plus a cross-encoder, and hands back **cited evidence**: every hit says where it is from, when, why it matched, and quotes the matching words.
