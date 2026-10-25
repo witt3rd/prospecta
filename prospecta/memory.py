@@ -24,6 +24,7 @@ from prospecta.db.queries import (
     SELECT_BANK,
     SELECT_BANK_STATS,
     ensure_kind_hnsw_indexes,
+    ensure_kind_lexical_indexes,
     validate_bank_id,
 )
 
@@ -200,7 +201,8 @@ class Memory:
         (prospecta.bank_defaults): channel_config = [hybrid_chunk] (Stage 1),
         recall_config = a cross_encoder rerank (Stage 2).
 
-        Also creates the bank's partial HNSW index over its chunk items.
+        Also creates the bank's partial HNSW index and its two partial GIN indexes (stemmed and exact
+        words) over its chunk items, so a search of this bank never walks another bank's index.
         """
         validate_bank_id(bank_id)
         if not isinstance(embedding_dim, int) or embedding_dim <= 0:
@@ -292,7 +294,8 @@ class Memory:
         """
         with psycopg.connect(self._database_url, autocommit=True) as conn:
             ensure_kind_hnsw_indexes(conn, bank_id, embedding_dim)
-        logger.info("Created the HNSW index of bank %s", bank_id)
+            ensure_kind_lexical_indexes(conn, bank_id)
+        logger.info("Created the HNSW and lexical indexes of bank %s", bank_id)
 
     def bank_stats(self, bank_id: str | None = None) -> BankStats:
         """Return basic counts for a bank (defaults to default_bank_id)."""
