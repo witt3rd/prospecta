@@ -184,6 +184,7 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/schema.md`](docs/schema.md) | the tables, indexes, write semantics and migrations 0001 to 0020 |
 | [`docs/limits.md`](docs/limits.md) | every numeric limit and why it is there |
 | [`docs/observability.md`](docs/observability.md) | the event tables, the `psql` cheat sheet, tracers |
+| [`docs/bank-isolation.md`](docs/bank-isolation.md) | why one bank's size no longer slows another: the per-bank HNSW and GIN indexes |
 | [`docs/exact-tsv.md`](docs/exact-tsv.md) | the stored exact vector (migration 0020, which rewrites `memory_items`), its operator runbook, the cost of plain questions |
 | [`docs/deployment.md`](docs/deployment.md) | Docker, local Postgres, Neon, Azure; pgvector 0.8 |
 | [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |

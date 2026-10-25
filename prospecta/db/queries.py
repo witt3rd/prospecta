@@ -102,6 +102,49 @@ def ensure_kind_hnsw_indexes(conn, bank_id: str, embedding_dim: int) -> None:
             cur.execute(sql)
 
 
+# The per-bank partial GIN indexes of Stage 1's two lexical retrievers (stemmed: body_tsv, exact:
+# exact_tsv). Like the HNSW index above, each repeats bank_id and kind literally, so the planner
+# serves a bank's search from that bank's own small index instead of the shared GIN that holds every
+# bank's words (docs/bank-isolation.md). The shared indexes stay: a bank without its indexes still
+# searches (slower, in proportion to the other banks' size).
+LEXICAL_INDEX_COLUMNS = (("body_tsv", "body_tsv"), ("exact_tsv", "exact_tsv"))   # (name stem, column)
+
+LEXICAL_KIND_INDEX_TEMPLATE = """
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
+    ON memory_items USING gin ({column})
+    WHERE bank_id = '{bank_id_literal}' AND kind = '{kind}'
+"""
+
+
+def lexical_kind_index_name(stem: str, bank_id: str, kind: str) -> str:
+    """memory_items_<stem>_<bank>_<kind>_gin, kept within 63 bytes (the md5 rule of hnsw_kind_index_name)."""
+    import hashlib
+
+    validate_bank_id(bank_id)
+    if kind not in KIND_INDEX_KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+    safe = bank_id.replace("-", "_")
+    name = f"memory_items_{stem}_{safe}_{kind}_gin"
+    if len(name) <= 63:
+        return name
+    digest = hashlib.md5(bank_id.encode()).hexdigest()[:8]
+    fixed = f"memory_items_{stem}__{digest}_{kind}_gin"
+    room = 63 - len(fixed)
+    return f"memory_items_{stem}_{safe[:room]}_{digest}_{kind}_gin"
+
+
+def ensure_kind_lexical_indexes(conn, bank_id: str) -> None:
+    """Create the bank's two partial GIN indexes over its chunk items. `conn` MUST be autocommit."""
+    validate_bank_id(bank_id)
+    for kind in KIND_INDEX_KINDS:
+        for stem, column in LEXICAL_INDEX_COLUMNS:
+            sql = LEXICAL_KIND_INDEX_TEMPLATE.format(
+                index_name=lexical_kind_index_name(stem, bank_id, kind),
+                column=column, bank_id_literal=bank_id, kind=kind)
+            with conn.cursor() as cur:
+                cur.execute(sql)
+
+
 # ---------------------------------------------------------------------------
 # T9 — Document + memory_item write helpers
 # ---------------------------------------------------------------------------

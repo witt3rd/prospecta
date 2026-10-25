@@ -232,14 +232,16 @@ def test_a_new_bank_works_end_to_end_and_stamps_nothing_legacy(fresh_db):
         mem.close()
 
 
-def test_a_new_bank_builds_the_chunk_index_only(fresh_db):
+def test_a_new_bank_builds_the_chunk_indexes_only(fresh_db):
     mem = Memory(database_url=fresh_db, bank_id="fresh", embed=embed)
     try:
         mem.create_bank("fresh", embedding_dim=EMBED_DIM)
         with psycopg.connect(fresh_db) as c:
             names = {r[0] for r in c.execute(
                 "SELECT indexname FROM pg_indexes WHERE tablename = 'memory_items' AND indexname LIKE '%fresh%'")}
-        assert names == {"memory_items_embedding_fresh_chunk_idx"}
+        # the HNSW index and the two per-bank partial GIN indexes (docs/bank-isolation.md): chunk items only
+        assert names == {"memory_items_embedding_fresh_chunk_idx",
+                         "memory_items_body_tsv_fresh_chunk_gin", "memory_items_exact_tsv_fresh_chunk_gin"}
     finally:
         mem.close()
 
