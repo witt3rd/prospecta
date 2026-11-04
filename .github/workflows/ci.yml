@@ -1,22 +1,39 @@
 name: ci
 
+# Direct landing (docs/decisions/0001-land-direct.md): Tier 1 on push to main only;
+# Tier 2 (full suite with Postgres testcontainers) on a 6 h schedule and on dispatch.
+# scripts/land-direct reads the `tier1` job of main's latest push run: the job name is load-bearing.
+
 on:
   push:
     branches: [main]
     paths-ignore: ["tui/**"]
-  pull_request:
-    paths-ignore: ["tui/**"]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  tier1:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: scripts/tier1.sh
+
+  tier2:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras
-      # Postgres tests start throwaway pgvector containers via testcontainers
-      # (docker is available on ubuntu-latest).
+      # Postgres tests start throwaway pgvector containers via testcontainers.
       - run: uv run pytest -q
