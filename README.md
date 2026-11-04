@@ -188,7 +188,7 @@ Every load-bearing event is recorded in Postgres event tables, a durable audit t
 | [`docs/exact-tsv.md`](docs/exact-tsv.md) | the stored exact vector (migration 0020, which rewrites `memory_items`), its operator runbook, the cost of plain questions |
 | [`docs/deployment.md`](docs/deployment.md) | Docker, local Postgres, Neon, Azure; pgvector 0.8 |
 | [`docs/source-contract.md`](docs/source-contract.md) | shared-database mode, source views, the HTTP service |
-| [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md) | operations |
+| [`docs/backup-restore.md`](docs/backup-restore.md), [`docs/embedding-migration.md`](docs/embedding-migration.md), [`docs/import-hindsight.md`](docs/import-hindsight.md), [`docs/testing.md`](docs/testing.md), [`docs/eval.md`](docs/eval.md), [`docs/decisions/0001-land-direct.md`](docs/decisions/0001-land-direct.md) | operations |
 | [`docs/hybrid-implementation-plan.md`](docs/hybrid-implementation-plan.md) | the plan that built this and the status of its slices (removed when slices 5 and 6 finish) |
 | [`PRINCIPLES.md`](PRINCIPLES.md) | the load-bearing principles |
 | [`AGENTS.md`](AGENTS.md) and the skills | the practice, with its reasons and evidence: [recall](skills/recall/SKILL.md), [retain](skills/retain/SKILL.md), [search-and-ask](skills/search-and-ask/SKILL.md), [tuning-and-testing](skills/tuning-and-testing/SKILL.md), [operating](skills/operating/SKILL.md); other projects adopt them, and lessons come back as PRs |
