@@ -120,8 +120,48 @@ def run_migrations(database_url: str, schema: str | None = None) -> dict:
     if 20 in current or 20 in applied:
         from prospecta.db.exact_tsv import ensure_exact_tsv_index
         ensure_exact_tsv_index(database_url)
+        ensure_bank_lexical_indexes(database_url)
 
     return {"applied": applied, "skipped": skipped}
+
+
+def ensure_bank_lexical_indexes(database_url: str) -> dict:
+    """Every bank has its two partial GIN indexes (docs/bank-isolation.md); idempotent.
+
+    A bank created before they existed, or inserted by raw SQL, gets them here, and an invalid
+    leftover of an interrupted build is dropped and rebuilt (the repair of finish_0004). The usual
+    case (nothing missing) is one catalog query and no lock. The build holds every index builder's
+    advisory key (builder_locks.py), like the exact_tsv index.
+    """
+    from prospecta.db.queries import (
+        KIND_INDEX_KINDS, LEXICAL_INDEX_COLUMNS, ensure_kind_lexical_indexes, lexical_kind_index_name,
+    )
+
+    built = 0
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        bank_ids = [r[0] for r in conn.execute("SELECT bank_id FROM banks ORDER BY bank_id")]
+        wanted = {lexical_kind_index_name(stem, b, k): b
+                  for b in bank_ids for k in KIND_INDEX_KINDS for stem, _ in LEXICAL_INDEX_COLUMNS}
+
+        def valid_names() -> set[str]:
+            return {r[0] for r in conn.execute(
+                "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = to_regclass('memory_items') AND i.indisvalid AND i.indisready "
+                "AND c.relname = ANY(%s)", (list(wanted),))}
+
+        if not (set(wanted) - valid_names()):
+            return {"banks": len(bank_ids), "built": 0}
+        with hold_builder_locks(conn):
+            have = valid_names()
+            for (name,) in conn.execute(
+                    "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                    "WHERE i.indrelid = to_regclass('memory_items') AND NOT i.indisvalid "
+                    "AND c.relname = ANY(%s)", (list(wanted),)).fetchall():
+                conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+            for bank_id in sorted({b for n, b in wanted.items() if n not in have}):
+                ensure_kind_lexical_indexes(conn, bank_id)
+                built += 1
+    return {"banks": len(bank_ids), "built": built}
 
 
 BACKFILL_BATCH = 5000
