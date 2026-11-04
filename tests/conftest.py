@@ -225,3 +225,19 @@ def populated_corpus_with_recording_tracer(memory_with_recording_tracer):
     # Clear seeded events so tests assert on the queries-under-test only.
     mem._tracer.clear()
     return mem
+
+
+_PG_FIXTURES = {"pg_container", "pg_url", "fresh_db"}
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tier 1 (PROSPECTA_TIER1=1): skip tests that need Postgres (they run in
+    Tier 2: docs/decisions/0001-land-direct.md)."""
+    import os
+
+    if os.environ.get("PROSPECTA_TIER1") != "1":
+        return
+    skip = pytest.mark.skip(reason="needs Postgres: Tier 2 only")
+    for item in items:
+        if _PG_FIXTURES & set(getattr(item, "fixturenames", ())):
+            item.add_marker(skip)

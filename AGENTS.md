@@ -33,3 +33,5 @@ and `python -m pytest tests/test_docs_links.py tests/test_skills.py`.
 
 Spire and rung-memory-prospecta adopt or adapt these skills; lessons found elsewhere come back as PRs to
 these skills; every recall PR states the skill it follows or changes.
+
+Land with `scripts/land-direct`, never open a PR.
