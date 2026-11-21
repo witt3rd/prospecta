@@ -104,6 +104,7 @@ All idempotent; they take the record's reference, never its text.
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score","created_on","match_kind","exact_snippet","relevance_score"}]}]}` |
 | `POST /lookup` (a task brief) | `{"task":{"title","ask","done"?,"project"?}, "max_tokens"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` (no `limit`) | `{"task":{"queries":[...], "context":"## Recalled Project Context ...", "searches":[{"query","terms","date_from","date_to"}], "results":[{"source","created_on","kind","record_id","revision","project","match_kind","exact_snippet","relevance_score","found_by"}], "fallbacks":[...], "error":null}}` |
 | `POST /retain` | `{"content","source","bank"?,"metadata"?:{"created_on","project","person","kind"},"tags"?,"create"?}` | `{"document_id","status":"created"|"replaced"|"unchanged"}` |
+| `POST /lung-memory/1` | lung's wire: `{"op":"recall"|"search"|"retain", ...}` (see "The `lung-memory/1` adapter") | `{"status":"ok","records":[...]}`, `{"status":"retained","id"}` or `{"status":"unavailable","reason"}`, each with `"retention"` |
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
 | `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
@@ -171,6 +172,62 @@ body limit (the other routes keep 1 MiB), and it is stored whole, as chunks.
 "content", ...}` with the same citation fields as a record. Nobody holds its text elsewhere, so
 `content` is its best-matching chunk. The task form already returned them (`kind` is the note's
 own kind, `record_id` null), and accepts `excluded_sources` as the questions form does.
+
+### The `lung-memory/1` adapter
+
+`POST /lung-memory/1` speaks the wire that lung (the Lean agent) specified and proved on its side
+(`lung/spec/LungSpec/MemoryWire.lean`, PART B), so lung can use the service as its memory provider.
+It sends the same `Authorization: Bearer <PROSPECTA_SERVICE_TOKEN>` as every other call (401
+without it), JSON in, JSON out, stdlib only. Banks are named in the request; a retain makes its bank
+on first use. Like `/retain` it has no body limit.
+
+| request | what runs | reply |
+|---|---|---|
+| `{"op":"recall","task":"...","banks":["b1","b2"]}` | Mode 1 as the task form of `/lookup` (the query writer, Stage 1 + Stage 2, one merged set) over each bank, results concatenated in the request's bank order | `{"status":"ok","records":[...],"retention":"..."}` |
+| `{"op":"search","query":"...","banks":["b1"]}` | the questions form of `/lookup` (best chunk per note, best first, 10 per bank) over each bank | the same |
+| `{"op":"retain","bank":"b1","text":"...","source":"..."}` | `/retain` with `create`: `source` is the idempotency key (same key and text: unchanged; same key, new text: replaced) | `{"status":"retained","id":"<document id>","retention":"..."}` |
+
+A record is `{"bank","id","text","source","date"}`: `bank` is the name the request used (never a
+bank the request did not name), `id` the document id, `text` the best-matching chunk, verbatim,
+`source` the note's stored source, `date` the note's date as `YYYY-MM-DD`. Ids are distinct in a
+reply (a note of many chunks is one record). Nothing found is `{"status":"ok","records":[],...}`;
+a bank that does not exist has no notes, and is not made by a recall. Lung's decoder takes all of a
+reply or none of it, so a hit that has no source or no date is **left out** (never defaulted).
+Every note stored through `/retain` or `/lung-memory/1` has a source and a date, so this can only
+happen to a document written another way with a NULL or empty `source` (a direct database write);
+a date cannot be missing (the note's date, else its creation day). The service logs how many it left
+out.
+
+A failure is `{"status":"unavailable","reason":"<word>","retention":"..."}` with HTTP **200**. The
+reasons this service gives: `provider` (a bank of another embedding dimension, the same text already
+stored under another source, no embedder, a recall that failed or any unexpected error), `timeout`
+(the database pool timed out, or the recall deadline was hit: a partial recall is never returned),
+`malformed` (a retain with a bank name that is not valid, or with blank text). `transport`, `scope`,
+`cost` and `retention` are the caller's to say; the service never gives them. If one of several banks
+cannot be read, the whole reply is `unavailable`: lung would otherwise believe it consulted them all.
+**400** is only for a body that parses as none of the three ops (not JSON, not an object, an unknown
+`op`, a missing or wrongly typed field, an empty `bank` or `source` on a retain); its body is still
+`{"status":"unavailable","reason":"malformed","retention":"..."}`.
+
+`retention` is `"attested"` only when the operator sets `PROSPECTA_ZDR_ATTESTED=1` (exactly `1`: the
+operator asserts that the deployment's OpenRouter key or workspace is zero-data-retention);
+otherwise `"unattested"`. Prospecta does not enforce zero data retention; the flag is a claim, said on every reply
+(including a 400).
+
+```
+POST /lung-memory/1  {"op":"retain","bank":"lung-class-work","text":"Deploys go out on Tuesdays.","source":"lung/session-7"}
+-> {"status":"retained","id":"6e664361-a6f0-40ad-b032-681928cfc6f4","retention":"unattested"}
+
+POST /lung-memory/1  {"op":"search","query":"when do deploys go out","banks":["lung-class-work"]}
+-> {"status":"ok","records":[{"bank":"lung-class-work","id":"6e664361-a6f0-40ad-b032-681928cfc6f4",
+    "text":"Deploys go out on Tuesdays.","source":"lung/session-7","date":"2026-11-23"}],"retention":"unattested"}
+
+POST /lung-memory/1  {"op":"recall","task":"plan this week's release","banks":["lung-class-work","lung-domain-shop"]}
+-> {"status":"ok","records":[],"retention":"attested"}                       (PROSPECTA_ZDR_ATTESTED=1)
+
+POST /lung-memory/1  {"op":"search","query":"x","banks":["narrow"]}          (a bank of another embedding dimension)
+-> {"status":"unavailable","reason":"provider","retention":"unattested"}
+```
 
 ### Reconcile
 
