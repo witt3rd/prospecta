@@ -6,6 +6,8 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 
 ## [Unreleased]
 
+`POST /lung-memory/1` gains `{"op":"delete_bank","bank"}` (only `lung-scratch-*` banks: documents, bank row and the bank's partial indexes go; any other name is `unavailable scope`), and a recall or search naming a bank that does not exist is now `{"status":"unavailable","reason":"scope","detail":"unknown bank: <name>"}` (checked for all banks before anything runs) instead of an empty result. Docs say a recall takes about 5 s; use a 30 s timeout.
+
 The default query-writer model is now `openrouter/deepseek/deepseek-v4.1-flash-1017` (was `openrouter/google/gemini-2.5-flash-lite`,
 which has no endpoint under a zero-data-retention OpenRouter workspace). Override with `PROSPECTA_QUERY_WRITER_MODEL`.
 

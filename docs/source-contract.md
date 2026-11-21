@@ -179,34 +179,51 @@ own kind, `record_id` null), and accepts `excluded_sources` as the questions for
 (`lung/spec/LungSpec/MemoryWire.lean`, PART B), so lung can use the service as its memory provider.
 It sends the same `Authorization: Bearer <PROSPECTA_SERVICE_TOKEN>` as every other call (401
 without it), JSON in, JSON out, stdlib only. Banks are named in the request; a retain makes its bank
-on first use. Like `/retain` it has no body limit.
+on first use (a recall or search of a bank that does not exist is an error, below). Like `/retain` it has no body limit.
 
 | request | what runs | reply |
 |---|---|---|
 | `{"op":"recall","task":"...","banks":["b1","b2"]}` | Mode 1 as the task form of `/lookup` (the query writer, Stage 1 + Stage 2, one merged set) over each bank, results concatenated in the request's bank order | `{"status":"ok","records":[...],"retention":"..."}` |
 | `{"op":"search","query":"...","banks":["b1"]}` | the questions form of `/lookup` (best chunk per note, best first, 10 per bank) over each bank | the same |
 | `{"op":"retain","bank":"b1","text":"...","source":"..."}` | `/retain` with `create`: `source` is the idempotency key (same key and text: unchanged; same key, new text: replaced) | `{"status":"retained","id":"<document id>","retention":"..."}` |
+| `{"op":"delete_bank","bank":"lung-scratch-x"}` | this service's own op (not in the Lean spec): removes a scratch bank. Only an exact name starting `lung-scratch-` is allowed. Its per-bank partial indexes (hnsw and the two lexical, per kind) are dropped, then in one transaction its documents and the bank row are deleted (the schema's `ON DELETE CASCADE` takes the items, links, entities, events and source refs) | `{"status":"deleted","bank":"...","documents":N,"retention":"..."}`, `N` counted before the delete |
+
+**Timing.** A `recall` takes about 5 s (the query-writer model call); a `search` has no model call and
+is faster. Callers should use a 30 s timeout.
+
+**Unknown bank.** Every bank a `recall` or `search` names, and the bank of a `delete_bank`, must
+exist; otherwise the reply is `{"status":"unavailable","reason":"scope","detail":"unknown bank: <name>",
+"retention":"..."}` (HTTP 200). All banks of a request are checked before anything runs, so one
+unknown bank fails the whole request (the detail names the first, in request order). A mistyped bank
+in a profile therefore fails loudly instead of reading as "nothing found". `retain` is unchanged: it
+is the one op that creates a bank, on first use, so it has no unknown-bank case. `detail` is an extra
+field for humans: lung's decoder (`decodeOutcome`, `decodeRetain`) reads `status`, `reason`, `id` and
+`records` and `retention` by name and ignores any other field. `delete_bank` of a name that does not
+start with `lung-scratch-` is refused with `{"status":"unavailable","reason":"scope","detail":
+"delete_bank is only allowed for lung-scratch-* banks","retention":"..."}`, and the bank is untouched.
 
 A record is `{"bank","id","text","source","date"}`: `bank` is the name the request used (never a
 bank the request did not name), `id` the document id, `text` the best-matching chunk, verbatim,
 `source` the note's stored source, `date` the note's date as `YYYY-MM-DD`. Ids are distinct in a
-reply (a note of many chunks is one record). Nothing found is `{"status":"ok","records":[],...}`;
-a bank that does not exist has no notes, and is not made by a recall. Lung's decoder takes all of a
+reply (a note of many chunks is one record). Nothing found is `{"status":"ok","records":[],...}`
+(a bank that exists and has no matching note). Lung's decoder takes all of a
 reply or none of it, so a hit that has no source or no date is **left out** (never defaulted).
 Every note stored through `/retain` or `/lung-memory/1` has a source and a date, so this can only
 happen to a document written another way with a NULL or empty `source` (a direct database write);
 a date cannot be missing (the note's date, else its creation day). The service logs how many it left
 out.
 
-A failure is `{"status":"unavailable","reason":"<word>","retention":"..."}` with HTTP **200**. The
+A failure is `{"status":"unavailable","reason":"<word>","retention":"..."}` (plus `detail` for
+`scope`) with HTTP **200**. The
 reasons this service gives: `provider` (a bank of another embedding dimension, the same text already
 stored under another source, no embedder, a recall that failed or any unexpected error), `timeout`
 (the database pool timed out, or the recall deadline was hit: a partial recall is never returned),
-`malformed` (a retain with a bank name that is not valid, or with blank text). `transport`, `scope`,
-`cost` and `retention` are the caller's to say; the service never gives them. If one of several banks
+`malformed` (a retain with a bank name that is not valid, or with blank text), `scope` (an unknown bank,
+or a `delete_bank` of a non-scratch name). `transport`, `cost` and `retention` are the caller's to say;
+the service never gives them. If one of several banks
 cannot be read, the whole reply is `unavailable`: lung would otherwise believe it consulted them all.
 **400** is only for a body that parses as none of the three ops (not JSON, not an object, an unknown
-`op`, a missing or wrongly typed field, an empty `bank` or `source` on a retain); its body is still
+`op`, a missing or wrongly typed field, an empty `bank` or `source` on a retain, an empty `bank` on a delete_bank); its body is still
 `{"status":"unavailable","reason":"malformed","retention":"..."}`.
 
 `retention` is `"attested"` only when the operator sets `PROSPECTA_ZDR_ATTESTED=1` (exactly `1`: the
@@ -224,6 +241,12 @@ POST /lung-memory/1  {"op":"search","query":"when do deploys go out","banks":["l
 
 POST /lung-memory/1  {"op":"recall","task":"plan this week's release","banks":["lung-class-work","lung-domain-shop"]}
 -> {"status":"ok","records":[],"retention":"attested"}                       (PROSPECTA_ZDR_ATTESTED=1)
+
+POST /lung-memory/1  {"op":"delete_bank","bank":"lung-scratch-run1"}
+-> {"status":"deleted","bank":"lung-scratch-run1","documents":3,"retention":"unattested"}
+
+POST /lung-memory/1  {"op":"search","query":"x","banks":["lung-class-wrk"]}          (a mistyped bank)
+-> {"status":"unavailable","reason":"scope","detail":"unknown bank: lung-class-wrk","retention":"unattested"}
 
 POST /lung-memory/1  {"op":"search","query":"x","banks":["narrow"]}          (a bank of another embedding dimension)
 -> {"status":"unavailable","reason":"provider","retention":"unattested"}
