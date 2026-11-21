@@ -1,0 +1,18 @@
+# Prospecta as the lung agent's memory provider, on roger. A systemd USER unit TEMPLATE:
+# declared in fleet-ops (not installed from here). See README.md.
+[Unit]
+Description=Prospecta lung memory service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+# Written by fleet-ops from Doppler; NAMES only in this repo (see README.md). Not an in-unit `doppler run`.
+EnvironmentFile=%h/.config/prospecta-lung-memory/env
+# The pinned venv; path is a placeholder for fleet-ops to fix.
+# Refuses to start if LUNG_MEMORY_BIND is unset or empty (no default, never 0.0.0.0 implicitly).
+ExecStart=/bin/sh -c 'export PROSPECTA_SERVICE_HOST="$${LUNG_MEMORY_BIND:?LUNG_MEMORY_BIND is required: the roger tailnet address}"; exec %h/.local/share/prospecta-lung-memory/venv/bin/python -m prospecta.service'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
