@@ -1,0 +1,60 @@
+# Prospecta as a network memory provider (lung agent). Deployed on a fleet host, bound to the tailnet.
+# Start:  doppler run -- docker compose up -d      Stop and destroy:  docker compose down -v
+# See README.md. Everything here carries the label  org.prospecta.project=${LUNG_MEMORY_LABEL:-lung-memory}.
+name: ${COMPOSE_PROJECT_NAME:-lung-memory}
+
+x-labels: &labels
+  org.prospecta.project: ${LUNG_MEMORY_LABEL:-lung-memory}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16          # carries pgvector 0.8.x
+    restart: unless-stopped
+    labels: *labels
+    environment:
+      POSTGRES_DB: prospecta
+      POSTGRES_USER: prospecta
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (from Doppler)}
+    # No ports: Postgres is reachable only from the service, on the project network.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prospecta -d prospecta"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  service:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      labels: *labels
+    restart: unless-stopped
+    labels: *labels
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://prospecta:${POSTGRES_PASSWORD}@postgres:5432/prospecta
+      PROSPECTA_SERVICE_HOST: ${PROSPECTA_SERVICE_HOST:-0.0.0.0}   # inside the container; exposure is set by the published port
+      PROSPECTA_SERVICE_PORT: ${PROSPECTA_SERVICE_PORT:-8080}
+      PROSPECTA_SERVICE_TOKEN: ${PROSPECTA_SERVICE_TOKEN:?PROSPECTA_SERVICE_TOKEN is required (from Doppler)}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      PROSPECTA_EMBED_MODEL: ${PROSPECTA_EMBED_MODEL:-openai/text-embedding-3-large}
+      PROSPECTA_EMBEDDING_DIM: ${PROSPECTA_EMBEDDING_DIM:-1536}
+      PROSPECTA_RERANKER_MODEL: ${PROSPECTA_RERANKER_MODEL:-qwen/qwen3-reranker-8b}
+      PROSPECTA_DECISION_MODEL: ${PROSPECTA_DECISION_MODEL:-typesafe/jev-1.14}
+      PROSPECTA_QUERY_WRITER_MODEL: ${PROSPECTA_QUERY_WRITER_MODEL:-}
+    ports:
+      # Published only on the tailnet address. No default: unset must fail, never fall back to 0.0.0.0.
+      - "${LUNG_MEMORY_BIND:?LUNG_MEMORY_BIND is required: set it to this host's tailnet IP (tailscale ip -4), never 0.0.0.0}:${PROSPECTA_SERVICE_PORT:-8080}:${PROSPECTA_SERVICE_PORT:-8080}"
+    networks: [internal]
+
+volumes:
+  pgdata:
+    labels: *labels
+
+networks:
+  internal:
+    labels: *labels
