@@ -15,6 +15,11 @@ default bank, so nothing changes for a host that never sends it), `POST /retain`
 form now returns standalone notes (`kind: "chunk"`, with `source`, `document_id` and `content`) instead of dropping them.
 See `docs/source-contract.md`.
 
+`POST /lung-memory/1` makes the service a memory provider for lung: it speaks lung's `lung-memory/1` wire (recall by task,
+search, retain by source; replies exactly as lung's decoder reads them, `unavailable` with a reason for a failure, 400 only for
+a request that is none of the three ops). `retention` is `attested` only with `PROSPECTA_ZDR_ATTESTED=1`. See
+`docs/source-contract.md` and `deploy/lung-memory/README.md`.
+
 One bank's size no longer slows another's Stage 1: `create_bank` now also builds the bank's two partial GIN indexes
 (`memory_items_body_tsv_<bank>_chunk_gin`, `memory_items_exact_tsv_<bank>_chunk_gin`, `CREATE INDEX CONCURRENTLY`), and
 `prospecta migrate` builds any that are missing for banks that already exist (additive: no rewrite, no lock on writes;

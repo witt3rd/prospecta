@@ -36,6 +36,15 @@ Endpoints (JSON):
     POST /remove    {"kind", "record_id"}
     POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}], "concurrency"?}
     GET  /coverage?kind=&project=&bank=
+    POST /lung-memory/1                   the adapter for lung's `lung-memory/1` wire (the Lean spec
+                                          lung/spec/LungSpec/MemoryWire.lean, PART B): the request is
+                                          {"op": "recall", "task", "banks": [...]},
+                                          {"op": "search", "query", "banks": [...]} or
+                                          {"op": "retain", "bank", "text", "source"}; the replies
+                                          are exactly what lung's decoder reads, HTTP 200 for every
+                                          well-formed request (a failure is status "unavailable"
+                                          with a reason), 400 for one that parses as none of the
+                                          three. See docs/source-contract.md.
 
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
 PROSPECTA_SOURCE_SCHEMA / PROSPECTA_SOURCE_VIEWS (the source contract),
@@ -43,6 +52,9 @@ PROSPECTA_INDEX_CONCURRENCY (worker threads for reconcile/reindex, default 8, ma
 PROSPECTA_DB_POOL_MAX (the one shared connection pool, default 10),
 PROSPECTA_DB_POOL_IDLE_SECONDS (close an idle connection after this, default 60),
 PROSPECTA_REQUEST_TIMEOUT (seconds a request waits for a connection, default 30),
+PROSPECTA_ZDR_ATTESTED (exactly "1": the operator asserts the deployment's OpenRouter key is
+zero-data-retention; /lung-memory/1 then says "attested", else "unattested"; Prospecta does not
+enforce it),
 PROSPECTA_BANK (default "prospecta"), PROSPECTA_SERVICE_HOST (127.0.0.1),
 PROSPECTA_SERVICE_PORT (8080), PROSPECTA_SERVICE_TOKEN (bearer token; required
 to bind a non-loopback address), plus the usual embedder/LLM settings.
@@ -71,6 +83,8 @@ logger = logging.getLogger("prospecta.service")
 MAX_BODY = 1 << 20          # every route but /retain: a note is never refused for its size
 RETAIN_METADATA_KEYS = ("created_on", "project", "person", "kind")
 MAX_LIMIT = 100
+LUNG_PATH = "/lung-memory/1"
+LUNG_SEARCH_LIMIT = 10      # the same default as /lookup's `limit`
 
 
 class ApiError(Exception):
@@ -102,12 +116,26 @@ def _explain_query(trace: dict, ranked: list[dict]) -> dict:
             "channels_failed": failed}
 
 
+class _LungUnavailable(Exception):
+    """A lung-memory/1 call that cannot be answered; `reason` is one word of the wire's table."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def zdr_attested_from_env() -> bool:
+    """Whether the operator declares the deployment zero-data-retention: PROSPECTA_ZDR_ATTESTED=1, only."""
+    return os.environ.get("PROSPECTA_ZDR_ATTESTED") == "1"
+
+
 class Service:
     """The service logic, separate from HTTP so it can be tested directly."""
 
-    def __init__(self, memory, indexer: SourceIndexer | None):
+    def __init__(self, memory, indexer: SourceIndexer | None, *, zdr_attested: bool = False):
         self.memory = memory        # the default bank's Memory; its pool serves every bank
         self.indexer = indexer
+        self.zdr_attested = zdr_attested    # the operator's claim, said back on /lung-memory/1
         self._dim: int | None = None
 
     def _embedding_dim(self) -> int:
@@ -378,6 +406,121 @@ class Service:
                 "status": "replaced" if prior or dropped else "created"}
 
 
+    # ------------------------------------------------------------------
+    # POST /lung-memory/1: lung's wire over the calls above (docs/source-contract.md)
+    # ------------------------------------------------------------------
+
+    def lung_unavailable(self, reason: str) -> dict:
+        return {"status": "unavailable", "reason": reason, "retention": self._lung_retention()}
+
+    def _lung_retention(self) -> str:
+        return "attested" if self.zdr_attested else "unattested"
+
+    @staticmethod
+    def lung_parse(body: dict) -> tuple:
+        """The request as the Lean `Request.ofJson` reads it, or ApiError(400): an op of recall
+        (task, banks), search (query, banks) or retain (bank, text, source; bank and source non-empty).
+        Other fields are ignored."""
+        def strs(v):
+            return isinstance(v, list) and all(isinstance(x, str) for x in v)
+        op = body.get("op")
+        if op in ("recall", "search"):
+            key = "task" if op == "recall" else "query"
+            if isinstance(body.get(key), str) and strs(body.get("banks")):
+                return op, body[key], body["banks"]
+        elif op == "retain":
+            bank, text, source = body.get("bank"), body.get("text"), body.get("source")
+            if all(isinstance(x, str) for x in (bank, text, source)) and bank and source:
+                return op, bank, text, source
+        raise ApiError(400, "not a lung-memory/1 request")
+
+    def lung_memory(self, body: dict) -> dict:
+        """One lung-memory/1 call: the reply as lung's decoder reads it. Raises ApiError(400) only for
+        a request that is none of the three ops; every other outcome, a failure included, is a reply."""
+        req = self.lung_parse(body)
+        try:
+            if req[0] == "retain":
+                return self._lung_retain(*req[1:])
+            if req[0] == "recall":
+                records = self._lung_records(req[2], lambda mem: self._lung_task_hits(mem, req[1]))
+            else:
+                records = self._lung_records(req[2], lambda mem: self._lung_search_hits(mem, req[1]))
+        except _LungUnavailable as e:
+            return self.lung_unavailable(e.reason)
+        except PoolTimeout:
+            return self.lung_unavailable("timeout")
+        except Exception:
+            logger.exception("lung-memory/1 call failed")
+            return self.lung_unavailable("provider")
+        return {"status": "ok", "records": records, "retention": self._lung_retention()}
+
+    @staticmethod
+    def _lung_task_hits(mem, task: str) -> list:
+        """Mode 1 for a task: the writer's searches over the bank, merged (a blank task finds nothing)."""
+        got = mem.expand_and_recall(task, kind="task")
+        if got.error:
+            logger.warning("lung-memory/1 recall failed: %s", got.error)
+            raise _LungUnavailable("provider")
+        if got.deadline_hit:
+            raise _LungUnavailable("timeout")
+        return got.items
+
+    @staticmethod
+    def _lung_search_hits(mem, query: str) -> list:
+        """The questions recall of /lookup for one query: best chunk per note, best first."""
+        if not query.strip():
+            return []
+        hits = mem.recall([query], limit=LUNG_SEARCH_LIMIT * 3)
+        best: dict[str, object] = {}
+        for h in hits:
+            if h.document_id not in best or h.score > best[h.document_id].score:
+                best[h.document_id] = h
+        return sorted(best.values(), key=lambda h: -h.score)[:LUNG_SEARCH_LIMIT]
+
+    def _lung_records(self, banks: list[str], fetch) -> list[dict]:
+        """`fetch(memory)` over each named bank (once each), as records. A bank that does not exist
+        has no notes. A record needs an id, a source and a date: a hit without one is dropped, never
+        defaulted. Ids are distinct. Every record's bank is the name the request used."""
+        records: list[dict] = []
+        seen: set[str] = set()
+        dropped = 0
+        for name in dict.fromkeys(banks):
+            try:
+                mem = self._bank({"bank": name})
+            except ApiError as e:
+                if e.status in (400, 404):      # not a bank name, or not made yet: nothing in it
+                    continue
+                raise _LungUnavailable("provider") from None
+            for h in fetch(mem):
+                doc_id, source, day = str(h.document_id or ""), h.source, h.created_on
+                if not (doc_id and source and day):
+                    dropped += 1
+                    continue
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                records.append({"bank": name, "id": doc_id, "text": h.original_chunk,
+                                "source": source, "date": str(day)})
+        if dropped:
+            logger.warning("lung-memory/1: %d hit(s) without an id, source or date left out", dropped)
+        return records
+
+    def _lung_retain(self, bank: str, text: str, source: str) -> dict:
+        """/retain with `create`: the note keyed by `source` in `bank`, the bank made on first use."""
+        try:
+            validate_bank_id(bank)
+        except ValueError:
+            return self.lung_unavailable("malformed")
+        if not text.strip():
+            return self.lung_unavailable("malformed")
+        try:
+            out = self.retain({"content": text, "source": source, "bank": bank, "create": True})
+        except ApiError as e:
+            logger.warning("lung-memory/1 retain refused: %s %s", e.status, e.message)
+            return self.lung_unavailable("malformed" if e.status == 400 else "provider")
+        return {"status": "retained", "id": out["document_id"], "retention": self._lung_retention()}
+
+
 def _embedding_dim(memory) -> int:
     """The dimension a bank made by this service has: PROSPECTA_EMBEDDING_DIM, else what the embedder makes."""
     dim = os.environ.get("PROSPECTA_EMBEDDING_DIM")
@@ -423,8 +566,8 @@ def make_handler(service: Service, token: str | None):
             return hmac.compare_digest(got.encode(), f"Bearer {token}".encode())
 
         def _handle(self, method: str):
+            parts = urlsplit(self.path)
             try:
-                parts = urlsplit(self.path)
                 if parts.path == "/healthz" and method == "GET":
                     return self._send(200, {"status": "ok"})
                 if not self._authorized():
@@ -432,7 +575,7 @@ def make_handler(service: Service, token: str | None):
                 body: dict = {}
                 if method == "POST":
                     n = int(self.headers.get("Content-Length") or 0)
-                    if n > MAX_BODY and parts.path != "/retain":
+                    if n > MAX_BODY and parts.path not in ("/retain", LUNG_PATH):
                         raise ApiError(413, "body too large")
                     try:
                         body = json.loads(self.rfile.read(n) or b"{}")
@@ -445,6 +588,8 @@ def make_handler(service: Service, token: str | None):
                     return self._send(200, service.lookup(body))
                 if route == ("POST", "/retain"):
                     return self._send(200, service.retain(body))
+                if route == ("POST", LUNG_PATH):
+                    return self._send(200, service.lung_memory(body))
                 if route == ("POST", "/index"):
                     return self._send(200, service.index(body))
                 if route == ("POST", "/remove"):
@@ -458,6 +603,8 @@ def make_handler(service: Service, token: str | None):
                         (q.get("bank") or [None])[0]))
                 raise ApiError(404, "not found")
             except ApiError as e:
+                if parts.path == LUNG_PATH and e.status == 400:     # lung reads one shape, always
+                    return self._send(400, service.lung_unavailable("malformed"))
                 self._send(e.status, {"error": e.message})
             except PoolTimeout as e:
                 logger.warning("request waited too long for a database connection: %s", e)
@@ -507,7 +654,7 @@ def build_service() -> tuple[Service, str | None]:
             indexer.check_contract()
         except SourceContractError as e:
             raise SystemExit(f"source contract check failed: {e}") from e
-    return Service(memory, indexer), os.environ.get("PROSPECTA_SERVICE_TOKEN") or None
+    return Service(memory, indexer, zdr_attested=zdr_attested_from_env()), os.environ.get("PROSPECTA_SERVICE_TOKEN") or None
 
 
 def main() -> int:
