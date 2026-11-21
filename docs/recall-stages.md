@@ -126,8 +126,11 @@ All configurable; the first that applies:
   (`POST https://openrouter.ai/api/v1/systemone`).
 - **Query-writer model** of `expand_and_recall` (and so of `recall_for_task`): the per-call
   `query_writer_model=`, then `recall_config.models.query_writer_model`, then
-  `PROSPECTA_QUERY_WRITER_MODEL`, then `openrouter/google/gemini-2.5-flash-lite`; it is passed to
-  the `llm` callable as a `model=` hint when the callable accepts one.
+  `PROSPECTA_QUERY_WRITER_MODEL`, then `openrouter/deepseek/deepseek-v4.1-flash-1017`; it is passed to
+  the `llm` callable as a `model=` hint when the callable accepts one. There is no automatic writer
+  fallback model: a failed writer degrades (see `fallbacks`). To use another model, for example
+  `openrouter/deepseek/deepseek-v4-flash-0731`, or any model on a non-zero-data-retention key, set
+  `PROSPECTA_QUERY_WRITER_MODEL`; Prospecta does not enforce zero data retention, the deployment's key does.
 
 ## Mode 1 settings (`expansion`, `stage0_gate`)
 

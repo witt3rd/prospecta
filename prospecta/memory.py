@@ -521,7 +521,7 @@ class Memory:
            message through. `gate=False` turns it off. A task is never gated.
         2. Writer: the query-writer model (`query_writer_model`, else recall_config.models
            .query_writer_model, else PROSPECTA_QUERY_WRITER_MODEL, else
-           openrouter/google/gemini-2.5-flash-lite; it is the Memory's `llm`) expands the prompt into
+           openrouter/deepseek/deepseek-v4.1-flash-1017; it is the Memory's `llm`) expands the prompt into
            N searches {query, terms (verbatim proper names, identifiers, versions, paths, error
            codes and "quoted phrases", never common words), date_from, date_to}: about 3 for a
            short chat message, up to 10 to 20 for an elaborate one, never more than `max_searches`
