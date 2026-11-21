@@ -163,7 +163,10 @@ The global options are `--database-url` (else `DATABASE_URL`) and `--bank` (else
 
 - `POST /lookup {"questions": [...], "limit": 10, ...}` — Mode 2A for each question: ranked records, each with its citation fields (`created_on`, `match_kind`, `exact_snippet`, `relevance_score`).
 - `POST /lookup {"task": {"title", "ask", "done"?, "project"?}}` — Mode 1: the cited context block plus `searches`, `results`, `fallbacks` and `error`. No `limit`: the block is sized by relevance.
+- `POST /retain {"content", "source", "bank"?, "metadata"?, "tags"?, "create"?}` — save a standalone note, keyed by `source` (`created`, `replaced` or `unchanged`); `/lookup` returns it as `kind: "chunk"`.
 - `POST /index`, `/remove`, `/reconcile`, `GET /coverage`, `GET /healthz` — in-place indexing of a host's records.
+
+Every call may name its `bank` (`?bank=` on a GET); absent means `PROSPECTA_BANK`.
 
 Filters on a lookup: `date_from`, `date_to`, `excluded_sources` (the anti-echo list), `kind`, `project`, `person`, `allowed_audience_keys`, `allowed_projects`; per-call `reranker_model` and `decision_model`. The contract, shared-database mode and every environment variable are in `docs/source-contract.md`.
 

@@ -9,6 +9,12 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 The default query-writer model is now `openrouter/deepseek/deepseek-v4.1-flash-1017` (was `openrouter/google/gemini-2.5-flash-lite`,
 which has no endpoint under a zero-data-retention OpenRouter workspace). Override with `PROSPECTA_QUERY_WRITER_MODEL`.
 
+The HTTP service can be a memory provider for a client that is not Python: every call takes an optional `bank` (absent: the
+default bank, so nothing changes for a host that never sends it), `POST /retain` saves a standalone note keyed by `source`
+(`created`, `replaced` or `unchanged`; the same text under another source is 409; no body limit), and `/lookup`'s questions
+form now returns standalone notes (`kind: "chunk"`, with `source`, `document_id` and `content`) instead of dropping them.
+See `docs/source-contract.md`.
+
 One bank's size no longer slows another's Stage 1: `create_bank` now also builds the bank's two partial GIN indexes
 (`memory_items_body_tsv_<bank>_chunk_gin`, `memory_items_exact_tsv_<bank>_chunk_gin`, `CREATE INDEX CONCURRENTLY`), and
 `prospecta migrate` builds any that are missing for banks that already exist (additive: no rewrite, no lock on writes;

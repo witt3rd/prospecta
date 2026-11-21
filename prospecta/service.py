@@ -4,14 +4,29 @@
 
 Endpoints (JSON):
     GET  /healthz
-    POST /lookup    {"questions": [...], "limit": 10, "kind"?, "project"?, "person"?,
+    Every JSON body may carry "bank" (and a GET its ?bank=): the bank the call is about. Absent
+    means the process's default bank (PROSPECTA_BANK), so a host that never sends it sees no
+    change. An unknown bank is 404 (a /retain with "create": true creates it); a bank whose
+    embedding dimension differs from the service's embedder is 409. One connection pool serves
+    every bank.
+    POST /retain    {"content", "source", "bank"?, "metadata"?: {"created_on", "project", "person",
+                     "kind"}, "tags"?: [...], "create"?: true}
+                                          -> {"document_id", "status": "created" | "replaced" |
+                                             "unchanged"}. `source` is the idempotency key: the
+                                             same source with new content replaces the old note
+                                             ("replaced"), the same content again changes nothing
+                                             ("unchanged"), the same content under another source
+                                             is 409. Nothing is truncated; /retain has no body cap.
+    POST /lookup    {"questions": [...], "limit": 10, "bank"?, "kind"?, "project"?, "person"?,
                      "audience_key"?,
                      "allowed_audience_keys"?, "allowed_projects"?, "explain"?: true,
                      "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?,
                      "decision_model"?}
                                           -> ranked results per question, each with its citation
                                              fields (created_on, match_kind, exact_snippet,
-                                             relevance_score); with explain, also
+                                             relevance_score); a standalone note (from /retain)
+                                             comes back as kind "chunk" with source, document_id
+                                             and content; with explain, also
                                              channels_run / channels_failed per question and
                                              channels (rank, score, weight) per hit
                     {"task": {"title", "ask", "done"?, "project"?}, "limit": 10, ...}
@@ -20,7 +35,7 @@ Endpoints (JSON):
     POST /index     {"kind", "record_id"}  or  {"kind", "reindex": true, "concurrency"?}
     POST /remove    {"kind", "record_id"}
     POST /reconcile {"references": [{"kind","record_id"} | {"kind","project","title"}], "concurrency"?}
-    GET  /coverage?kind=&project=
+    GET  /coverage?kind=&project=&bank=
 
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
 PROSPECTA_SOURCE_SCHEMA / PROSPECTA_SOURCE_VIEWS (the source contract),
@@ -34,7 +49,9 @@ to bind a non-loopback address), plus the usual embedder/LLM settings.
 """
 from __future__ import annotations
 
+import copy
 import datetime
+import hashlib
 import hmac
 import json
 import logging
@@ -43,11 +60,16 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from prospecta._index import _delete_prior_docs_at_source_diff_hash
+from prospecta._types import DocumentSourceConflictError
+from prospecta.memory import BankConfigConflict
 from prospecta.db.pool import PoolTimeout
+from prospecta.db.queries import SELECT_BANK, validate_bank_id
 from prospecta.source import MAX_INDEX_CONCURRENCY, SourceConfig, SourceContractError, SourceIndexer
 
 logger = logging.getLogger("prospecta.service")
-MAX_BODY = 1 << 20
+MAX_BODY = 1 << 20          # every route but /retain: a note is never refused for its size
+RETAIN_METADATA_KEYS = ("created_on", "project", "person", "kind")
 MAX_LIMIT = 100
 
 
@@ -84,8 +106,56 @@ class Service:
     """The service logic, separate from HTTP so it can be tested directly."""
 
     def __init__(self, memory, indexer: SourceIndexer | None):
-        self.memory = memory
+        self.memory = memory        # the default bank's Memory; its pool serves every bank
         self.indexer = indexer
+        self._dim: int | None = None
+
+    def _embedding_dim(self) -> int:
+        if self._dim is None:
+            self._dim = _embedding_dim(self.memory)
+        return self._dim
+
+    def _bank(self, body: dict, *, create: bool = False, embeds: bool = True):
+        """The Memory for this call's bank: the default's when `bank` is absent (or names it),
+        else a view of it on that bank, sharing the one connection pool and the embedder.
+        An unknown bank is 404 unless `create`; one built for another embedding dimension is 409."""
+        name = body.get("bank")
+        if name is None or name == self.memory.default_bank_id:
+            return self.memory
+        if not isinstance(name, str) or not name:
+            raise ApiError(400, "bank must be a non-empty string")
+        try:
+            validate_bank_id(name)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        mem = copy.copy(self.memory)
+        mem._default_bank_id = name
+        mem._shadow_bank_id = None      # shadow reads belong to the default bank's migration
+        mem._shadow_embed = None
+        with mem._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(SELECT_BANK, {"bank_id": name})
+                row = cur.fetchone()
+            conn.rollback()
+        if row is None:
+            if not create:
+                raise ApiError(404, f"no such bank: {name}")
+            if mem._embed is None:
+                raise ApiError(503, "no embedder available to create a bank")
+            try:
+                mem.create_bank(name, embedding_dim=self._embedding_dim())
+            except BankConfigConflict as e:
+                raise ApiError(409, str(e)) from None
+        elif embeds and mem._embed is not None and row[1] != self._embedding_dim():
+            raise ApiError(409, f"bank {name} has embedding_dim {row[1]}; the service's embedder "
+                                f"makes {self._embedding_dim()}")
+        return mem
+
+    def _indexer_for(self, mem) -> SourceIndexer:
+        ix = self._need_indexer()
+        if mem is self.memory:
+            return ix
+        return SourceIndexer(mem, ix.config, ix.concurrency)
 
     def _need_indexer(self) -> SourceIndexer:
         if self.indexer is None:
@@ -117,7 +187,7 @@ class Service:
                 opts[key] = v
         return opts
 
-    def _lookup_task(self, body: dict) -> dict:
+    def _lookup_task(self, body: dict, memory) -> dict:
         task = body["task"]
         if not isinstance(task, dict) or not all(
                 isinstance(task.get(k), str) and task[k].strip() for k in ("title", "ask")):
@@ -132,7 +202,7 @@ class Service:
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0:
             raise ApiError(400, "max_tokens must be an integer >= 0 (0: no valve)")
         try:
-            got = self.memory.recall_for_task(
+            got = memory.recall_for_task(
                 title=task["title"], ask=task["ask"], done=task.get("done"),
                 project=task.get("project"), max_tokens=max_tokens, **self._recall_options(body))
         except ValueError as e:
@@ -145,8 +215,9 @@ class Service:
                          "fallbacks": got.fallbacks, "error": got.error}}
 
     def lookup(self, body: dict) -> dict:
+        memory = self._bank(body)
         if body.get("task") is not None:
-            return self._lookup_task(body)
+            return self._lookup_task(body, memory)
         qs = body.get("questions")
         if not isinstance(qs, list) or not qs or not all(isinstance(q, str) and q.strip() for q in qs):
             raise ApiError(400, "questions must be a non-empty list of strings")
@@ -177,7 +248,7 @@ class Service:
         for q in qs:
             traces: list[dict] = []
             try:
-                hits = self.memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
+                hits = memory.recall([q], limit=limit * 3, metadata_filter=flt or None,
                                           **options, **({"_trace": traces} if explain else {}))
             except ValueError as e:     # e.g. a depth that is neither standard nor deep
                 raise ApiError(400, str(e)) from None
@@ -185,7 +256,19 @@ class Service:
             for h in hits:
                 md = h.metadata or {}
                 if "record_id" not in md or "kind" not in md:
-                    continue          # not a source record (e.g. standalone notes)
+                    # a standalone note (from /retain): no host holds its text, so it comes back
+                    # whole, as its best chunk, under its source and document id
+                    key = ("chunk", h.document_id)
+                    if key not in best or h.score > best[key]["score"]:
+                        best[key] = {"kind": "chunk", "record_id": None, "revision": None,
+                                     "source": h.source, "document_id": h.document_id,
+                                     "content": h.original_chunk, "score": float(h.score),
+                                     "created_on": h.created_on, "match_kind": h.match_kind,
+                                     "exact_snippet": h.exact_snippet,
+                                     "relevance_score": h.relevance_score}
+                        if explain:
+                            best[key]["_doc"] = h.document_id
+                    continue
                 key = (md["kind"], md["record_id"], md.get("revision"))
                 if key not in best or h.score > best[key]["score"]:
                     best[key] = {"kind": md["kind"], "record_id": md["record_id"],
@@ -216,24 +299,89 @@ class Service:
         return c
 
     def index(self, body: dict) -> dict:
-        ix = self._need_indexer()
+        ix = self._indexer_for(self._bank(body))
         kind = _str(body, "kind")
         if body.get("reindex"):
             return ix.reindex_kind(kind, self._concurrency(body))
         return ix.index_record(kind, _str(body, "record_id")).as_dict()
 
     def remove(self, body: dict) -> dict:
-        return self._need_indexer().remove_record(_str(body, "kind"), _str(body, "record_id")).as_dict()
+        ix = self._indexer_for(self._bank(body, embeds=False))
+        return ix.remove_record(_str(body, "kind"), _str(body, "record_id")).as_dict()
 
     def reconcile(self, body: dict) -> dict:
-        ix = self._need_indexer()
+        ix = self._indexer_for(self._bank(body))
         refs = body.get("references")
         if not isinstance(refs, list) or not refs or not all(isinstance(r, dict) for r in refs):
             raise ApiError(400, "references must be a non-empty list of objects")
         return ix.reconcile(refs, self._concurrency(body))
 
-    def coverage(self, kind: str | None, project: str | None) -> dict:
-        return {"coverage": [c.as_dict() for c in self._need_indexer().coverage(kind, project)]}
+    def coverage(self, kind: str | None, project: str | None, bank: str | None = None) -> dict:
+        ix = self._indexer_for(self._bank({"bank": bank}, embeds=False))
+        return {"coverage": [c.as_dict() for c in ix.coverage(kind, project)]}
+
+    def retain(self, body: dict) -> dict:
+        """Save a standalone note, keyed by `source` (see the module docstring)."""
+        content, source = body.get("content"), body.get("source")
+        if not isinstance(content, str) or not content.strip():
+            raise ApiError(400, "content is required (non-empty string)")
+        if not isinstance(source, str) or not source:
+            raise ApiError(400, "source is required (non-empty string): it is the note's key")
+        meta = body.get("metadata")
+        if meta is None:
+            meta = {}
+        if not isinstance(meta, dict) or set(meta) - set(RETAIN_METADATA_KEYS):
+            raise ApiError(400, f"metadata must be an object with only {', '.join(RETAIN_METADATA_KEYS)}")
+        for k, v in meta.items():
+            if not isinstance(v, str) or not v:
+                raise ApiError(400, f"metadata.{k} must be a non-empty string")
+        if "created_on" in meta:
+            try:
+                datetime.date.fromisoformat(meta["created_on"])
+            except ValueError:
+                raise ApiError(400, "metadata.created_on must be a YYYY-MM-DD date") from None
+        tags = body.get("tags", [])
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise ApiError(400, "tags must be a list of strings")
+        create = body.get("create", False)
+        if not isinstance(create, bool):
+            raise ApiError(400, "create must be true or false")
+        mem = self._bank(body, create=create)
+        if mem._embed is None:
+            raise ApiError(503, "no embedder available; configure PROSPECTA_EMBEDDER")
+        bank = mem.default_bank_id
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with mem._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, content_hash, tags, document_metadata FROM documents "
+                            "WHERE bank_id = %s AND source = %s", (bank, source))
+                prior = cur.fetchall()
+            conn.rollback()
+        same = [r for r in prior if r[1] == digest]
+        if same:
+            _, _, have_tags, have_meta = same[0]
+            if list(have_tags or []) == tags and all(
+                    (have_meta or {}).get(k) == v for k, v in meta.items()):
+                return {"document_id": str(same[0][0]), "status": "unchanged"}
+        try:
+            doc_id = mem.retain(content, source=source, tags=tags, metadata=meta)
+        except DocumentSourceConflictError as e:
+            raise ApiError(409, f"the same content is already stored under source "
+                                f"{e.existing_source!r}") from None
+        dropped = 0
+        if any(r[1] != digest for r in prior):
+            with mem._pool.connection() as conn:     # the old text under this key goes away
+                dropped = _delete_prior_docs_at_source_diff_hash(
+                    conn, bank_id=bank, source=source, keep_doc_id=doc_id)
+                conn.commit()
+        return {"document_id": doc_id,
+                "status": "replaced" if prior or dropped else "created"}
+
+
+def _embedding_dim(memory) -> int:
+    """The dimension a bank made by this service has: PROSPECTA_EMBEDDING_DIM, else what the embedder makes."""
+    dim = os.environ.get("PROSPECTA_EMBEDDING_DIM")
+    return int(dim) if dim else len(memory._embed(["probe"])[0])
 
 
 def _cited_hit(h) -> dict:
@@ -284,7 +432,7 @@ def make_handler(service: Service, token: str | None):
                 body: dict = {}
                 if method == "POST":
                     n = int(self.headers.get("Content-Length") or 0)
-                    if n > MAX_BODY:
+                    if n > MAX_BODY and parts.path != "/retain":
                         raise ApiError(413, "body too large")
                     try:
                         body = json.loads(self.rfile.read(n) or b"{}")
@@ -295,6 +443,8 @@ def make_handler(service: Service, token: str | None):
                 route = (method, parts.path)
                 if route == ("POST", "/lookup"):
                     return self._send(200, service.lookup(body))
+                if route == ("POST", "/retain"):
+                    return self._send(200, service.retain(body))
                 if route == ("POST", "/index"):
                     return self._send(200, service.index(body))
                 if route == ("POST", "/remove"):
@@ -304,7 +454,8 @@ def make_handler(service: Service, token: str | None):
                 if route == ("GET", "/coverage"):
                     q = parse_qs(parts.query)
                     return self._send(200, service.coverage(
-                        (q.get("kind") or [None])[0], (q.get("project") or [None])[0]))
+                        (q.get("kind") or [None])[0], (q.get("project") or [None])[0],
+                        (q.get("bank") or [None])[0]))
                 raise ApiError(404, "not found")
             except ApiError as e:
                 self._send(e.status, {"error": e.message})
@@ -347,8 +498,7 @@ def build_service() -> tuple[Service, str | None]:
     memory = _common.make_memory(SimpleNamespace(database_url=url, bank=bank))
     if memory._embed is None:
         raise SystemExit("no embedder available; configure PROSPECTA_EMBEDDER")
-    dim = os.environ.get("PROSPECTA_EMBEDDING_DIM")
-    memory.create_bank(bank, embedding_dim=int(dim) if dim else len(memory._embed(["probe"])[0]))
+    memory.create_bank(bank, embedding_dim=_embedding_dim(memory))
     cfg = SourceConfig.from_env()
     indexer = None
     if cfg is not None:
