@@ -246,7 +246,8 @@ def test_lookup_hits_carry_the_citation_fields(mem):
                      "WHERE document_id = (SELECT id FROM documents WHERE source = 'phrase.md')")
         conn.commit()
     out = Service(mem, None).lookup({"questions": ['"electric dreams"'], "limit": 3})
-    [hit_] = out["results"][0]["results"]
+    # the other (standalone) notes of the bank come back too, as kind "chunk"
+    [hit_] = [r for r in out["results"][0]["results"] if r["record_id"] is not None]
     assert (hit_["kind"], hit_["record_id"], hit_["created_on"]) == ("note", "7", "2024-04-01")
     assert hit_["match_kind"] == "exact+semantic" and "<<electric>>" in hit_["exact_snippet"]
     assert 0 < hit_["relevance_score"] <= 1

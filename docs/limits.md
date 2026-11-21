@@ -79,6 +79,7 @@ section 1, point 9.
 |---|---|---|---|---|
 | `limit` on `search` / `recall` / `ask` | `Memory.search(limit=10)`, `ask(limit=8)` | 10 / 8 | the caller's request for how many results | caller |
 | `/lookup` | `service.py` `MAX_LIMIT`, questions per call | 100, 50 | request bounds of the service; a task takes no `limit` | ours-config |
+| Request body | `service.py` `MAX_BODY` | 1 MiB, every route but `/retain` | the host-record calls carry references, not text; `/retain` carries a note and has no limit (413 never answers a note) | ours-config |
 | `content_preview` | `memory.py` `PREVIEW_LEN` | 200 chars | inspection-only audit column in `recall_events`; full content stays in `memory_items` | display only |
 
 No `max_tokens` is passed to any model call. Not audited here: CLI / TUI display widths.

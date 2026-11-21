@@ -103,6 +103,7 @@ All idempotent; they take the record's reference, never its text.
 | `GET /healthz` | | `{"status":"ok"}` (no auth) |
 | `POST /lookup` | `{"questions":[...], "limit":10, "kind"?, "project"?, "person"?, "audience_key"?, "allowed_audience_keys"?, "allowed_projects"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` | `{"results":[{"question", "results":[{"kind","record_id","revision","score","created_on","match_kind","exact_snippet","relevance_score"}]}]}` |
 | `POST /lookup` (a task brief) | `{"task":{"title","ask","done"?,"project"?}, "max_tokens"?, "date_from"?, "date_to"?, "excluded_sources"?, "reranker_model"?, "decision_model"?}` (no `limit`) | `{"task":{"queries":[...], "context":"## Recalled Project Context ...", "searches":[{"query","terms","date_from","date_to"}], "results":[{"source","created_on","kind","record_id","revision","project","match_kind","exact_snippet","relevance_score","found_by"}], "fallbacks":[...], "error":null}}` |
+| `POST /retain` | `{"content","source","bank"?,"metadata"?:{"created_on","project","person","kind"},"tags"?,"create"?}` | `{"document_id","status":"created"|"replaced"|"unchanged"}` |
 | `POST /index` | `{"kind","record_id"}` or `{"kind","reindex":true,"concurrency"?}` | status per above |
 | `POST /remove` | `{"kind","record_id"}` | status |
 | `POST /reconcile` | `{"references":[{"kind","record_id"} or {"kind","project","title"}], "concurrency"?}` (any number, at least 1) | `{"indexed","unchanged","removed","absent","unreadable":[{"reference","error"}]}` |
@@ -139,6 +140,37 @@ words, starting `failed:` for an error or `skipped:` for a channel disabled in t
 config or that the library no longer has), and each hit gains `channels`:
 `[{"channel","rank","score","weight"}]` for every channel that returned it (rank within the
 channel, the channel's raw score, the fusion weight applied). `hybrid_chunk` is the only channel.
+
+### Banks and standalone notes
+
+**A bank per call.** Every JSON body may carry `"bank"` (a `GET` takes `?bank=`). Absent, the call
+is about the process's default bank (`PROSPECTA_BANK`), so a host that never sends it sees no
+change. One process, one connection pool, any number of banks: a named bank is looked up on every
+call. An unknown bank is `404`; `/retain` with `"create": true` makes it first (`Memory.create_bank`,
+the embedder's dimension, or `PROSPECTA_EMBEDDING_DIM`, and the new-bank defaults). A bank whose
+`embedding_dim` differs from the service's embedder is `409`; an invalid name is `400`. The service
+has one bearer token for every bank; it does not authorize per bank.
+
+**`POST /retain`** writes a note that no host view holds (the chunk-only write path of
+`docs/schema.md`; no model is called). `source` is the key and is required:
+
+| call | answer |
+|---|---|
+| a source never seen | `created` |
+| the same `source`, new `content` | `replaced`: the old text under that key is deleted, the new one stored |
+| the same `source`, the same `content` (and the same `tags` and `metadata`) | `unchanged`: nothing is written; with other `tags` or `metadata` the note is rewritten and the answer is `replaced` |
+| the same `content` under another `source` | `409`, nothing changes |
+
+A retry of a call whose answer was lost is therefore safe. `metadata` takes only `created_on`
+(`YYYY-MM-DD`, the note's date, else today), `project`, `person` and `kind` (all filterable in
+`/lookup`); `tags` is a list of strings. A note is never refused for its size: `/retain` has no
+body limit (the other routes keep 1 MiB), and it is stored whole, as chunks.
+
+**`/lookup` returns standalone notes.** In the questions form a note with no `record_id` (one from
+`/retain`) comes back as `{"kind":"chunk","record_id":null,"revision":null,"source","document_id",
+"content", ...}` with the same citation fields as a record. Nobody holds its text elsewhere, so
+`content` is its best-matching chunk. The task form already returned them (`kind` is the note's
+own kind, `record_id` null), and accepts `excluded_sources` as the questions form does.
 
 ### Reconcile
 
