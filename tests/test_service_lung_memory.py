@@ -222,17 +222,90 @@ def test_recall_merges_banks_and_never_names_a_bank_outside_the_request(served):
         assert {(r[0], r[1]) for r in outcome[1]} == {("lung-class-a", a["a/1"]), ("lung-domain-b", b["b/1"])}
 
 
-def test_nothing_found_is_ok_with_no_records_and_an_unknown_bank_is_not_made(served):
+def test_nothing_found_is_ok_with_no_records(served):
     url, mem, serve = served
     base = serve()
     mem.create_bank("lung-empty", embedding_dim=EMBED_DIM)         # a bank with no notes in it
-    for banks in (["lung-empty"], ["lung-nope"], []):
+    for banks in (["lung-empty"], []):
         for req in ({"op": "search", "query": "zzyzx qwertyuiop", "banks": banks},
                     {"op": "recall", "task": "zzyzx qwertyuiop", "banks": banks}):
             st, reply = post(base, req)
             assert st == 200 and reply == {"status": "ok", "records": [], "retention": "unattested"}
             assert lean_decode(reply)[0] == ("empty",)
-    assert rows(url, "SELECT count(*) FROM banks WHERE bank_id='lung-nope'") == [(0,)]
+
+
+def unknown(name):
+    return {"status": "unavailable", "reason": "scope", "detail": f"unknown bank: {name}",
+            "retention": "unattested"}
+
+
+def test_an_unknown_bank_is_unavailable_scope_and_is_not_made(served):
+    url, mem, serve = served
+    base = serve()
+    seed(mem, "lung-class-a", NOTES)
+    for banks in (["lung-nope"], ["lung-class-a", "lung-nope"], ["lung-nope", "bad name!"]):
+        for req in ({"op": "search", "query": "harbor crane", "banks": banks},
+                    {"op": "recall", "task": "harbor crane", "banks": banks}):
+            st, reply = post(base, req)
+            assert (st, reply) == (200, unknown("lung-nope"))     # the whole request fails, found notes too
+            assert lean_decode(reply) == (("unavailable", "scope"), "unattested")
+    st, reply = post(base, {"op": "search", "query": "x", "banks": ["bad name!"]})
+    assert (st, reply) == (200, unknown("bad name!"))
+    assert rows(url, "SELECT count(*) FROM banks WHERE bank_id IN ('lung-nope', 'bad name!')") == [(0,)]
+
+
+SCRATCH_IDX = "SELECT indexname FROM pg_indexes WHERE indexname LIKE %s"
+
+
+def test_delete_bank_removes_a_scratch_bank_with_its_documents_and_indexes(served):
+    url, mem, serve = served
+    base = serve()
+    bank = "lung-scratch-r1"
+    for i, text in enumerate(("Kelp farms grow along the north reef.", "Reef divers count kelp each May.")):
+        st, a = post(base, {"op": "retain", "bank": bank, "text": text, "source": f"s/{i}"})
+        assert lean_decode_retain(a)[0][0] == "retained"
+    keep = seed(mem, "lung-class-keep", {"k/1": ("Kelp is kept elsewhere.", "2024-01-01")})
+    safe = bank.replace("-", "_")
+    # oracle: the database's own catalog, read before and after
+    assert len(rows(url, SCRATCH_IDX, f"%{safe}%")) == 3
+    assert rows(url, "SELECT count(*) FROM documents WHERE bank_id=%s", bank) == [(2,)]
+    items_before = rows(url, "SELECT count(*) FROM memory_items WHERE bank_id=%s", bank)[0][0]
+    assert items_before >= 2
+    st, reply = post(base, {"op": "delete_bank", "bank": bank})
+    assert (st, reply) == (200, {"status": "deleted", "bank": bank, "documents": 2, "retention": "unattested"})
+    assert rows(url, "SELECT count(*) FROM banks WHERE bank_id=%s", bank) == [(0,)]
+    assert rows(url, "SELECT count(*) FROM documents WHERE bank_id=%s", bank) == [(0,)]
+    assert rows(url, "SELECT count(*) FROM memory_items WHERE bank_id=%s", bank) == [(0,)]
+    assert rows(url, SCRATCH_IDX, f"%{safe}%") == []
+    # another bank is untouched, indexes included
+    assert rows(url, "SELECT count(*) FROM documents WHERE bank_id='lung-class-keep'") == [(1,)]
+    assert len(rows(url, SCRATCH_IDX, "%lung_class_keep%")) == 3
+    st, again = post(base, {"op": "delete_bank", "bank": bank})   # now it is unknown
+    assert (st, again) == (200, unknown(bank))
+    st, got = post(base, {"op": "search", "query": "kelp", "banks": ["lung-class-keep"]})
+    assert [r[1] for r in check_recall_shape(got, ["lung-class-keep"])[1]] == [keep["k/1"]]
+
+
+@pytest.mark.parametrize("name", ["lung-class-keep", "lung-scratch", "xlung-scratch-a", "LUNG-SCRATCH-a",
+                                  "lung-scratch-nope"])
+def test_delete_bank_refuses_a_name_that_is_not_scratch_and_touches_nothing(served, name):
+    url, mem, serve = served
+    base = serve()
+    seed(mem, "lung-class-keep", {"k/1": ("Kelp is kept elsewhere.", "2024-01-01")})
+    seed(mem, "lung-scratch", {"k/1": ("Kelp in a bank without the dash suffix.", "2024-01-01")})
+    seed(mem, "xlung-scratch-a", {"k/1": ("Kelp in a bank with a prefix.", "2024-01-01")})
+    before = rows(url, "SELECT bank_id, count(*) FROM documents GROUP BY 1 ORDER BY 1")
+    idx_before = rows(url, "SELECT indexname FROM pg_indexes ORDER BY 1")
+    st, reply = post(base, {"op": "delete_bank", "bank": name})
+    if name == "lung-scratch-nope":                      # scratch name, no such bank
+        assert (st, reply) == (200, unknown(name))
+    else:
+        assert (st, reply) == (200, {"status": "unavailable", "reason": "scope", "detail":
+                                     "delete_bank is only allowed for lung-scratch-* banks",
+                                     "retention": "unattested"})
+    assert lean_decode(reply) == (("unavailable", "scope"), "unattested")
+    assert rows(url, "SELECT bank_id, count(*) FROM documents GROUP BY 1 ORDER BY 1") == before
+    assert rows(url, "SELECT indexname FROM pg_indexes ORDER BY 1") == idx_before
 
 
 def test_a_hit_with_no_source_is_dropped_not_defaulted(served):
@@ -275,7 +348,9 @@ def test_a_bank_the_service_cannot_read_is_unavailable_provider(served):
     {"op": "retain", "bank": "", "text": "t", "source": "s"},       # Request.ok: bank named
     {"op": "retain", "bank": "b", "text": "t", "source": ""},       # Request.ok: source named
     {"op": "retain", "bank": "b", "source": "s"},                   # no text
-    {"op": "forget", "bank": "b"},                                  # not one of the three ops
+    {"op": "forget", "bank": "b"},                                  # not one of the ops
+    {"op": "delete_bank"},                                          # no bank
+    {"op": "delete_bank", "bank": ""},                              # empty bank
     {"banks": []},                                                  # no op
 ])
 def test_a_request_that_does_not_parse_is_400_with_the_malformed_reply(served, body):

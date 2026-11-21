@@ -39,12 +39,14 @@ Endpoints (JSON):
     POST /lung-memory/1                   the adapter for lung's `lung-memory/1` wire (the Lean spec
                                           lung/spec/LungSpec/MemoryWire.lean, PART B): the request is
                                           {"op": "recall", "task", "banks": [...]},
-                                          {"op": "search", "query", "banks": [...]} or
-                                          {"op": "retain", "bank", "text", "source"}; the replies
-                                          are exactly what lung's decoder reads, HTTP 200 for every
-                                          well-formed request (a failure is status "unavailable"
-                                          with a reason), 400 for one that parses as none of the
-                                          three. See docs/source-contract.md.
+                                          {"op": "search", "query", "banks": [...]},
+                                          {"op": "retain", "bank", "text", "source"} or
+                                          {"op": "delete_bank", "bank"} (only lung-scratch-*); the
+                                          replies are exactly what lung's decoder reads, HTTP 200
+                                          for every well-formed request (a failure is status
+                                          "unavailable" with a reason; a bank that does not exist is
+                                          reason "scope" with a detail), 400 for one that parses as
+                                          none of the four. See docs/source-contract.md.
 
 Environment: DATABASE_URL, PROSPECTA_SCHEMA (shared-database mode),
 PROSPECTA_SOURCE_SCHEMA / PROSPECTA_SOURCE_VIEWS (the source contract),
@@ -72,11 +74,14 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+import psycopg
+
 from prospecta._index import _delete_prior_docs_at_source_diff_hash
 from prospecta._types import DocumentSourceConflictError
 from prospecta.memory import BankConfigConflict
 from prospecta.db.pool import PoolTimeout
-from prospecta.db.queries import SELECT_BANK, validate_bank_id
+from prospecta.db.queries import (KIND_INDEX_KINDS, LEXICAL_INDEX_COLUMNS, SELECT_BANK,
+                                  hnsw_kind_index_name, lexical_kind_index_name, validate_bank_id)
 from prospecta.source import MAX_INDEX_CONCURRENCY, SourceConfig, SourceContractError, SourceIndexer
 
 logger = logging.getLogger("prospecta.service")
@@ -84,6 +89,7 @@ MAX_BODY = 1 << 20          # every route but /retain: a note is never refused f
 RETAIN_METADATA_KEYS = ("created_on", "project", "person", "kind")
 MAX_LIMIT = 100
 LUNG_PATH = "/lung-memory/1"
+LUNG_SCRATCH_PREFIX = "lung-scratch-"      # the only banks delete_bank may remove
 LUNG_SEARCH_LIMIT = 10      # the same default as /lookup's `limit`
 
 
@@ -119,9 +125,10 @@ def _explain_query(trace: dict, ranked: list[dict]) -> dict:
 class _LungUnavailable(Exception):
     """A lung-memory/1 call that cannot be answered; `reason` is one word of the wire's table."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, detail: str | None = None):
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail
 
 
 def zdr_attested_from_env() -> bool:
@@ -410,8 +417,13 @@ class Service:
     # POST /lung-memory/1: lung's wire over the calls above (docs/source-contract.md)
     # ------------------------------------------------------------------
 
-    def lung_unavailable(self, reason: str) -> dict:
-        return {"status": "unavailable", "reason": reason, "retention": self._lung_retention()}
+    def lung_unavailable(self, reason: str, detail: str | None = None) -> dict:
+        """`detail` is an extra field for humans; lung's decoder reads status, reason and retention only."""
+        out = {"status": "unavailable", "reason": reason}
+        if detail is not None:
+            out["detail"] = detail
+        out["retention"] = self._lung_retention()
+        return out
 
     def _lung_retention(self) -> str:
         return "attested" if self.zdr_attested else "unattested"
@@ -419,8 +431,9 @@ class Service:
     @staticmethod
     def lung_parse(body: dict) -> tuple:
         """The request as the Lean `Request.ofJson` reads it, or ApiError(400): an op of recall
-        (task, banks), search (query, banks) or retain (bank, text, source; bank and source non-empty).
-        Other fields are ignored."""
+        (task, banks), search (query, banks) or retain (bank, text, source; bank and source non-empty),
+        or delete_bank (bank, non-empty; this service's own op, not in the Lean spec). Other fields are
+        ignored."""
         def strs(v):
             return isinstance(v, list) and all(isinstance(x, str) for x in v)
         op = body.get("op")
@@ -428,6 +441,9 @@ class Service:
             key = "task" if op == "recall" else "query"
             if isinstance(body.get(key), str) and strs(body.get("banks")):
                 return op, body[key], body["banks"]
+        elif op == "delete_bank":
+            if isinstance(body.get("bank"), str) and body["bank"]:
+                return op, body["bank"]
         elif op == "retain":
             bank, text, source = body.get("bank"), body.get("text"), body.get("source")
             if all(isinstance(x, str) for x in (bank, text, source)) and bank and source:
@@ -441,12 +457,15 @@ class Service:
         try:
             if req[0] == "retain":
                 return self._lung_retain(*req[1:])
+            if req[0] == "delete_bank":
+                return self._lung_delete_bank(req[1])
+            self._lung_need_banks(req[2])       # one unknown bank fails the request, before anything runs
             if req[0] == "recall":
                 records = self._lung_records(req[2], lambda mem: self._lung_task_hits(mem, req[1]))
             else:
                 records = self._lung_records(req[2], lambda mem: self._lung_search_hits(mem, req[1]))
         except _LungUnavailable as e:
-            return self.lung_unavailable(e.reason)
+            return self.lung_unavailable(e.reason, e.detail)
         except PoolTimeout:
             return self.lung_unavailable("timeout")
         except Exception:
@@ -479,7 +498,7 @@ class Service:
 
     def _lung_records(self, banks: list[str], fetch) -> list[dict]:
         """`fetch(memory)` over each named bank (once each), as records. A bank that does not exist
-        has no notes. A record needs an id, a source and a date: a hit without one is dropped, never
+        is refused earlier (_lung_need_banks). A record needs an id, a source and a date: a hit without one is dropped, never
         defaulted. Ids are distinct. Every record's bank is the name the request used."""
         records: list[dict] = []
         seen: set[str] = set()
@@ -488,8 +507,8 @@ class Service:
             try:
                 mem = self._bank({"bank": name})
             except ApiError as e:
-                if e.status in (400, 404):      # not a bank name, or not made yet: nothing in it
-                    continue
+                if e.status in (400, 404):      # gone since the check, or never a bank name
+                    raise _LungUnavailable("scope", f"unknown bank: {name}") from None
                 raise _LungUnavailable("provider") from None
             for h in fetch(mem):
                 doc_id, source, day = str(h.document_id or ""), h.source, h.created_on
@@ -506,7 +525,8 @@ class Service:
         return records
 
     def _lung_retain(self, bank: str, text: str, source: str) -> dict:
-        """/retain with `create`: the note keyed by `source` in `bank`, the bank made on first use."""
+        """/retain with `create`: the note keyed by `source` in `bank`, the bank made on first use (the
+        one op that makes a bank; lung's wire has no retain without create, so no unknown-bank error)."""
         try:
             validate_bank_id(bank)
         except ValueError:
@@ -519,6 +539,60 @@ class Service:
             logger.warning("lung-memory/1 retain refused: %s %s", e.status, e.message)
             return self.lung_unavailable("malformed" if e.status == 400 else "provider")
         return {"status": "retained", "id": out["document_id"], "retention": self._lung_retention()}
+
+
+    def _lung_existing_banks(self, names: list[str]) -> set[str]:
+        with self.memory._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT bank_id FROM banks WHERE bank_id = ANY(%s)", (list(names),))
+                found = {r[0] for r in cur.fetchall()}
+            conn.rollback()
+        return found
+
+    def _lung_need_banks(self, banks: list[str]) -> None:
+        """Every named bank must exist, else the whole request is `unavailable scope` naming the first
+        that does not (in request order). A name that is no valid bank id cannot exist."""
+        names = [b for b in dict.fromkeys(banks)]
+        found = self._lung_existing_banks(names) if names else set()
+        for b in names:
+            if b not in found:
+                raise _LungUnavailable("scope", f"unknown bank: {b}")
+
+    def _lung_delete_bank(self, bank: str) -> dict:
+        """Remove a scratch bank: its per-bank partial indexes, then in ONE transaction its documents
+        (and, by the schema's ON DELETE CASCADE, its items, links, entities, events and refs) and the
+        bank row. The library has no bank removal, so the cascade does the work. Only an exact name
+        starting `lung-scratch-` is allowed; the counts are taken before the delete."""
+        if not bank.startswith(LUNG_SCRATCH_PREFIX):
+            return self.lung_unavailable(
+                "scope", f"delete_bank is only allowed for {LUNG_SCRATCH_PREFIX}* banks")
+        try:
+            validate_bank_id(bank)
+        except ValueError:
+            raise _LungUnavailable("scope", f"unknown bank: {bank}") from None
+        self._lung_need_banks([bank])
+        pool = self.memory._pool
+        # DROP INDEX CONCURRENTLY cannot run in a transaction (and a plain one would lock every
+        # bank's reads of memory_items); done first, a failure leaves the bank whole and retryable.
+        index_names = [hnsw_kind_index_name(bank, k) for k in KIND_INDEX_KINDS]
+        index_names += [lexical_kind_index_name(stem, bank, k)
+                        for k in KIND_INDEX_KINDS for stem, _ in LEXICAL_INDEX_COLUMNS]
+        with psycopg.connect(self.memory._database_url, autocommit=True) as conn:
+            for name in index_names:
+                conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM documents WHERE bank_id = %s", (bank,))
+                documents = cur.fetchone()[0]
+                cur.execute("DELETE FROM documents WHERE bank_id = %s", (bank,))
+                cur.execute("DELETE FROM banks WHERE bank_id = %s", (bank,))
+                if cur.rowcount == 0:       # removed by someone else since the check
+                    conn.rollback()
+                    raise _LungUnavailable("scope", f"unknown bank: {bank}")
+            conn.commit()
+        logger.info("lung-memory/1: deleted bank %s (%d documents)", bank, documents)
+        return {"status": "deleted", "bank": bank, "documents": documents,
+                "retention": self._lung_retention()}
 
 
 def _embedding_dim(memory) -> int:

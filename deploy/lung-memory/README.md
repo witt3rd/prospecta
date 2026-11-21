@@ -68,7 +68,7 @@ systemctl --user status prospecta-lung-memory
 ```
 
 Verify the template without starting it: `systemd-analyze --user verify prospecta-lung-memory.service`.
-Stopping the unit keeps all data (it lives in the shared Postgres); removing the lung banks is a deliberate bank deletion, not a deploy step.
+Stopping the unit keeps all data (it lives in the shared Postgres); removing the lung banks is a deliberate bank deletion, not a deploy step (`delete_bank` removes `lung-scratch-*` banks only).
 
 ## API
 
@@ -110,6 +110,27 @@ curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 # a failure
 {"status":"unavailable","reason":"provider","retention":"unattested"}
 ```
+
+**Timing:** a `recall` takes about 5 s (the query-writer model call); a `search` has no model call and is faster.
+Callers should use a **30 s timeout**.
+
+```
+# delete a scratch bank (only names starting lung-scratch-; its documents, indexes and the bank row go)
+  -d '{"op":"delete_bank","bank":"lung-scratch-run1"}'
+{"status":"deleted","bank":"lung-scratch-run1","documents":3,"retention":"unattested"}
+
+# any other name is refused, and the bank is untouched
+  -d '{"op":"delete_bank","bank":"lung-class-work"}'
+{"status":"unavailable","reason":"scope","detail":"delete_bank is only allowed for lung-scratch-* banks","retention":"unattested"}
+
+# a bank that does not exist (recall, search, delete_bank): the whole request fails, nothing runs
+  -d '{"op":"search","query":"x","banks":["lung-class-work","lung-class-wrk"]}'
+{"status":"unavailable","reason":"scope","detail":"unknown bank: lung-class-wrk","retention":"unattested"}
+```
+
+`retain` is the only op that creates a bank (on first use), so it has no unknown-bank error. `detail` is an extra field:
+lung's decoder reads `status`, `reason` and `retention` by name and ignores the rest (`MemoryWire.lean`, `decodeOutcome`).
+Never delete a bank by a direct database `DELETE`: use `delete_bank` (scratch banks only).
 
 A record is always `{bank, id, text, source, date}` with `bank` one of the request's banks; a hit with no source or date is left out, not defaulted
 (only a document written outside `/retain` can lack a source).
