@@ -27,7 +27,7 @@ from prospecta.stages import (
     NEAR_COPY_COSINE, NEAR_COPY_JACCARD, deduplicate_by_meaning, deduplicate_near_copies,
 )
 
-DEFAULT_QUERY_WRITER_MODEL = "openrouter/google/gemini-2.5-flash-lite"
+DEFAULT_QUERY_WRITER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017"
 DEFAULT_MAX_SEARCHES = 20          # the hard maximum: a bad model output cannot explode the fan-out
 DEFAULT_MAX_CONCURRENCY = 8        # Stage 1 searches at once (and never more than the pool has)
 DEFAULT_DEADLINE_S = 7.0           # everything (gate, writer, searches, reranks) inside this

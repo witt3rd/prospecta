@@ -269,7 +269,7 @@ def test_the_query_writer_model_is_per_call_then_bank_then_environment_then_defa
     mem.expand_and_recall("tree view", gate=False)
     models.append(writer.calls[-1]["model"])
     assert models == ["call/qw", "bank/qw", "env/qw", DEFAULT_QUERY_WRITER_MODEL]
-    assert DEFAULT_QUERY_WRITER_MODEL == "openrouter/google/gemini-2.5-flash-lite"
+    assert DEFAULT_QUERY_WRITER_MODEL == "openrouter/deepseek/deepseek-v4.1-flash-1017"
 
 
 # --------------------------------------------------------------------------

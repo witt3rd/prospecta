@@ -6,6 +6,9 @@ All notable changes to Prospecta are recorded here, newest first. The format fol
 
 ## [Unreleased]
 
+The default query-writer model is now `openrouter/deepseek/deepseek-v4.1-flash-1017` (was `openrouter/google/gemini-2.5-flash-lite`,
+which has no endpoint under a zero-data-retention OpenRouter workspace). Override with `PROSPECTA_QUERY_WRITER_MODEL`.
+
 One bank's size no longer slows another's Stage 1: `create_bank` now also builds the bank's two partial GIN indexes
 (`memory_items_body_tsv_<bank>_chunk_gin`, `memory_items_exact_tsv_<bank>_chunk_gin`, `CREATE INDEX CONCURRENTLY`), and
 `prospecta migrate` builds any that are missing for banks that already exist (additive: no rewrite, no lock on writes;

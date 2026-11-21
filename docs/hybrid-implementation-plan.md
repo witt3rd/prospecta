@@ -51,7 +51,7 @@ recall_config = {
   "rerank":  {"enabled": True, "stage": "cross_encoder", "model": "qwen/qwen3-reranker-8b",
               "top_n": 10, "min_score": 0.15, "timeout_s": 2.5, "deduplicate_near_copies": True},
   "models":  {"decision_model": "typesafe/jev-1.14",
-              "query_writer_model": "openrouter/google/gemini-2.5-flash-lite"},
+              "query_writer_model": "openrouter/deepseek/deepseek-v4.1-flash-1017"},
   "stage0_gate": {"enabled": True, "needs_memory_threshold": 0.5},
   "expansion": {"max_searches": 20, "max_concurrency": 8, "deadline_s": 7},
   "stage3_sufficiency": {"enabled": False, "threshold": 0.70},
@@ -64,7 +64,7 @@ channel_config = [{"name": "hybrid_chunk", "weight": 1,
 **Environment variable defaults:**
 * `PROSPECTA_DECISION_MODEL` (default: `typesafe/jev-1.14`, alias `PROSPECTA_JEV_MODEL` kept for backward compatibility)
 * `PROSPECTA_RERANKER_MODEL` (default: `qwen/qwen3-reranker-8b`)
-* `PROSPECTA_QUERY_WRITER_MODEL` (default: `openrouter/google/gemini-2.5-flash-lite`)
+* `PROSPECTA_QUERY_WRITER_MODEL` (default: `openrouter/deepseek/deepseek-v4.1-flash-1017`)
 
 ---
 
@@ -107,7 +107,7 @@ The text below is the plan as written; the Status table above says what happened
   * **Cited evidence contract (`RecalledMemory` & `format_cited_rag_block`):** Every returned item includes `source`, `created_on` (`YYYY-MM-DD`), `category`/`kind`, `match_kind`, `relevance_score`, `exact_snippet`, and `original_chunk`.
   * **Mode 1A (Conversational automatic recall in `hermes-prospecta`):**
     * Stage 0 (`decision_model`, default `typesafe/jev-1.14`) decides `needs_memory` and `time_scope`.
-    * Query writer (`query_writer_model`, default `openrouter/google/gemini-2.5-flash-lite`) resolves follow-ups against `agent_last` only, preserving `"quoted phrases"` verbatim.
+    * Query writer (`query_writer_model`, default `openrouter/deepseek/deepseek-v4.1-flash-1017`) resolves follow-ups against `agent_last` only, preserving `"quoted phrases"` verbatim.
     * Passes `excluded_sources` (last 2 turns of current session) into Stage 1 + Stage 2 (`reranker_model`, default `qwen/qwen3-reranker-8b`).
     * Formats the injected `<memory-context>` block with citation headers and `Exact match snippet:` lines.
   * **Mode 1B (Non-interactive task/commission recall):**
