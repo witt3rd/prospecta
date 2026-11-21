@@ -1,27 +1,33 @@
 # lung-memory: Prospecta as a network memory provider
 
-The lung agent uses Prospecta over HTTP. The service runs on the fleet host **mcfeely** (docker), with its own
-Postgres (`pgvector/pgvector:pg16`, pgvector 0.8.x), bound to the tailnet address only. Nothing here runs on roger.
+The lung agent uses Prospecta over HTTP. The service runs **on roger** as a systemd user unit, against the **existing shared
+Prospecta Postgres** (container `prospecta-roger-postgres`, `127.0.0.1:54321`). There is no second Postgres and no compose
+stack. Banks are `lung-class-<profile>` and `lung-domain-<project>`, created on first retain.
 
 | piece | how |
 |---|---|
-| service | built from this repo's `Dockerfile` (`python -m prospecta.service`) |
-| Postgres | `pgvector/pgvector:pg16`; **no published port**; data in the named volume `pgdata` |
-| exposure | the service port is published only on `LUNG_MEMORY_BIND` (the host's tailnet IP). There is no default; compose refuses to start if it is unset |
-| labels | every container, volume, network and the built image carry `org.prospecta.project=lung-memory` (override the value with `LUNG_MEMORY_LABEL`, together with `COMPOSE_PROJECT_NAME`, for a scratch stack) |
+| unit | `prospecta-lung-memory.service` (template; `python -m prospecta.service` from the pinned venv) |
+| env | `~/.config/prospecta-lung-memory/env`, written by fleet-ops from Doppler; names in `prospecta-lung-memory.env.example` |
+| exposure | bound to `LUNG_MEMORY_BIND` (the roger tailnet address). No default: the unit refuses to start if it is unset |
+| database | `DATABASE_URL` points at the existing shared DB (shared-database mode, own schema as that DB is configured) |
+
+The unit is declared in fleet-ops later; nothing here installs or starts it.
+
+**Light on roger:** embeddings, rerank and the query writer are OpenRouter calls; the service itself holds only a small
+DB connection pool (`PROSPECTA_DB_POOL_MAX`, default 10).
+
+**Later move to the cloud (Supabase):** change `DATABASE_URL` and `LUNG_MEMORY_BIND`; nothing else.
 
 ## Secrets and variables
 
-Secrets come from **Doppler**; this repo holds names only (`lung-memory.env.example`). Variables:
+Secrets come from **Doppler**; this repo holds names only. fleet-ops renders them to the env file; the unit does not call `doppler run`.
 
-- `POSTGRES_PASSWORD`: the database password (compose builds `DATABASE_URL` from it; the service inside the stack talks to the stack's own Postgres).
-- `DATABASE_URL`: set by compose; set it yourself only if you run the service image against another database.
-- `OPENROUTER_API_KEY`: the key the models are called with (see ZDR below). Without it the service starts, but recall has no reranker, decision model or query writer, and embedding fails.
-- `PROSPECTA_SERVICE_TOKEN`: the bearer token callers send; required.
-- `PROSPECTA_SERVICE_HOST` (default `0.0.0.0` inside the container) and `PROSPECTA_SERVICE_PORT` (default `8080`).
-- `PROSPECTA_QUERY_WRITER_MODEL`: the query-writer model (see profiles).
-- `LUNG_MEMORY_BIND`: the tailnet IP to publish on (`tailscale ip -4`). Required.
-- Optional, defaulted in compose: `PROSPECTA_EMBED_MODEL`, `PROSPECTA_EMBEDDING_DIM`, `PROSPECTA_RERANKER_MODEL`, `PROSPECTA_DECISION_MODEL`.
+- `LUNG_MEMORY_BIND`: the tailnet IP to listen on. Required.
+- `DATABASE_URL`: the shared Prospecta Postgres.
+- `PROSPECTA_SERVICE_TOKEN`: the bearer token callers send; required (the service refuses a non-loopback bind without it).
+- `PROSPECTA_SERVICE_PORT` (default `8080`).
+- `OPENROUTER_API_KEY`: the key the models are called with (see ZDR below).
+- `PROSPECTA_QUERY_WRITER_MODEL`, `PROSPECTA_EMBED_MODEL`, `PROSPECTA_EMBEDDING_DIM`, `PROSPECTA_RERANKER_MODEL`, `PROSPECTA_DECISION_MODEL`: models (see profiles).
 
 ## ZDR: a property of the key, not of Prospecta
 
@@ -41,7 +47,7 @@ PROSPECTA_DECISION_MODEL=typesafe/jev-1.14
 PROSPECTA_QUERY_WRITER_MODEL=deepseek/deepseek-v4.1-flash-1017
 ```
 
-(Set these in the Doppler config for the work deployment; the first four are also the compose defaults.)
+(Set these in the Doppler config for the work deployment.)
 
 ### `personal`: non-ZDR key
 
@@ -51,32 +57,15 @@ work data at this profile.
 The embedding dimension is fixed per bank when it is created; do not change `PROSPECTA_EMBED_MODEL`/`PROSPECTA_EMBEDDING_DIM` on a
 bank that has data.
 
-## Run it (on mcfeely)
+## Check (after fleet-ops declares and starts it)
 
 ```
-ssh mcfeely
-cd <checkout of this repo>/deploy/lung-memory
-export LUNG_MEMORY_BIND=$(tailscale ip -4 | head -1)
-doppler run -- docker compose up -d --build        # `up -d` after the first build
+curl http://$LUNG_MEMORY_BIND:8080/healthz          # needs no token
+systemctl --user status prospecta-lung-memory
 ```
 
-Health (needs no token):
-
-```
-curl http://$LUNG_MEMORY_BIND:8080/healthz
-docker compose exec postgres psql -U prospecta -d prospecta -c "select extversion from pg_extension where extname='vector'"   # >= 0.8
-```
-
-Tear down, including the data volume (destructive: the memory is gone):
-
-```
-doppler run -- docker compose down -v
-docker ps -a --filter label=org.prospecta.project=lung-memory
-docker volume ls --filter label=org.prospecta.project=lung-memory
-docker network ls --filter label=org.prospecta.project=lung-memory     # all three must list nothing
-```
-
-Use `docker compose down` (no `-v`) to stop but keep the data.
+Verify the template without starting it: `systemd-analyze --user verify prospecta-lung-memory.service`.
+Stopping the unit keeps all data (it lives in the shared Postgres); removing the lung banks is a deliberate bank deletion, not a deploy step.
 
 ## API
 
